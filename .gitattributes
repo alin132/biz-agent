@@ -1,0 +1,7 @@
+# 统一换行符，避免跨平台 diff 噪音
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,33 @@
+{
+	"name": "biz-agent",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "通用业务流程 Agent —— 基于 Pi (pi-agent-core) 的可配置企业业务智能体平台",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"dev": "tsx server/index.ts",
+		"check-model": "tsx scripts/check-model.ts",
+		"live-check": "tsx scripts/live-check.ts",
+		"persist-check": "tsx scripts/persist-check.ts",
+		"typecheck": "tsc --noEmit",
+		"verify": "tsx scripts/selftest.ts",
+		"smoke": "tsx scripts/smoke.ts",
+		"demo:ticket": "tsx examples/ticket.demo.ts",
+		"demo:data": "tsx examples/data.demo.ts",
+		"demo:approval": "tsx examples/approval.demo.ts",
+		"demo:real": "tsx examples/real-model.ts"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "1.5.0",
+		"@earendil-works/pi-ai": "1.5.0",
+		"@earendil-works/pi-schema": "1.5.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.0",
+		"tsx": "^4.20.0",
+		"typescript": "^5.9.0"
+	}
+}
