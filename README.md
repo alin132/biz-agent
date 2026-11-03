@@ -4,8 +4,6 @@
 
 把"一个业务系统接入 AI"从写代码变成**注册工具 + 写流程定义**。新增业务流程不需要改核心层。
 
-参考实现：[AgentOne（灵一）](https://github.com/sangshy-go/AgentOne) —— Java 版的企业 AI Agent 中台，本项目借用它的分层思路，用 Pi 重新实现。
-
 ---
 
 ## 状态
@@ -262,7 +260,8 @@ await agent.agent.prompt("用户的自然语言请求");
 模型会跳步、会漏步、会重复。`WorkflowEngine` 根据"哪个工具成功执行过"来判定步骤完成，模型只管调用工具，**流程推进权在代码手里**。模型停早了，`finishTurn` 返回 `continue` 并注入下一步提示；全部走完才放行收尾。
 
 **为什么工具结果要截断？**
-一次大查询就能撑爆上下文窗口。`afterToolCall` 里统一截到 4000 字符——这条经验直接来自 AgentOne 的 `MAX_TOOL_RESULT_CHARS`。
+一次大查询就能撑爆上下文窗口，模型会开始丢指令、答非所问。所以在 `afterToolCall` 里统一截到
+4000 字符，并在末尾标注原始长度，让模型知道结果被截断过。
 
 **权限为什么必须自己写？**
 Pi 官方 README 明确写了：不提供文件系统/进程/网络/凭据的权限系统，默认以启动用户的权限运行。企业场景这块必须自建。
@@ -271,22 +270,9 @@ Pi 官方 README 明确写了：不提供文件系统/进程/网络/凭据的权
 
 ## 已知限制
 
-- **数据在内存**：`store/memory.ts` 重启即清空，真实项目要换数据库。
-- **无管理后台**：AgentOne 那套 Vue 配置界面没做，目前流程定义是 TypeScript 文件。
-- **无会话持久化**：每次 demo 都是新会话。生产要接 Pi 的 `SessionManager` 或 `pi-durable`。
-- **审批是同步回调**：真实审批要走工单系统，需要异步挂起/恢复机制，`beforeToolCall` 的同步语义要改造。
+- **业务数据仍是模拟的**：`store/memory.ts` 里是写死的工单/订单种子数据，工具只改内存对象，
+  没有对接真实工单系统或数据库。持久化只保证"重启不丢"，不保证数据真实。
+- **没有管理后台**：流程定义仍是 TypeScript 文件，没有可视化配置界面。
+- **单机 SQLite**：会话库是本地单文件，多实例部署需要换成 PostgreSQL 之类的共享存储。
+- **审批是同步回调**：真实审批要走外部审批系统，需要异步挂起/恢复机制，`beforeToolCall` 的同步语义要改造。
 - **Node 版本**：Pi 要求 ≥22.19.0，本机是 22.18.0，实测可运行但 npm 会警告，建议升级。
-
----
-
-## 与 AgentOne 的对应关系
-
-| AgentOne（Java / AgentScope） | 本项目（TypeScript / Pi） |
-|---|---|
-| `ChatServiceImpl.buildSystemPrompt` | `runtime.ts` 的 `buildSystemPrompt` |
-| `SkillAgentTool implements AgentTool` | `registry.ts` 的 `toAgentTools` |
-| `SkillDescriptor.inputSchema` | `ToolDef.parameters` |
-| `SkillCallLogRecorder` | `audit.ts` 的 `createAuditHook` |
-| `MemoryService` 滑动窗口 | `context.ts` 的 `createContextTransformer` |
-| `AgentStatus` 状态机 + 双人审批 | `workflow.ts` + `permission.ts`（简化版） |
-| SSE 五事件协议 | `agent.subscribe()` 事件流 |

@@ -3,8 +3,8 @@
  *
  * 两件事：
  * 1) 每次工具调用落一条审计记录（谁、在哪个租户、调了什么、成没成）；
- * 2) 截断超长工具结果——照抄 AgentOne 的 MAX_TOOL_RESULT_CHARS 经验，
- *    否则一次大查询就能把上下文窗口撑爆。
+ * 2) 截断超长工具结果——一次大查询的结果就能把上下文窗口撑爆，
+ *    统一截到 MAX_RESULT_CHARS，并在末尾标注原始长度。
  */
 
 import type { AfterToolCallContext, AfterToolCallResult } from "@earendil-works/pi-agent-core";
