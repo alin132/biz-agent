@@ -2,18 +2,60 @@
  * 极简 HTTP 服务：只依赖 node 标准库，无框架、无构建步骤。
  *
  * 路由：
- *   GET  /api/workflows                 可选流程清单
- *   GET  /api/models                    当前模型与可用模型
- *   POST /api/sessions                  创建会话 { workflowId, modelId? }
- *   GET  /api/sessions                  会话列表（含 SQLite 历史）
+ *   GET    /api/health                  存活探针 { ok, uptimeMs, sessions, model, storage }
+ *   GET    /api/workflows               流程清单（内置 + 自定义）
+ *   GET    /api/workflows/:id           流程详情（流程编辑器用）
+ *   POST   /api/workflows               新建自定义流程 { name, systemPrompt, steps, skill? }
+ *   PATCH  /api/workflows/:id           编辑自定义流程（内置流程 403）
+ *   DELETE /api/workflows/:id           删除自定义流程（内置流程 403）
+ *                                       连带删除它的会话（`sessionsRemoved`），
+ *                                       并让别的会话退出这条技能（`skillsCleared`）
+ *   （skill? = { description, instructions }，给「技能区」写的一句话触发条件与正文；
+ *     不传也能当技能用，正文回落 systemPrompt。传 null 表示清空技能文案。）
+ *   GET    /api/tools                   工具目录（步骤里 via 可选的工具）
+ *   GET    /api/models                  当前模型 + 可用模型 + 供应商/模型（P6）
+ *   GET/POST/PATCH/DELETE /api/models/providers[/:id]   供应商（API Key 只回掩码）
+ *   POST   /api/models/:id/ping          连通性探测 { ok, latencyMs, error? }
+ *   GET/POST /api/models/current         读/切当前模型 { modelId }
+ *   POST/PATCH/DELETE /api/models[/:id] 模型（P6）
+ *   GET/POST /api/api-keys              开放 API 的 Key（POST 只返回一次明文 bk_）
+ *   PATCH/DELETE /api/api-keys/:id       改属性 / 吊销（P4）
+ *   GET/POST /api/mcp/servers            MCP 服务列表 / 注册（P7，注册即 initialize + tools/list）
+ *   GET/PATCH/DELETE /api/mcp/servers/:id
+ *   POST   /api/mcp/servers/:id/refresh  重新发现工具
+ *   GET    /api/mcp/servers/:id/tools    发现到的工具（含启停状态）
+ *   POST   /api/mcp/servers/:id/call     直接调用一次 MCP 工具
+ *   PATCH  /api/mcp/tools/:id            工具启停 { enabled }
+ *   GET/POST /api/im/bots                IM 机器人（凭证只回掩码）
+ *   GET/PATCH/DELETE /api/im/bots/:id    机器人详情 / 改 / 删（连带删会话映射）
+ *   POST   /api/im/bots/:id/ping         发一条测试消息（fake 传输时进 outbox）
+ *   POST   /api/im/dingtalk/callback     钉钉回调（免登录：加签或 AES 加密）
+ *   GET    /api/im/outbox                仅 DINGTALK_TRANSPORT=fake 可用
+ *   GET    /v1/health                   开放 API 探针（免鉴权）
+ *   POST   /v1/chat                     开放 API 对话（Bearer API Key；非流式 + SSE 流式）
+ *   POST   /api/sessions                创建会话 { workflowId, modelId? }
+ *   GET    /api/sessions                会话列表（含 SQLite 历史）
  *   DELETE /api/sessions                清空全部会话
- *   GET  /api/sessions/:id              会话快照（必要时从 SQLite 恢复）
+ *   GET    /api/sessions/:id            会话快照（必要时从 SQLite 恢复）
+ *   PATCH  /api/sessions/:id            重命名会话 { title }
  *   DELETE /api/sessions/:id            删除会话
- *   GET  /api/sessions/:id/events       SSE 事件流
- *   POST /api/sessions/:id/messages     发送消息 { text }
- *   POST /api/sessions/:id/approve      审批决定 { requestId, approved }
- *   POST /api/sessions/:id/permissions  权限模式 { mode }
- *   其余                                 静态资源（web/）
+ *   GET    /api/sessions/:id/events     SSE 事件流
+ *   POST   /api/sessions/:id/messages   发送消息 { text }
+ *   POST   /api/sessions/:id/approve    审批决定 { requestId, approved }
+ *   GET    /api/approvals               审批中心：全局挂起中的审批 { items, total }
+ *   POST   /api/approvals/:sessionId    在审批中心处理某条审批 { requestId, approved }
+ *   POST   /api/sessions/:id/permissions 权限模式 { mode }
+ *   POST   /api/sessions/:id/skills      加载/退出技能 { skillId: string | null }
+ *   GET    /api/skills                  技能目录（内置流程 + 自定义流程都能当技能）
+ *   POST   /api/auth/login              登录 { email, password } → { token, user }
+ *   POST   /api/auth/logout             退出（无状态 JWT，仅语义端点）→ { ok: true }
+ *   GET    /api/auth/me                 当前用户 + 权限矩阵（AUTH_MODE=off 返回演示所有者）
+ *   GET    /api/auth/users              成员列表（owner）｜POST 建成员 { email, password, role, name? }
+ *   GET    /api/audit                   审计倒序列表 ?limit&offset&action&actor&actorType&targetType&from&to&q
+ *   GET    /api/monitor/summary         监控首页聚合 ?range=24h（会话/消息/工具/技能/MCP/模型/p95）
+ *   GET    /api/monitor/traces          调用链倒序列表 ?limit&offset&sessionId
+ *   GET    /api/monitor/traces/:id      调用链详情（trace + events，不存在 404）
+ *   其余                                静态资源（web/）
  */
 
 import { createServer } from "node:http";
@@ -21,10 +63,22 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SessionDb } from "./db.js";
+import { handleAuthRoute } from "./auth/routes.js";
+import { initAuth } from "./auth/service.js";
+import { createApiKeyService } from "./apiKeys/service.js";
+import { handleApiKeysRoute } from "./apiKeys/routes.js";
+import { openStore } from "./db/index.js";
 import { loadEnvFile } from "./env.js";
-import { currentModelId, listModelOptions, resolveLlm, supportedKeyEnvs } from "./llm.js";
+import { initIm } from "./im/index.js";
+import { handleKb, initKb } from "./kb/index.js";
+import { supportedKeyEnvs } from "./llm.js";
+import { initMcp } from "./mcp/index.js";
+import { handleModelsRoute } from "./models/routes.js";
+import { initModels } from "./models/service.js";
+import { createObservability, handleMonitorRoute } from "./observability/index.js";
+import { handleOpenApiRoute } from "./openapi/routes.js";
 import { SessionHub } from "./session.js";
+import { WorkflowHttpError, WorkflowRepo } from "./workflows.js";
 
 loadEnvFile();
 
@@ -41,7 +95,43 @@ const MIME: Record<string, string> = {
 	".json": "application/json; charset=utf-8",
 };
 
-const hub = new SessionHub(new SessionDb(DB_PATH));
+const startedAt = Date.now();
+// 存储后端由 DATABASE_URL 决定（有则 Postgres，无则 SQLite）；DB_PATH 只在 SQLite 分支生效
+const db = openStore({ dbPath: DB_PATH });
+// MCP 集成（P7）：把 MCP 工具接进平台工具目录（/api/tools、自动编排会话、技能 via 校验同一份）。
+// 必须在 WorkflowRepo 之前初始化：注册表会先用库里"上次发现到的工具"重建快照，
+// 这样已有的技能引用 MCP 工具时不会在启动校验里被误判成 broken（真正的握手随后异步做）。
+// 初始化只建注册表，真正的 initialize + tools/list 在监听之后异步做，避免卡死的 MCP 服务拖住启动。
+const mcp = initMcp({
+	db,
+	onLog: (message) => console.log(message),
+});
+const repo = new WorkflowRepo(db);
+// 多模型管理（P6）：首次启动用 .env 的 key 兜底建 default 供应商；当前模型注入给会话构造
+const models = initModels({ storage: db });
+// 开放 API 的 API Key（P4）：库 + 令牌桶
+const apiKeys = createApiKeyService(db);
+// 监控与可观测（P9）：每轮消息一条调用链 + 批量落 trace_events；不传存储以外的东西，
+// MCP 服务名解析通过注册表查（可观测模块本身不依赖 MCP）。
+const observability = createObservability({
+	storage: db,
+	resolveMcpServer: (toolName) => {
+		for (const server of mcp.registry.listServers()) {
+			if (server.tools.some((tool) => tool.toolName === toolName)) {
+				return server.name;
+			}
+		}
+		return undefined;
+	},
+});
+const hub = new SessionHub(db, repo, (modelId) => models.resolveRuntime(modelId), observability);
+const storage = db.info();
+// 鉴权：AUTH_MODE 未设置时是 off（全部放行，行为与 P2 一致）；required 时验 Bearer 令牌 + 四角色矩阵
+const auth = initAuth(db);
+// IM Bot 网关（P8）：机器人凭证（AES 加密）+ 钉钉回调（加签/AES）+ 出站（fake outbox / 真 https）
+const im = initIm({ storage: db, hub });
+// 知识库：启动时建表（幂等），表与会话库同一个 SQLite 文件
+initKb({ dbPath: DB_PATH });
 
 function json(res: ServerResponse, status: number, body: unknown): void {
 	const payload = JSON.stringify(body);
@@ -52,13 +142,23 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 	res.end(payload);
 }
 
+/** 请求体不合法（目前只有 JSON 解析失败）：由路由层统一转成 400，而不是 500。 */
+class BadRequestError extends Error {}
+
 async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of req) {
 		chunks.push(chunk as Buffer);
 	}
 	const raw = Buffer.concat(chunks).toString("utf8");
-	return raw.length === 0 ? {} : (JSON.parse(raw) as Record<string, unknown>);
+	if (raw.length === 0) {
+		return {};
+	}
+	try {
+		return JSON.parse(raw) as Record<string, unknown>;
+	} catch {
+		throw new BadRequestError("请求体不是合法 JSON");
+	}
 }
 
 async function serveStatic(pathname: string, res: ServerResponse): Promise<void> {
@@ -70,7 +170,11 @@ async function serveStatic(pathname: string, res: ServerResponse): Promise<void>
 	}
 	try {
 		const data = await readFile(target);
-		res.writeHead(200, { "Content-Type": MIME[extname(target)] ?? "application/octet-stream" });
+		res.writeHead(200, {
+			"Content-Type": MIME[extname(target)] ?? "application/octet-stream",
+			// 控制台没有构建步骤，前端文件改完要能被浏览器立刻拿到；不做缓存协商，省一次 hard refresh
+			"Cache-Control": "no-cache",
+		});
 		res.end(data);
 	} catch {
 		json(res, 404, { error: "not found" });
@@ -105,10 +209,26 @@ function handleEvents(session: ReturnType<SessionHub["get"]>, req: IncomingMessa
 }
 
 const server = createServer((req, res) => {
+	// 路径与方法在 IIFE 外取一次：请求收尾落审计时还要用（只读，不影响下面的路由分派）
+	const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+	const pathname = url.pathname;
+	const method = req.method ?? "GET";
+
 	void (async () => {
-		const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-		const pathname = url.pathname;
-		const method = req.method ?? "GET";
+		// ---- 开放 API（/v1/*）：自带走 Bearer API Key 鉴权，必须在静态资源分支之前接管 ----
+		if (
+			await handleOpenApiRoute(req, res, url, {
+				storage: db,
+				auth,
+				hub,
+				models,
+				apiKeys,
+				startedAt,
+				storageInfo: storage,
+			})
+		) {
+			return;
+		}
 
 		// ---- 静态资源 ----
 		if (!pathname.startsWith("/api/")) {
@@ -116,10 +236,125 @@ const server = createServer((req, res) => {
 			return;
 		}
 
-		// ---- API ----
-		if (pathname === "/api/workflows" && method === "GET") {
-			json(res, 200, SessionHub.catalog());
+		// ---- 鉴权：AUTH_MODE=off 时挂演示所有者直接放行；required 时验令牌 + 角色矩阵 ----
+		const denied = auth.guard(req, method, pathname);
+		if (denied) {
+			json(res, denied.status, { error: denied.error });
 			return;
+		}
+
+		// ---- IM Bot 网关（/api/im*）：机器人凭证 + 钉钉回调 + fake outbox ----
+		// 钉钉回调在 auth.guard 的公开白名单里（外部服务器没有内部令牌），其余接口照常过权限矩阵。
+		if (await im.handle(req, res, url)) {
+			return;
+		}
+
+		// ---- 认证与审计接口（/api/auth/*、/api/audit） ----
+		if (await handleAuthRoute(req, res, url, auth)) {
+			return;
+		}
+
+		// ---- 监控与可观测（/api/monitor*）：summary / 调用链列表 / 详情 ----
+		if (await handleMonitorRoute(req, res, url, { observability, storage: db, auth })) {
+			return;
+		}
+
+		// ---- 知识库接口（/api/kb*）：模块自包含，内部自己解析 URL 与请求体 ----
+		if (await handleKb(req, res)) {
+			return;
+		}
+
+		// ---- 多模型管理（/api/models*）：供应商 / 模型 / 当前模型 / 连通性探测 ----
+		if (await handleModelsRoute(req, res, url, models)) {
+			return;
+		}
+
+		// ---- 开放 API 的 Key 管理（/api/api-keys*） ----
+		if (await handleApiKeysRoute(req, res, url, apiKeys)) {
+			return;
+		}
+
+		// ---- MCP 集成（/api/mcp*）：注册 / 发现 / 调用 / 工具启停 ----
+		if (await mcp.handle(req, res, url, auth)) {
+			return;
+		}
+
+		// ---- API ----
+		if (pathname === "/api/health" && method === "GET") {
+			// model 的形状与 P2 完全一致（{ mode, id, label }），只是现在可能来自库里的当前模型
+			json(res, 200, {
+				ok: true,
+				uptimeMs: Date.now() - startedAt,
+				sessions: hub.count(),
+				model: models.healthModel(),
+				// 存储后端观测字段：kind 决定"跑的是哪条 DAO"，detail 是库文件路径或 host:port/db
+				storage,
+				// 鉴权模式观测字段：off = 全部放行（默认），required = 要 Bearer 令牌
+				auth: auth.mode,
+			});
+			return;
+		}
+
+		if (pathname === "/api/workflows" && method === "GET") {
+			json(res, 200, repo.list());
+			return;
+		}
+
+		if (pathname === "/api/tools" && method === "GET") {
+			json(res, 200, repo.toolSummaries());
+			return;
+		}
+
+		if (pathname === "/api/skills" && method === "GET") {
+			// 技能目录：内置流程与自定义流程都能当技能加载，控制台用它画技能选择器
+			json(
+				res,
+				200,
+				repo.skills().map((skill) => ({
+					id: skill.id,
+					name: skill.name,
+					description: skill.description,
+					steps: skill.steps.length,
+					tools: skill.tools,
+					builtin: repo.isBuiltin(skill.id),
+				})),
+			);
+			return;
+		}
+
+		if (pathname === "/api/workflows" && method === "POST") {
+			const body = await readBody(req);
+			json(res, 201, repo.create(body));
+			return;
+		}
+
+		const workflowMatch = /^\/api\/workflows\/([^/]+)$/.exec(pathname);
+		if (workflowMatch) {
+			let workflowId: string;
+			try {
+				workflowId = decodeURIComponent(workflowMatch[1]!);
+			} catch {
+				json(res, 400, { error: "流程 id 不是合法的 URL 编码" });
+				return;
+			}
+			if (method === "GET") {
+				json(res, 200, repo.detail(workflowId));
+				return;
+			}
+			if (method === "PATCH") {
+				const body = await readBody(req);
+				json(res, 200, repo.update(workflowId, body));
+				return;
+			}
+			if (method === "DELETE") {
+				// 删流程 = 连它的会话一起删（否则这些会话找不到流程，会从列表里凭空消失）；
+				// 再清掉别的会话里"正挂着这条技能"的引用，让它们退回自己的流程
+				const sessionsRemoved = hub.removeByWorkflow(workflowId);
+				repo.remove(workflowId);
+				const skillsCleared = hub.detachSkill(workflowId);
+				json(res, 200, { removed: true, sessionsRemoved, skillsCleared });
+				return;
+			}
 		}
 
 		if (pathname === "/api/sessions" && method === "GET") {
@@ -127,23 +362,15 @@ const server = createServer((req, res) => {
 			return;
 		}
 
-		if (pathname === "/api/models" && method === "GET") {
-			const options = listModelOptions();
-			const current = currentModelId();
-			json(res, 200, {
-				mode: current ? "live" : "simulated",
-				current,
-				options,
-			});
-			return;
-		}
-
 		if (pathname === "/api/sessions" && method === "POST") {
 			const body = await readBody(req);
 			const workflowId = String(body.workflowId ?? "");
-			const modelId = typeof body.modelId === "string" && body.modelId.trim() ? body.modelId.trim() : undefined;
+			// 不指定就用"当前模型"（P6）；指定时既可以是库里的模型行 id，也可以是供应商的 modelId
+			const modelId =
+				typeof body.modelId === "string" && body.modelId.trim() ? body.modelId.trim() : models.currentModelKey();
 			try {
-				const session = hub.create(workflowId, { modelId });
+				// ownerId 落进会话 payload：developer 在监控页只能看到自己创建的会话调用链
+				const session = hub.create(workflowId, { modelId, ownerId: auth.userOf(req)?.id ?? null });
 				json(res, 201, session.view());
 			} catch (error) {
 				json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -173,6 +400,31 @@ const server = createServer((req, res) => {
 
 			if (action === "" && method === "GET") {
 				json(res, 200, session.view());
+				return;
+			}
+
+			if (action === "" && method === "PATCH") {
+				const body = await readBody(req);
+				// 重命名与归档共用这个入口：传哪个改哪个，两个都能不传就算错误请求。
+				const hasTitle = "title" in body;
+				const hasArchived = "archived" in body;
+				if (!hasTitle && !hasArchived) {
+					json(res, 400, { error: "至少要传 title 或 archived" });
+					return;
+				}
+				if (hasTitle && typeof body.title !== "string") {
+					json(res, 400, { error: "title must be a string" });
+					return;
+				}
+				if (hasArchived && typeof body.archived !== "boolean") {
+					json(res, 400, { error: "archived must be a boolean" });
+					return;
+				}
+				const title = hasTitle ? session.setTitle(body.title as string) : session.view().title;
+				const archived = hasArchived
+					? session.setArchived(body.archived as boolean)
+					: session.view().archived;
+				json(res, 200, { title, archived });
 				return;
 			}
 
@@ -209,18 +461,96 @@ const server = createServer((req, res) => {
 				json(res, 200, { permissionMode: session.setPermissionMode(mode) });
 				return;
 			}
+
+			if (action === "/skills" && method === "POST") {
+				// 加载技能（skillId 是字符串）或退出技能（skillId: null）
+				const body = await readBody(req);
+				if (!("skillId" in body) || (body.skillId !== null && typeof body.skillId !== "string")) {
+					json(res, 400, { error: "skillId 必须是字符串或 null" });
+					return;
+				}
+				try {
+					if (body.skillId === null) {
+						session.clearSkill();
+					} else {
+						session.activateSkill(body.skillId as string);
+					}
+				} catch (error) {
+					json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+					return;
+				}
+				const view = session.view();
+				json(res, 200, {
+					activeSkillId: view.activeSkillId,
+					tools: view.tools,
+					skills: view.skills,
+					steps: view.steps,
+					current: view.current,
+					done: view.done,
+				});
+				return;
+			}
+		}
+
+		// 审批中心（全局待办）：跨会话合并挂起中的审批。
+		// 会话级 POST /api/sessions/:id/approve 保留不动（向后兼容），两条入口最终都走 resolveApproval。
+		if (pathname === "/api/approvals" && method === "GET") {
+			const items = hub.pendingApprovals();
+			json(res, 200, { items, total: items.length });
+			return;
+		}
+
+		const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(pathname);
+		if (approvalMatch && method === "POST") {
+			// 先确认会话存在（404），再校验入参（400），最后才看这条审批还活着没（409）
+			const session = hub.get(approvalMatch[1]!);
+			if (!session) {
+				json(res, 404, { error: "会话不存在" });
+				return;
+			}
+			const body = await readBody(req);
+			const requestId = body.requestId;
+			if (typeof requestId !== "string" || requestId.length === 0) {
+				json(res, 400, { error: "requestId 必须是非空字符串" });
+				return;
+			}
+			if (typeof body.approved !== "boolean") {
+				json(res, 400, { error: "approved 必须是布尔值" });
+				return;
+			}
+			if (!session.resolveApproval(requestId, body.approved)) {
+				// 不存在 / 已批 / 已拒：统一按"处理过了"回 409，让界面刷新待办而不是报错
+				json(res, 409, { error: "这条审批已经处理过了" });
+				return;
+			}
+			json(res, 200, { ok: true, resolved: true, sessionId: session.id, requestId });
+			return;
 		}
 
 		json(res, 404, { error: "not found" });
-	})().catch((error: unknown) => {
-		json(res, 500, { error: error instanceof Error ? error.message : String(error) });
-	});
+	})().then(
+		// 请求收尾：写操作统一落一条审计（成功与被拦都记，状态码进 detail）
+		() => auth.recordWriteAudit(req, method, pathname, res.statusCode),
+		(error: unknown) => {
+			const status =
+				error instanceof BadRequestError
+					? 400
+					: error instanceof WorkflowHttpError
+						? error.status
+						: 500;
+			json(res, status, { error: error instanceof Error ? error.message : String(error) });
+			auth.recordWriteAudit(req, method, pathname, status);
+		},
+	);
 });
 
 server.listen(PORT, () => {
-	const llm = resolveLlm();
+	const llm = models.currentRuntime();
 	console.log(`biz-agent web 已启动: http://127.0.0.1:${PORT}`);
-	console.log(`会话库: ${DB_PATH}`);
+	console.log(`会话库: ${storage.kind === "postgres" ? "Postgres" : "SQLite"}（${storage.detail}）`);
+	console.log(
+		`鉴权: ${auth.mode === "required" ? "AUTH_MODE=required（登录 + Bearer 令牌 + 四角色）" : "AUTH_MODE=off（默认，全部放行）"}`,
+	);
 	if (llm) {
 		console.log(`模型: ${llm.label}（真实模型）`);
 	} else {
@@ -228,4 +558,37 @@ server.listen(PORT, () => {
 		console.log(`      支持的环境变量: ${supportedKeyEnvs().join(" / ")}`);
 		console.log(`      也可用 LLM_PROVIDER + LLM_MODEL + LLM_BASE_URL + LLM_API_KEY 自由指定`);
 	}
+	const current = models.currentView();
+	console.log(
+		`模型管理: ${models.providerCount()} 个供应商 / ${models.modelCount()} 个模型（当前: ${current.current ?? "模拟模型"}）`,
+	);
 });
+
+// MCP 启动加载：异步做，失败只落库 last_status（registry 内部处理），不阻塞监听、不崩进程
+void mcp.start().catch((error: unknown) => {
+	console.error(`MCP 启动加载失败: ${error instanceof Error ? error.message : String(error)}`);
+});
+
+/** 优雅关闭：停止接受新连接，关闭 MCP 子进程与 SQLite，避免 WAL/句柄未落盘。 */
+function shutdown(signal: string): void {
+	console.log(`\n收到 ${signal}，正在关闭…`);
+	// 先杀 MCP 子进程：SSE/keep-alive 连接可能让 server.close 等一会儿，别留下孤儿 node 进程
+	void mcp.close();
+	server.close(() => {
+		void mcp.close().finally(() => {
+			try {
+				// 先把调用链队列刷完，再关库（顺序反了会丢最后几轮的事件）
+				observability.close();
+				db.close();
+			} catch {
+				// 忽略关闭时可能的已关闭错误
+			}
+			process.exit(0);
+		});
+	});
+	// 兜底：5 秒内没关完就强制退出
+	setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

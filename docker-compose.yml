@@ -1,0 +1,30 @@
+# 本地依赖：只起一个 Postgres（带 pgvector），应用本身仍在本机 `npm run dev` 跑。
+# 用法：
+#   docker compose up -d          # 起库
+#   docker compose logs -f postgres
+#   docker compose down           # 停（数据在 data/pg，删目录才会丢）
+# 应用侧：
+#   $env:DATABASE_URL="postgres://biz:biz@127.0.0.1:5433/biz"; npm run dev
+# 不配 DATABASE_URL 时应用走 SQLite（data/biz-agent.db），功能不变。
+services:
+  postgres:
+    # 官方镜像自带 vector 扩展，省掉自己编译 pgvector
+    image: pgvector/pgvector:pg16
+    container_name: biz-agent-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: biz
+      POSTGRES_PASSWORD: biz
+      POSTGRES_DB: biz
+      # 中文分词用不上，排序规则跟随镜像默认；这里只固定时区，便于审计时间对照
+      TZ: Asia/Shanghai
+    ports:
+      # 5433 而不是 5432：本机可能已有别的 Postgres
+      - "5433:5432"
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biz -d biz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

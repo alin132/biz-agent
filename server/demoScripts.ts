@@ -14,30 +14,16 @@ import { createModels } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { FauxResponseFactory, FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
+import type { ToolRegistry } from "../src/core/registry.js";
 import type { WorkflowDef } from "../src/core/types.js";
 import type { WorkflowEngine } from "../src/core/workflow.js";
 
-/** 每个工具在演示时使用的参数。 */
-const DEMO_ARGS: Record<string, Record<string, unknown>> = {
-	ticket_search: { keyword: "支付" },
-	ticket_assign: { ticketId: "TK-1001", assignee: "李工" },
-	ticket_update_status: { ticketId: "TK-1001", status: "processing" },
-	ticket_notify: { ticketId: "TK-1001", channel: "im", message: "工单已受理，由李工负责跟进" },
-
-	data_describe: {},
-	data_query: { status: "paid" },
-	data_aggregate: { groupBy: "region", metric: "sum_amount" },
-	report_save: {
-		title: "区域销售分析",
-		content: "# 区域销售分析\n\n华南 ¥215,000 居首，华东 ¥204,000 次之，华北 ¥98,000。",
-	},
-
-	approval_check_rules: { type: "报销", amount: 3200 },
-	approval_submit: { applicant: "张明", type: "报销", amount: 3200, reason: "客户拜访差旅" },
-	approval_archive: { approvalId: "AP-1" },
-};
-
-/** 每个流程走完后的总结语（markdown，用于演示排版效果）。 */
+/**
+ * 每个流程走完后的总结语（markdown，用于演示排版效果）。
+ *
+ * 只是"包装"，不是流程的一部分：没配到的流程会退化成按步骤自动生成的总结，
+ * 所以新增流程不写这里也能演示，只是文案朴素一点。
+ */
 const DEMO_SUMMARY: Record<string, string> = {
 	"ticket-flow": [
 		"### 工单处理完成",
@@ -88,7 +74,32 @@ export interface SimulatedRuntime {
 	mode: "simulated";
 }
 
-export function createSimulatedRuntime(workflow: WorkflowDef, engine: WorkflowEngine): SimulatedRuntime {
+/** 流程没写专属台词时的兜底总结：按步骤自动列一遍，新流程不用配也能看到结果。 */
+function fallbackSummary(workflow: WorkflowDef): string {
+	const lines = [`### ${workflow.name}已完成`, ""];
+	workflow.steps.forEach((step, index) => {
+		lines.push(`${index + 1}. ${step.title}`);
+	});
+	lines.push("", "> 当前是模拟模型（未配置 API key），总结文案由流程定义自动生成。");
+	return lines.join("\n");
+}
+
+/** 自动编排没有步骤，模拟模型没法定；直接说清"这一档要真模型"。 */
+const AUTO_SIMULATED_TEXT = [
+	"### 自动编排（当前是模拟模型）",
+	"",
+	"这一档没有写死的步骤，需要模型自己判断该用哪些工具、该加载哪条技能——模拟模型做不到这件事。",
+	"",
+	"两种办法：",
+	"- 在 `.env` 里配一个 API key（或用 `LLM_PROVIDER` 系列变量自定义模型），重启后这一档就会真的自己挑技能；",
+	"- 或者在右侧「技能」里接上一条具体技能再问，模拟模型能按步骤把它演完。",
+].join("\n");
+
+export function createSimulatedRuntime(
+	workflow: WorkflowDef,
+	engine: WorkflowEngine,
+	registry: ToolRegistry,
+): SimulatedRuntime {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -99,11 +110,16 @@ export function createSimulatedRuntime(workflow: WorkflowDef, engine: WorkflowEn
 
 		// 上一步工具失败或被阻断 → 改为说明原因，不要死循环重试。
 		if (last?.role === "toolResult" && last.isError) {
-			return fauxAssistantMessage("执行中断：上一步工具调用未成功，流程没有走完。右侧审计流水里有失败原因。");
+			return fauxAssistantMessage("执行中断：上一步工具调用未成功，这次没走完。右侧审计流水里有失败原因。");
+		}
+
+		// 自动编排没有预设步骤，模拟模型无从"演"，直接说明要真模型
+		if (workflow.steps.length === 0) {
+			return fauxAssistantMessage(AUTO_SIMULATED_TEXT);
 		}
 
 		if (engine.done) {
-			return fauxAssistantMessage(DEMO_SUMMARY[workflow.id] ?? "流程已完成。");
+			return fauxAssistantMessage(DEMO_SUMMARY[workflow.id] ?? fallbackSummary(workflow));
 		}
 
 		const step = engine.currentStep;
@@ -112,7 +128,8 @@ export function createSimulatedRuntime(workflow: WorkflowDef, engine: WorkflowEn
 			return fauxAssistantMessage("流程定义里没有可执行步骤。");
 		}
 
-		const args = (DEMO_ARGS[tool] ?? {}) as Parameters<typeof fauxToolCall>[1];
+		// 演示参数挂在工具定义上（ToolDef.example）：新增流程填了它就能被"演"完
+		const args = (registry.get(tool)?.example ?? {}) as Parameters<typeof fauxToolCall>[1];
 		return fauxAssistantMessage(fauxToolCall(tool, args));
 	};
 

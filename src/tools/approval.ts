@@ -30,6 +30,7 @@ export function createApprovalTools(store: Store): ToolDef[] {
 				},
 				required: ["type", "amount"],
 			},
+			example: { type: "报销", amount: 3200 },
 			execute: async (args) => {
 				const type = String(args.type ?? "");
 				const amount = Number(args.amount ?? 0);
@@ -72,6 +73,7 @@ export function createApprovalTools(store: Store): ToolDef[] {
 				},
 				required: ["applicant", "type", "amount", "reason"],
 			},
+			example: { applicant: "张明", type: "报销", amount: 3200, reason: "客户拜访差旅" },
 			execute: async (args, ctx) => {
 				const applicant = String(args.applicant ?? ctx.userId);
 				const type = String(args.type ?? "");
@@ -112,6 +114,7 @@ export function createApprovalTools(store: Store): ToolDef[] {
 				},
 				required: ["approvalId"],
 			},
+			example: { approvalId: "AP-1" },
 			execute: async (args) => {
 				const approvalId = String(args.approvalId ?? "");
 				const item = store.approvals.find((entry) => entry.id === approvalId);

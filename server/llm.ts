@@ -61,6 +61,47 @@ export function supportedKeyEnvs(): string[] {
 	return PROVIDERS.map((spec) => spec.keyEnv);
 }
 
+/** `LLM_DISABLE=1` 强制模拟模型（冒烟/演示/离线）。 */
+export function llmDisabled(): boolean {
+	return process.env.LLM_DISABLE === "1" || process.env.LLM_DISABLE === "true";
+}
+
+/**
+ * `.env` 里那一份模型配置（P6 的 `default` 供应商用它兜底）。
+ * 返回 null = 没配 key（或 `LLM_DISABLE=1`），此时不该建供应商。
+ */
+export interface EnvProviderInfo {
+	/** pi-ai 的 provider id（deepseek / openai / anthropic / ...） */
+	provider: string;
+	label: string;
+	/** 明文 key：只用于加密后落库，不进出参 */
+	apiKey: string;
+	baseUrl: string | null;
+	modelId: string;
+}
+
+export function envProviderInfo(): EnvProviderInfo | null {
+	const spec = detectProvider();
+	if (!spec) {
+		return null;
+	}
+	const runtime = resolveLlm();
+	if (!runtime) {
+		return null;
+	}
+	const apiKey = (process.env[spec.keyEnv] ?? process.env.LLM_API_KEY ?? "").trim();
+	if (apiKey.length === 0) {
+		return null;
+	}
+	return {
+		provider: spec.id,
+		label: spec.label,
+		apiKey,
+		baseUrl: process.env.LLM_BASE_URL?.trim() || null,
+		modelId: runtime.modelId,
+	};
+}
+
 export interface ModelOption {
 	id: string;
 	label: string;
@@ -68,6 +109,11 @@ export interface ModelOption {
 
 /** 识别当前该用哪个 provider；没有配置任何 key 时返回 null。 */
 function detectProvider(): ProviderSpec | null {
+	// LLM_DISABLE=1 强制走模拟模型：即使 .env 里配了真 key 也不联网。
+	// 用于冒烟测试 / demo / 离线演示，保证结果可复现。
+	if (llmDisabled()) {
+		return null;
+	}
 	const forcedProvider = process.env.LLM_PROVIDER?.trim();
 	const genericKey = process.env.LLM_API_KEY?.trim();
 

@@ -7,44 +7,40 @@
 		<link rel="stylesheet" href="/style.css" />
 	</head>
 	<body>
-		<div class="shell">
-			<!-- 最左侧图标栏 -->
+		<!-- 登录页：只有后端要求登录（GET /api/auth/me 回 401）时才显示，这时整个控制台不渲染 -->
+		<div class="login-gate" id="login-gate" hidden>
+			<form class="login-card" id="login-form">
+				<div class="login-logo">B</div>
+				<h1 class="login-title">登录 biz-agent</h1>
+				<p class="login-sub">用公司邮箱登录：能用哪些工具、能不能发布技能，按角色决定。</p>
+				<label class="login-field">
+					<span class="login-label">邮箱</span>
+					<input class="login-input" id="login-email" type="email" autocomplete="username" placeholder="you@company.com" />
+				</label>
+				<label class="login-field">
+					<span class="login-label">密码</span>
+					<input class="login-input" id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" />
+				</label>
+				<div class="login-error" id="login-error" hidden></div>
+				<button class="login-submit" id="login-submit" type="submit">登录</button>
+			</form>
+		</div>
+
+		<div class="shell" id="shell">
+			<!-- 最左侧图标栏：模块导航（对话 / 知识库 / 技能 / 模型 …），内容由 app.js 渲染 -->
 			<nav class="rail">
 				<div class="rail-logo">B</div>
-
-				<button class="rail-btn" id="rail-new" title="新聊天">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-						<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.3-.6L3 21l1.7-4.6A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z" />
-					</svg>
-				</button>
-				<button class="rail-btn" id="rail-history" title="全部会话">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-						<circle cx="12" cy="12" r="8.5" />
-						<path d="M12 7.5V12l3 2" />
-					</svg>
-				</button>
-				<button class="rail-btn" id="rail-audit" title="运行详情">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-						<rect x="3.5" y="4.5" width="5" height="15" rx="1.2" />
-						<rect x="10.5" y="4.5" width="5" height="10" rx="1.2" />
-						<rect x="17.5" y="4.5" width="3" height="6" rx="1.2" />
-					</svg>
-				</button>
-				<button class="rail-btn" id="rail-more" title="更多">
-					<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
-				</button>
-
+				<div class="rail-nav" id="rail-nav"></div>
 				<div class="rail-spacer"></div>
-				<div class="rail-avatar" id="rail-avatar" title="当前用户">LE</div>
+				<div class="rail-avatar" id="rail-avatar" role="button" tabindex="0" title="当前用户">LE</div>
+				<div class="rail-role" id="rail-role" hidden></div>
 			</nav>
 
 			<!-- 侧边栏 -->
 			<aside class="sidebar">
 				<div class="sidebar-head">
-					<button class="workspace" id="workspace">
-						biz-agent
-						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-					</button>
+					<!-- 工作区名只是标识：新建聊天直接开会话，这里不挂任何菜单 -->
+					<div class="workspace" id="workspace">biz-agent</div>
 					<div class="head-actions">
 						<button class="icon-btn" id="btn-audit" title="运行详情">
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -80,9 +76,20 @@
 					<div class="item-list" id="pinned-list"></div>
 				</div>
 
+				<!-- 会话平铺：不再按「流程」分组，用户视角里只有"聊过的会话"这一层 -->
 				<div class="group">
-					<div class="group-label">流程</div>
-					<div class="flow-groups" id="flow-groups"></div>
+					<div class="group-label">会话</div>
+					<div class="item-list" id="session-list"></div>
+				</div>
+
+				<!-- 已归档：默认收起，点击标题展开（有归档会话时才出现） -->
+				<div class="group" id="archived-group" hidden>
+					<button class="group-label group-toggle" id="archived-toggle" type="button" aria-expanded="false" aria-controls="archived-list">
+						<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+						已归档
+						<span class="archived-count" id="archived-count">0</span>
+					</button>
+					<div class="item-list archived-list" id="archived-list" hidden></div>
 				</div>
 
 				<div class="sidebar-spacer"></div>
@@ -96,8 +103,17 @@
 							<path d="M3.5 7.5a2 2 0 0 1 2-2h3.2l2 2.2h7.8a2 2 0 0 1 2 2v8.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" />
 						</svg>
 						<span id="session-title">新会话</span>
+						<span class="archived-badge" id="archived-badge" hidden>已归档</span>
+						<button class="btn-ghost mini" id="btn-unarchive" type="button" hidden>取消归档</button>
 					</div>
 					<div class="head-tools">
+						<!-- 技能只是状态显示：加载/退出都在右栏或由模型触发，这里不做成入口 -->
+						<span class="skill-chip" id="skill-chip" title="未加载技能">
+							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+								<path d="M12 3.2 14 9l5.8 2-5.8 2-2 5.8-2-5.8L4.2 11 10 9z" />
+							</svg>
+							<span id="skill-chip-label">技能：无</span>
+						</span>
 						<span class="mode-chip" id="mode-chip">—</span>
 						<button class="icon-btn" id="btn-audit-top" title="运行详情">
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -114,10 +130,18 @@
 				<div class="thread" id="messages">
 					<div class="thread-inner" id="thread-inner">
 						<div class="empty" id="empty">
-							<h2>开始一个新任务</h2>
-							<p>在下方描述你要处理的事情，Agent 会按内置流程一步步执行。</p>
+							<div class="empty-mark">B</div>
+							<h2>今天想处理什么？</h2>
+							<p class="empty-sub">用一句话说清要办的事，Agent 会自己挑技能和工具。</p>
 						</div>
 					</div>
+				</div>
+
+				<!-- 0 高度锚点：让「回到底部」贴着消息区底部，输入框长高时也不会被压在输入框上 -->
+				<div class="thread-foot">
+					<button class="to-bottom" id="to-bottom" type="button" title="回到底部" hidden>
+						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14" /><path d="m6 13 6 6 6-6" /></svg>
+					</button>
 				</div>
 
 				<div class="composer-wrap">
@@ -157,6 +181,28 @@
 				</div>
 			</main>
 
+			<!-- 模块页：非「对话」模块时整宽显示（会话栏与右栏技能面板随之收起） -->
+			<main class="module-main" id="module-main">
+				<div class="module-page" id="module-page"></div>
+			</main>
+
+			<!-- 右栏：技能常驻在这里（点一条装进当前会话；模型也会自己按对话挑） -->
+			<aside class="skill-side" id="skill-side">
+				<div class="skill-side-head">
+					<span class="skill-side-title">技能</span>
+					<button class="icon-btn" id="btn-new-skill" type="button" title="新建技能">＋</button>
+				</div>
+
+				<!-- 当前技能：这个会话现在按哪份作业指导书在跑，以及一键退出 -->
+				<div class="skill-current" id="skill-current">
+					<div class="skill-current-name" id="skill-current-name">未加载技能</div>
+					<div class="skill-current-meta" id="skill-current-meta">模型会按你的话自己挑；也可以在这里点一条装进来</div>
+					<button class="btn-ghost mini" id="skill-current-exit" type="button" hidden>退出技能</button>
+				</div>
+
+				<div class="skill-list" id="skill-list"></div>
+			</aside>
+
 			<!-- 右侧抽屉 -->
 			<aside class="drawer" id="drawer">
 				<div class="drawer-head">
@@ -166,10 +212,7 @@
 					</button>
 				</div>
 				<div class="drawer-body">
-					<h4>全部会话</h4>
-					<div class="session-rows" id="drawer-sessions"></div>
-
-					<h4>流程进度</h4>
+					<h4>当前进度</h4>
 					<ol class="steps" id="steps"><li class="placeholder">尚未开始</li></ol>
 
 					<h4>审计流水</h4>
@@ -179,8 +222,89 @@
 
 			<!-- 浮动菜单 -->
 			<div class="menu" id="menu" hidden></div>
+
+			<!-- 技能编辑器：新建 / 编辑技能（内置技能只读查看）；步骤就是它的执行顺序 -->
+			<div class="modal" id="flow-modal" hidden>
+				<div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="flow-modal-title">
+					<div class="modal-head">
+						<span id="flow-modal-title">新建技能</span>
+						<button class="icon-btn" id="flow-modal-close" type="button" title="关闭">
+							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+						</button>
+					</div>
+
+					<div class="modal-body">
+						<label class="field">
+							<span class="field-label">技能名称</span>
+							<input class="field-input" id="flow-name" type="text" maxlength="40" placeholder="例如：销售数据分析" autocomplete="off" spellcheck="false" />
+						</label>
+
+						<label class="field">
+							<span class="field-row">
+								<span class="field-label">系统提示</span>
+								<span class="field-note">必填</span>
+							</span>
+							<textarea class="field-textarea" id="flow-prompt" rows="3" maxlength="4000" placeholder="告诉 Agent 这个技能负责什么、边界在哪…"></textarea>
+						</label>
+
+						<!-- 技能文案：加载这个技能时模型看到的是这两段（不填就退回系统提示） -->
+						<label class="field">
+							<span class="field-row">
+								<span class="field-label">技能一句话说明</span>
+								<span class="field-note">可选 · 用户说什么话时该用它</span>
+							</span>
+							<input class="field-input" id="flow-skill-desc" type="text" maxlength="200" placeholder="例如：让我分析销售数据时用它" autocomplete="off" spellcheck="false" />
+						</label>
+
+						<label class="field">
+							<span class="field-row">
+								<span class="field-label">技能正文</span>
+								<span class="field-note">可选 · 加载后怎么做好</span>
+							</span>
+							<textarea class="field-textarea" id="flow-skill-inst" rows="3" maxlength="4000" placeholder="加载后怎么做好；留空则用系统提示"></textarea>
+						</label>
+
+						<div class="field">
+							<div class="field-row">
+								<span class="field-label">步骤</span>
+								<button class="btn-ghost mini" id="flow-add-step" type="button">＋ 添加步骤</button>
+							</div>
+							<div class="flow-steps" id="flow-steps"></div>
+						</div>
+
+						<div class="flow-error" id="flow-error" hidden></div>
+					</div>
+
+					<div class="modal-foot">
+						<button class="btn-ghost" id="flow-cancel" type="button">取消</button>
+						<button class="btn-primary" id="flow-save" type="button">保存</button>
+					</div>
+				</div>
+			</div>
 		</div>
 
+		<!-- 通用小弹窗：新建知识库 / 技能绑定知识库都用它，内容由 app.js 现填 -->
+		<div class="modal" id="kb-modal" hidden>
+			<form class="modal-card kb-modal-card" id="kb-form" role="dialog" aria-modal="true" aria-labelledby="kb-modal-title">
+				<div class="modal-head">
+					<span id="kb-modal-title">新建知识库</span>
+					<button class="icon-btn" id="kb-modal-close" type="button" title="关闭">
+						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+					</button>
+				</div>
+				<div class="modal-body" id="kb-modal-body"></div>
+				<div class="kb-error" id="kb-error" hidden></div>
+				<div class="modal-foot">
+					<button class="btn-ghost" id="kb-cancel" type="button">取消</button>
+					<button class="btn-primary" id="kb-save" type="button">保存</button>
+				</div>
+			</form>
+		</div>
+
+		<!-- 上传文档：不做 multipart，选中文件后前端读成 base64 以 JSON 提交 -->
+		<input class="kb-file" id="kb-file" type="file" accept=".txt,.md,.csv,.pdf,.docx" hidden />
+
+		<script src="/markdown.js"></script>
 		<script src="/app.js"></script>
 	</body>
 </html>

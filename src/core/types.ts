@@ -5,6 +5,8 @@
  * 被管理后台编辑。只有 runtime.ts 负责把它翻译成 Pi 的 Agent。
  */
 
+import type { Store } from "../store/memory.js";
+
 /** 工具风险等级，决定是否需要人工审批。 */
 export type RiskLevel = "low" | "medium" | "high";
 
@@ -71,6 +73,11 @@ export interface ToolDef {
 	risk: RiskLevel;
 	/** JSON Schema，直接作为 function calling 的 parameters。 */
 	parameters: Record<string, unknown>;
+	/**
+	 * 演示用的一组参数示例（可选）。
+	 * 没有 API key 时，模拟模型拿它"演"一遍流程；不填就只能用空参数调用。
+	 */
+	example?: Record<string, unknown>;
 	execute: (args: Record<string, unknown>, ctx: BizContext) => Promise<ToolResult>;
 }
 
@@ -90,6 +97,30 @@ export interface WorkflowDef {
 	name: string;
 	systemPrompt: string;
 	steps: WorkflowStep[];
+	/**
+	 * 该流程可用的业务工具装配函数。
+	 *
+	 * 流程自带工具，上层（server/）不再按 workflow id 分派——
+	 * 新增一条业务流只要写工具 + 写流程 + 加进 `workflows/index.ts` 的列表，
+	 * 控制台的"新建对话"会自动多出这一项。
+	 */
+	createTools: (store: Store) => ToolDef[];
+	/**
+	 * 技能化文案：把这条流程当"技能"加载时给模型看的说明。
+	 *
+	 * 技能和流程共用同一份定义：步骤仍是 `steps`（状态机推进），
+	 * 这里补的只是"什么时候该用它"（进技能目录的 description）和"加载后怎么做好"（正文）。
+	 * 不填则用 `systemPrompt` + 步骤清单自动拼一份兜底文案。
+	 */
+	skill?: WorkflowSkillText;
+}
+
+/** 流程的技能化文案（可选，见 `WorkflowDef.skill`）。 */
+export interface WorkflowSkillText {
+	/** 一句话触发条件：只有这一句会进系统提示的技能目录（渐进式披露的第一层）。 */
+	description: string;
+	/** 加载后才进上下文的正文：职责边界、坑、汇报要求。不填则回落到 `systemPrompt`。 */
+	instructions?: string;
 }
 
 /** 一次工具调用记录，用于驱动流程状态机。 */

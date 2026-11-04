@@ -53,6 +53,7 @@ export function createDataTools(store: Store): ToolDef[] {
 				},
 				required: [],
 			},
+			example: { status: "paid" },
 			execute: async (args) => {
 				const region = typeof args.region === "string" ? args.region : undefined;
 				const status = typeof args.status === "string" ? args.status : undefined;
@@ -82,6 +83,7 @@ export function createDataTools(store: Store): ToolDef[] {
 				},
 				required: ["groupBy", "metric"],
 			},
+			example: { groupBy: "region", metric: "sum_amount" },
 			execute: async (args) => {
 				const groupBy = String(args.groupBy ?? "region") as "region" | "customer";
 				const metric = String(args.metric ?? "sum_amount") as "sum_amount" | "count";
@@ -118,6 +120,10 @@ export function createDataTools(store: Store): ToolDef[] {
 					content: { type: "string", description: "报告正文，Markdown 格式" },
 				},
 				required: ["title", "content"],
+			},
+			example: {
+				title: "区域销售分析",
+				content: "# 区域销售分析\n\n华南 ¥215,000 居首，华东 ¥204,000 次之，华北 ¥98,000。",
 			},
 			execute: async (args) => {
 				const title = String(args.title ?? "未命名报告");

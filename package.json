@@ -12,8 +12,24 @@
 		"check-model": "tsx scripts/check-model.ts",
 		"live-check": "tsx scripts/live-check.ts",
 		"persist-check": "tsx scripts/persist-check.ts",
+		"db:migrate": "tsx scripts/db-migrate.ts",
+		"db:check": "tsx scripts/db-check.ts",
 		"typecheck": "tsc --noEmit",
 		"verify": "tsx scripts/selftest.ts",
+		"kb:selftest": "tsx scripts/kb-selftest.ts",
+		"auth:selftest": "tsx scripts/auth-selftest.ts",
+		"models:selftest": "tsx scripts/models-selftest.ts",
+		"mcp:selftest": "tsx scripts/mcp-selftest.ts",
+		"obs:selftest": "tsx scripts/observability-selftest.ts",
+		"im:selftest": "tsx scripts/im-selftest.ts",
+		"smoke:auth": "tsx scripts/smoke-auth.ts",
+		"smoke:mcp": "tsx scripts/smoke-mcp.ts",
+		"smoke:openapi": "tsx scripts/smoke-openapi.ts",
+		"smoke:monitor": "tsx scripts/smoke-monitor.ts",
+		"smoke:im": "tsx scripts/smoke-im.ts",
+		"ui-check": "node scripts/ui-check.mjs",
+		"ui-dom-check": "node scripts/ui-dom-check.mjs",
+		"ui-shot": "node scripts/ui-shot.mjs",
 		"smoke": "tsx scripts/smoke.ts",
 		"demo:ticket": "tsx examples/ticket.demo.ts",
 		"demo:data": "tsx examples/data.demo.ts",
@@ -23,10 +39,15 @@
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "1.5.0",
 		"@earendil-works/pi-ai": "1.5.0",
-		"@earendil-works/pi-schema": "1.5.0"
+		"@earendil-works/pi-schema": "1.5.0",
+		"mammoth": "^1.13.0",
+		"pg": "^8.23.1",
+		"unpdf": "^1.9.1"
 	},
 	"devDependencies": {
 		"@types/node": "^22.19.0",
+		"@types/pg": "^8.23.1",
+		"jszip": "^3.10.2",
 		"tsx": "^4.20.0",
 		"typescript": "^5.9.0"
 	}

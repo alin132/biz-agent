@@ -32,6 +32,7 @@ export function createTicketTools(store: Store): ToolDef[] {
 				},
 				required: [],
 			},
+			example: { keyword: "支付" },
 			execute: async (args) => {
 				const keyword = typeof args.keyword === "string" ? args.keyword : undefined;
 				const status = typeof args.status === "string" ? args.status : undefined;
@@ -66,6 +67,7 @@ export function createTicketTools(store: Store): ToolDef[] {
 				},
 				required: ["ticketId", "assignee"],
 			},
+			example: { ticketId: "TK-1001", assignee: "李工" },
 			execute: async (args) => {
 				const ticketId = String(args.ticketId ?? "");
 				const assignee = String(args.assignee ?? "");
@@ -96,6 +98,7 @@ export function createTicketTools(store: Store): ToolDef[] {
 				},
 				required: ["ticketId", "status"],
 			},
+			example: { ticketId: "TK-1001", status: "processing" },
 			execute: async (args) => {
 				const ticketId = String(args.ticketId ?? "");
 				const status = String(args.status ?? "") as Ticket["status"];
@@ -129,6 +132,7 @@ export function createTicketTools(store: Store): ToolDef[] {
 				},
 				required: ["ticketId", "channel", "message"],
 			},
+			example: { ticketId: "TK-1001", channel: "im", message: "工单已受理，由李工负责跟进" },
 			execute: async (args) => {
 				const ticketId = String(args.ticketId ?? "");
 				const channel = String(args.channel ?? "im");
