@@ -17,6 +17,7 @@
 		"typecheck": "tsc --noEmit",
 		"verify": "tsx scripts/selftest.ts",
 		"kb:selftest": "tsx scripts/kb-selftest.ts",
+		"kb:pg:selftest": "tsx scripts/kb-pg-selftest.ts",
 		"auth:selftest": "tsx scripts/auth-selftest.ts",
 		"models:selftest": "tsx scripts/models-selftest.ts",
 		"mcp:selftest": "tsx scripts/mcp-selftest.ts",

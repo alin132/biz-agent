@@ -42,10 +42,10 @@
 | 阶段 | 内容 | 验收入口（实测项数） | 状态 |
 |---|---|---|---|
 | P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 230 项 | 完成 |
-| P2 | 存储层 + Postgres 路径 | `smoke` 双后端、`persist-check` | 完成（pgvector 待真镜像复核） |
+| P2 | 存储层 + Postgres/pgvector 路径 | `smoke` / `persist-check` / `db:check` 双后端、`kb:pg:selftest` 16 项 | 完成（PG 用 PGlite 真内核验证；Docker 镜像本身未实机） |
 | P3 | 企业安全（登录 / JWT / 四角色 / 限流 / 审计） | `auth:selftest` 41 项 + `smoke:auth` 51 项 | 完成 |
 | P4 | 开放 API（API Key + `/v1/chat` + `/v1/health`） | `smoke:openapi` 53 项 | 完成 |
-| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`） | `kb:selftest` 52 项 + `smoke` 场景 G 24 项 | 完成 |
+| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`） | `kb:selftest` 52 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 | 完成 |
 | P6 | 多模型管理（供应商 + 模型 + 当前选择 + 连通性探测） | `models:selftest` 22 项 | 完成 |
 | P7 | MCP 集成（stdio / HTTP / SSE 三种传输） | `mcp:selftest` 30 项 + `smoke:mcp` 45 项 | 完成 |
 | P8 | IM Bot 网关（钉钉回调 + 加签回推 + fake outbox） | `im:selftest` 26 项 + `smoke:im` 37 项 | 完成 |
@@ -53,6 +53,7 @@
 
 `npm run typecheck` 通过、`npm run verify` 55 项边界检查、`npm run ui-check` 14 项前端渲染单测、
 `npm run ui-dom-check` **230 项**控制台接线自检、`npm run kb:selftest` 52 项知识库自检、
+`npm run kb:pg:selftest` 16 项 Postgres/pgvector 自检、
 `npm run auth:selftest` 41 项安全自检、`npm run models:selftest` 22 项多模型自检、
 `npm run mcp:selftest` 30 项 MCP 自检、`npm run obs:selftest` 22 项可观测自检、
 `npm run smoke` 164 项端到端检查、`npm run smoke:auth` 51 项鉴权端到端、
@@ -377,6 +378,19 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 工具检索当前技能（没加载技能时回落到会话自己的流程）绑定的库（`server/kb/tool.ts`，会话级工具，**不进**
 `/api/tools` 业务工具目录，自定义流程的 `via` 也不能引用它）。
 
+**存储后端与检索下推**：知识库 DAO 有 `KbStore` 这一份契约、两种实现，跟着宿主的 `DATABASE_URL` 自动选：
+
+| 后端 | 表 | 向量存法 | 语义检索在哪算 |
+|---|---|---|---|
+| SQLite（默认） | `DB_PATH` 同一个库文件（`server/kb/schema.ts` 建表） | `kb_chunks.embedding` 存 JSON 文本 | `server/kb/store.ts` 读回内存算余弦 |
+| Postgres（配了 `DATABASE_URL`） | `db/migrations/0001_init.sql` + `0007_kb_pgvector.sql` | `kb_chunks.embedding` 是 pgvector 的 `vector` 列 | `server/kb/pgStore.ts` 用 `embedding <=> $vec` 排序，只回命中行 |
+
+- 两边的 SQLite / PG 表名、列名与行映射一致（共用 `server/kb/store.ts` 的归一化与映射），所以 service / routes / `kb_search` 不知道底下是哪种库。
+- **向量维度不固定**：`0007_kb_pgvector.sql` 把 `embedding` 从 `vector(1024)` 改成无维度 `vector`（默认模型是 1536 维、可换 1024/3072）；
+  代价是 HNSW 索引必须有固定维度，所以删掉那条索引、语义检索走精确余弦扫描（单机控制台规模够用）。
+- PG 分支的 `KbStore` 方法也是同步的，复用存储层那套「工作线程跑 pg + 主线程 Atomics.wait」的同步桥；
+  没装 pgvector 扩展时启动会 warn，检索自动回退关键词。
+
 ### 支持的文件与上传
 
 - 格式：`txt` / `md` / `markdown` / `csv` / `pdf` / `docx`；单文件上限 **20 MB**（请求体上限 32 MB），解析超时 60 秒。
@@ -400,7 +414,8 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 - `GET /api/kb/embedding` 返回 `{ available, model, baseUrl }`，页面据此显示「语义检索 / 关键词检索」；
   `available` 只表示配没配 key，具体某个库有没有向量看库行的 `embedding`（`embeddedChunkCount > 0`）。
 - **向量化失败绝不阻断上传**：文档与分块先落库（`ready`），检索退回关键词，响应里带 `warning`。
-- 换模型不会崩：向量按模型返回的维度存 JSON 文本，不假设维度；维度对不上时相似度按 0 处理。
+- 换模型不会崩：向量按模型返回的维度存（SQLite 是 JSON 文本、PG 是 pgvector 的无维度 `vector` 列），不假设维度；
+  维度确实对不上时 SQLite 按相似度 0 处理，PG 会让 pgvector 报错 → 检索层回退关键词并带 `fallbackReason`。
 
 ### 技能绑定与 `kb_search`
 
@@ -415,10 +430,11 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 
 - PDF 没有 OCR：扫描件解析不出文字会直接报「可能是扫描件（暂不支持 OCR）」。
 - 上传后再补 `EMBEDDING_API_KEY`，**旧文档不会自动重嵌入**；要语义检索得重新上传。
-- **PG/pgvector 向量检索尚未接入**：知识库 DAO 目前只有 SQLite 实现（`server/kb/store.ts`），
-  `db/migrations/0001_init.sql` 里给 PG 预留了 KB 表与 `vector` 列，但没有任何 DAO 会切过去。
-- **KB 表只落 SQLite**：`initKb({ dbPath })` 与会话同库文件（`DB_PATH`）；配了 `DATABASE_URL` 时会话/技能走 PG，
-  知识库仍写这个本地文件，启动日志会打警告。
+- **pgvector 只保证"能检索"，没有 HNSW 索引**：`0007` 迁移把向量列改成无维度、删掉 HNSW 索引，
+  语义检索走精确余弦扫描（知识库是单机控制台规模；要上千万级块再按固定维度 + 分表建 HNSW）。
+- **PG 的 pgvector 检索没有在真实 Docker 镜像里跑过**：本机 Docker Desktop 起不来，PG 侧（含 pgvector）
+  是用 PGlite（真 PostgreSQL 18.6 WASM + pgvector 扩展）+ 线上协议代理验的，`docker-compose.yml` 的镜像本身未实机；
+  没装 `vector` 扩展的 Postgres 会自动回退关键词检索。
 - 上传在请求内同步解析：20 MB 大文件会让这次请求等一会儿（还没有异步任务队列）。
 
 ---
@@ -621,8 +637,9 @@ npm run persist-check -- --read <SESSION_ID> --continue
   内置流程不落库——它们仍是 `src/workflows/` 里的代码，`WorkflowRepo` 负责把两个来源合并成一份索引。
 - `users` / `audit_logs`：P3 的成员与平台审计（`audit_logs` 记 actor / action / target / detail，
   写操作自动落库；P9 起可查 `trace_id`，支持 `actorType` / `targetType` / 时间范围 / 关键字过滤）。
-- `knowledge_bases` / `kb_documents` / `kb_chunks` / `skill_kb_bindings`：P5 的知识库、文档、分块（向量存 JSON 文本列）
-  与技能绑定；表结构在 `server/kb/schema.ts`（见「知识库」章节的已知限制）。
+- `knowledge_bases` / `kb_documents` / `kb_chunks` / `skill_kb_bindings`：P5 的知识库、文档、分块与技能绑定。
+  SQLite 的表内建在 `server/kb/schema.ts`（向量存 JSON 文本列）；PG 的表在 `0001_init.sql`，向量列由
+  `0007_kb_pgvector.sql` 改成无维度 `vector`（pgvector 检索，见「知识库」章节）。
 - `model_providers` / `models`：P6 的供应商与模型两层；`api_key_encrypted` 存 AES-256-GCM 密文，永不存明文。
 - `api_keys`：P4 的开放 API Key（`prefix` + `key_hash`（sha256） + 角色 / 限额 / 停用 / 吊销时间 / 最近使用）。
 - `mcp_servers` / `mcp_tools`：P7 的 MCP 服务配置（传输、命令/地址、headers/env、`last_status` / `last_error`）
@@ -648,6 +665,7 @@ Postgres 路径（P2）：
   | `0004_mcp.sql` | P7 给 `mcp_servers` 补 `env` / `last_status` / `last_error` / `last_checked_at` 与三个索引（0001 已建两张 MCP 表，不重建） |
   | `0005_observability.sql` | P9 给 `trace_events` 补 `ok` / `ms` 列、加 `(trace_id, seq)` 唯一索引与三个查询索引，并加 `audit_logs` 的 `actor_type` / `target_type` 索引 |
   | `0006_im.sql` | P8 IM 机器人回调相关列与索引（`robot_code` / `aes_key_enc` / `last_callback_at` / `last_msg_id`）；后端与控制台页面都已接入 |
+  | `0007_kb_pgvector.sql` | P5 收尾：`kb_chunks.embedding` 从 `vector(1024)` 改成无维度 `vector`（换 embedding 模型不再被维度卡死），删掉 HNSW 索引改精确余弦扫描；PG 知识库检索就此接上 |
 
   **迁移只服务 PG**——SQLite 表结构内建在 `server/db/sqlite.ts` 与 `server/kb/schema.ts`
   （`CREATE TABLE IF NOT EXISTS` + PRAGMA/ALTER 自愈），加表要两边都加。
@@ -658,8 +676,8 @@ Postgres 路径（P2）：
   代价是 PG 后端**每次存储调用都会阻塞主线程毫秒级**；单用户开发够用，高并发 / 多实例不在当前范围
   （那需要连接池 + 全异步改造）。别为了"性能"把 storage 层改成返回 Promise——上层一个都 await 不了。
 - 只有 `DATABASE_URL` 存在时才加载 worker；依赖只有 `pg` + `@types/pg`。
-- **知识库仍只落 SQLite**：配了 `DATABASE_URL` 时会话/技能走 PG，KB 四张表仍写 `DB_PATH` 的本地库文件，
-  启动会打警告；PG/pgvector 向量检索未接（见「知识库」章节）。
+- **知识库跟着 `DATABASE_URL` 走**：配了 PG 时 KB 四张表也在 PG 里，语义检索由 pgvector（`server/kb/pgStore.ts`）执行；
+  没配时仍落 `DB_PATH` 的 SQLite 文件、向量在本地算余弦。启动日志会打一行 `[kb] 知识库存储后端：sqlite / postgres`。
 
 改路径用 `DB_PATH`（SQLite）或 `DATABASE_URL`（Postgres）环境变量。
 
@@ -677,7 +695,8 @@ npm run demo:approval    # 切片 C
 npm run verify           # 边界能力自检（55 项）
 npm run ui-check         # 前端渲染单测（markdown，node:vm 沙盒，14 项）
 npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，230 项）
-npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具，52 项）
+npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具，52 项，SQLite 本地）
+npm run kb:pg:selftest   # 知识库 Postgres/pgvector 自检（16 项；需 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest    # 安全自检（scrypt/JWT/RBAC/限流/审计/成员保护，41 项）
 npm run models:selftest  # 多模型自检（AES-256-GCM/掩码/首启 default/ping，22 项）
 npm run mcp:selftest     # MCP 自检（stdio/HTTP/SSE、命名、超时与关闭，30 项）
@@ -850,7 +869,7 @@ biz-agent/
 │   ├── session.ts         会话管理、事件翻译、审批挂起与全局待办（`approvalMeta` / `pendingApprovalViews` / `pendingApprovals`）、flow_xxx 装配、技能加载/退出、kb_search、MCP 工具并入、trace 打点（traceIds/createdBy）
 │   ├── workflows.ts       运行时流程仓库：内置（代码）+ 自定义（存储层）合并成索引（含技能文案）
 │   ├── auth/              企业安全（P3）：scrypt 口令、HS256 JWT、四角色权限矩阵、登录限流、审计与成员接口（含 PATCH/DELETE 成员写接口）
-│   ├── kb/                知识库（P5）：解析/分块/向量化/检索/技能绑定/会话级 kb_search 工具
+│   ├── kb/                知识库（P5）：两种 DAO 后端（store.ts=SQLite JSON 向量 / pgStore.ts=PG pgvector）、解析/分块/向量化/检索/技能绑定/会话级 kb_search 工具
 │   ├── models/            多模型管理（P6）：AES-256-GCM 加解密（crypto.ts）、供应商/模型 DAO、运行时与 ping（service.ts）、/api/models*
 │   ├── apiKeys/           开放 API 的 Key（P4）：`bk_` 生成 + sha256 落库 + 令牌桶限流 + /api/api-keys*
 │   ├── openapi/           开放 API（P4）：/v1/chat（非流式 + SSE）、/v1/health、统一错误与审计
@@ -868,7 +887,7 @@ biz-agent/
 │   └── demoScripts.ts     模拟模型（无 key 时按流程演出）
 ├── db/migrations/         Postgres 迁移（0001_init.sql：vector + pg_trgm、17 张表；0002_auth.sql：审计列/邮箱索引；
 │                          0003_models.sql：供应商/模型表；0004_mcp.sql：MCP 运行时列/索引；0005_observability.sql：事件列/唯一索引/审计索引；
-│                          0006_im.sql：IM 回调列/索引）；SQLite 不跑
+│                          0006_im.sql：IM 回调列/索引；0007_kb_pgvector.sql：KB 向量列去维度 + 去 HNSW）；SQLite 不跑
 ├── web/                   控制台前端（原生 JS，无构建）
 │   ├── index.html
 │   ├── style.css
@@ -878,7 +897,8 @@ biz-agent/
 ├── examples/              终端 demo
 └── scripts/
     ├── selftest.ts        边界能力自检（55 项）
-    ├── kb-selftest.ts     知识库自检（52 项，解析/分块/检索/绑定/工具，不起服务）
+    ├── kb-selftest.ts     知识库自检（52 项，SQLite 本地，解析/分块/检索/绑定/工具，不起服务）
+    ├── kb-pg-selftest.ts  知识库 Postgres/pgvector 自检（16 项，需 DATABASE_URL + 迁移，没配就跳过）
     ├── auth-selftest.ts   安全自检（41 项，scrypt/JWT/RBAC/限流/审计/成员保护，不起服务）
     ├── models-selftest.ts 多模型自检（22 项，AES-256-GCM/掩码/首启 default/ping，不起服务）
     ├── mcp-selftest.ts    MCP 自检（30 项，stdio/HTTP/SSE 传输、命名、超时/关闭，不起服务）
@@ -1030,7 +1050,8 @@ SQLite 天生同步；Postgres 用「工作线程跑异步 `pg` + 主线程 `Ato
 **为什么迁移只服务 Postgres？**
 `db/migrations/*.sql` 里用的是 PG 方言（`vector` 扩展、`gin` / `hnsw` 索引、`to_tsvector`），SQLite 没有对应能力。
 SQLite 的表结构继续内建在 `server/db/sqlite.ts`，知识库的四张表在 `server/kb/schema.ts`，老库缺列靠 PRAGMA + ALTER 自愈
-（见 AGENTS 坑 19 / 23 / 24）。所以加表要两边都加，迁移不是"两边通用"的机制。
+（见 AGENTS 坑 19 / 23 / 24）。反过来，PG 的知识库表全部由迁移建（`0001` + `0007`），
+`server/kb/pgStore.ts` 只查询不建表。所以加表/改列要两边都加，迁移不是"两边通用"的机制。
 
 ---
 
@@ -1056,10 +1077,11 @@ SQLite 的表结构继续内建在 `server/db/sqlite.ts`，知识库的四张表
   想演示"模型自己挑技能"得配真实模型。控制台在右栏技能面板点一条（或直接打 `POST /api/sessions/:id/skills`）可以随时手工加载/退出。
   另外技能正文会占上下文，步骤越多越长——这正是它和 `flow_*` 委托执行的分工。
 - **默认单机 SQLite**：不配 `DATABASE_URL` 时存储层就是本地单文件（会话 / 技能 / 成员 / 审计 / 知识库 / 模型 / API Key /
-  MCP / 调用链都在里面），部署多实例要切 Postgres。PG 路径已通（P2），但有两点边界：**PG 路径没有在真实库上验证过**
-  （本机 Docker Desktop 起不来，docker 不可用；P2 用 PGlite 代跑过，`0003`~`0006` 的增量 SQL 只做了离线核对）；
-  PG 后端每次存储调用会阻塞主线程毫秒级（同步桥），高并发 / 多实例不在当前范围。知识库这一轮仍只落 SQLite，
-  PG/pgvector 检索未接（见「知识库」章节）。
+  MCP / 调用链都在里面），部署多实例要切 Postgres。PG 路径已通（P2），但有边界：**Docker 镜像本身没在真实库上跑过**
+  （本机 Docker Desktop 起不来；迁移 `0001`~`0007`、`db:check`、`smoke`、`persist-check`、pgvector 检索是用
+  PGlite（真 PostgreSQL 18.6 WASM + pgvector 扩展）跑通的，`docker-compose.yml` 里的镜像未实机）；
+  PG 后端每次存储调用会阻塞主线程毫秒级（同步桥），高并发 / 多实例不在当前范围。知识库在 PG 后端同样落 PG 表，
+  语义检索走 pgvector（见「知识库」章节）。
 - **当前模型选择不持久化**：`/api/models/current` 只改进程内存，重启后回落到第一条可用的 `chat` 模型；
   想固定默认模型得改 `.env`（或首启自动建的 `default` 供应商）。
 - **MCP 工具默认 `high` 风险**：平台的 `RiskLevel` 只有 low/medium/high（没有 `write`），而审批只在 `high` 触发——

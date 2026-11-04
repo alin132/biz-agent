@@ -2,9 +2,10 @@
  * 知识库 DAO（SQLite / `node:sqlite`）。
  *
  * 为什么不用 `server/db/**` 那套 `Storage` 契约：那层的 DAO 签名要同时满足 Postgres 的同步桥，
- * 塞进知识库的十来张查询只会把两边都绑死；这一轮先做 SQLite，等 PG/pgvector 接上时
- * 再抽一个 `KbStorage` 接口给两种实现。当前实现**只依赖库文件路径**，不 import 宿主存储层，
- * 单测可以直接拿一个临时文件建一套。
+ * 塞进知识库的十来张查询只会把两边都绑死；所以知识库自己定义一个 `KbStore` 契约，
+ * SQLite（本文件，本地 JSON 向量）与 Postgres（`pgStore.ts`，pgvector）各实现一份，
+ * 归一化校验/行映射/列表 SELECT 放在本文件导出给两边共用。SQLite 实现只依赖库文件路径，
+ * 不 import 宿主存储层，单测可以直接拿一个临时文件建一套。
  *
  * 约定：
  *   - 所有 SQL 参数化（`?`），没有字符串拼 SQL。
@@ -16,7 +17,9 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { parseEmbedding } from "./embedding.js";
 import { badRequest, notFound } from "./errors.js";
+import { cosineSimilarity } from "./search.js";
 import { ensureKbSchema, resolveKbDbPath } from "./schema.js";
 import type { KbChunkRow, KbDocumentRow, KnowledgeBaseRow } from "./schema.js";
 
@@ -81,8 +84,15 @@ export interface ListChunksOptions {
 	limit?: number;
 }
 
+/** 语义检索命中：块 + 相似度（0..1，已四舍五入到 4 位）。 */
+export interface KbVectorHit {
+	chunk: KbChunkRow;
+	score: number;
+}
+
 export interface KbStore {
-	info(): { path: string; kind: "sqlite" };
+	/** 后端种类：sqlite 存 JSON 向量（本地余弦），postgres 用 pgvector 的余弦距离运算符。 */
+	info(): { path: string; kind: "sqlite" | "postgres" };
 	close(): void;
 
 	createKnowledgeBase(input: KnowledgeBaseInput): KnowledgeBaseRow;
@@ -104,6 +114,13 @@ export interface KbStore {
 	countChunks(kbId: string): number;
 	countEmbeddedChunks(kbId: string): number;
 	updateChunkEmbeddings(updates: { id: number; embedding: string }[]): void;
+
+	/**
+	 * 语义检索：由**存储后端**负责排名。SQLite 读 JSON 向量在本地算余弦；
+	 * Postgres 直接下推给 pgvector（`embedding <=> $vec`），只回命中行。
+	 * 只返回已经带向量的块，调用方不再需要把整库块读进内存。
+	 */
+	searchByEmbedding(kbId: string, queryVector: number[], options: { topK: number; threshold: number }): KbVectorHit[];
 
 	setSkillBindings(skillId: string, kbIds: string[]): void;
 	getSkillKbIds(skillId: string): string[];
@@ -150,12 +167,100 @@ interface ChunkDbRow {
 	embedding: string | null;
 }
 
-/** LIKE 预筛时把用户词里的通配符转义掉，避免查询语义被 `%` 带偏。 */
-function escapeLike(token: string): string {
+/** 建库入参归一化 + 校验（SQLite / Postgres 共用；错误文案直接上界面，不写英文技术黑话）。 */
+export interface NormalizedKnowledgeBaseInput {
+	name: string;
+	description: string | null;
+	embeddingModel: string | null;
+	chunkSize: number;
+	chunkOverlap: number;
+	similarityThreshold: number;
+}
+
+export function normalizeKnowledgeBaseInput(input: KnowledgeBaseInput): NormalizedKnowledgeBaseInput {
+	const name = (input.name ?? "").trim();
+	if (name.length === 0) {
+		throw badRequest("知识库名称不能为空");
+	}
+	if (name.length > KB_LIMITS.nameMaxLength) {
+		throw badRequest(`知识库名称最多 ${KB_LIMITS.nameMaxLength} 个字符`);
+	}
+	const description = (input.description ?? "").trim();
+	if (description.length > KB_LIMITS.descriptionMaxLength) {
+		throw badRequest(`知识库说明最多 ${KB_LIMITS.descriptionMaxLength} 个字符`);
+	}
+	return {
+		name,
+		description: description.length > 0 ? description : null,
+		embeddingModel: input.embeddingModel ?? null,
+		chunkSize: Math.round(clampNumber(input.chunkSize, DEFAULT_CHUNK_SIZE, 200, 4000)),
+		chunkOverlap: Math.round(clampNumber(input.chunkOverlap, DEFAULT_CHUNK_OVERLAP, 0, 1000)),
+		similarityThreshold: clampNumber(input.similarityThreshold, DEFAULT_SIMILARITY_THRESHOLD, 0, 1),
+	};
+}
+
+/** 列表/详情共用的一段 SELECT：三个计数用子查询算，读的时候不用再拆表（两种后端语法一致）。 */
+export const KB_LIST_SELECT = `
+	SELECT
+		kb.*,
+		(SELECT COUNT(*) FROM kb_documents d WHERE d.kb_id = kb.id)                        AS doc_count,
+		(SELECT COUNT(*) FROM kb_chunks c WHERE c.kb_id = kb.id)                           AS chunk_count,
+		(SELECT COUNT(*) FROM kb_chunks c WHERE c.kb_id = kb.id AND c.embedding IS NOT NULL) AS embedded_chunk_count
+	FROM knowledge_bases kb
+`;
+
+/** 行 → 驼峰视图（SQLite 与 Postgres 的列名一致，两边共用）。 */
+export function mapKnowledgeBaseRow(row: KnowledgeBaseDbRow): KnowledgeBaseRow {
+	return {
+		id: row.id,
+		name: row.name,
+		description: row.description,
+		embeddingModel: row.embedding_model,
+		chunkSize: Number(row.chunk_size),
+		chunkOverlap: Number(row.chunk_overlap),
+		similarityThreshold: Number(row.similarity_threshold),
+		createdAt: Number(row.created_at),
+		updatedAt: Number(row.updated_at),
+		docCount: Number(row.doc_count),
+		chunkCount: Number(row.chunk_count),
+		embeddedChunkCount: Number(row.embedded_chunk_count),
+	};
+}
+
+export function mapDocumentRow(row: DocumentDbRow): KbDocumentRow {
+	return {
+		id: row.id,
+		kbId: row.kb_id,
+		filename: row.filename,
+		mime: row.mime,
+		bytes: Number(row.bytes),
+		status: row.status,
+		error: row.error,
+		chunkCount: Number(row.chunk_count),
+		createdAt: Number(row.created_at),
+		updatedAt: Number(row.updated_at),
+	};
+}
+
+export function mapChunkRow(row: ChunkDbRow): KbChunkRow {
+	return {
+		id: Number(row.id),
+		docId: row.doc_id,
+		kbId: row.kb_id,
+		seq: Number(row.seq),
+		heading: row.heading,
+		content: row.content,
+		tokens: Number(row.tokens),
+		embedding: row.embedding,
+	};
+}
+
+/** LIKE 预筛时把用户词里的通配符转义掉，避免查询语义被 `%` 带偏（两种后端共用）。 */
+export function escapeLike(token: string): string {
 	return token.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
-function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+export function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
 	const number = typeof value === "number" && Number.isFinite(value) ? value : fallback;
 	return Math.min(max, Math.max(min, number));
 }
@@ -197,64 +302,9 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 		}
 	}
 
-	function toKnowledgeBase(row: KnowledgeBaseDbRow): KnowledgeBaseRow {
-		return {
-			id: row.id,
-			name: row.name,
-			description: row.description,
-			embeddingModel: row.embedding_model,
-			chunkSize: Number(row.chunk_size),
-			chunkOverlap: Number(row.chunk_overlap),
-			similarityThreshold: Number(row.similarity_threshold),
-			createdAt: Number(row.created_at),
-			updatedAt: Number(row.updated_at),
-			docCount: Number(row.doc_count),
-			chunkCount: Number(row.chunk_count),
-			embeddedChunkCount: Number(row.embedded_chunk_count),
-		};
-	}
-
-	function toDocument(row: DocumentDbRow): KbDocumentRow {
-		return {
-			id: row.id,
-			kbId: row.kb_id,
-			filename: row.filename,
-			mime: row.mime,
-			bytes: Number(row.bytes),
-			status: row.status,
-			error: row.error,
-			chunkCount: Number(row.chunk_count),
-			createdAt: Number(row.created_at),
-			updatedAt: Number(row.updated_at),
-		};
-	}
-
-	function toChunk(row: ChunkDbRow): KbChunkRow {
-		return {
-			id: Number(row.id),
-			docId: row.doc_id,
-			kbId: row.kb_id,
-			seq: Number(row.seq),
-			heading: row.heading,
-			content: row.content,
-			tokens: Number(row.tokens),
-			embedding: row.embedding,
-		};
-	}
-
-	/** 列表/详情共用的一段 SELECT：三个计数用子查询算，读的时候不用再拆表。 */
-	const KB_SELECT = `
-		SELECT
-			kb.*,
-			(SELECT COUNT(*) FROM kb_documents d WHERE d.kb_id = kb.id)                        AS doc_count,
-			(SELECT COUNT(*) FROM kb_chunks c WHERE c.kb_id = kb.id)                           AS chunk_count,
-			(SELECT COUNT(*) FROM kb_chunks c WHERE c.kb_id = kb.id AND c.embedding IS NOT NULL) AS embedded_chunk_count
-		FROM knowledge_bases kb
-	`;
-
 	function findKnowledgeBase(id: string): KnowledgeBaseRow | undefined {
-		const row = db.prepare(`${KB_SELECT} WHERE kb.id = ?`).get(id) as KnowledgeBaseDbRow | undefined;
-		return row ? toKnowledgeBase(row) : undefined;
+		const row = db.prepare(`${KB_LIST_SELECT} WHERE kb.id = ?`).get(id) as KnowledgeBaseDbRow | undefined;
+		return row ? mapKnowledgeBaseRow(row) : undefined;
 	}
 
 	const store: KbStore = {
@@ -269,22 +319,12 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 		/* ---------------- 知识库 ---------------- */
 
 		createKnowledgeBase(input) {
-			const name = (input.name ?? "").trim();
-			if (name.length === 0) {
-				throw badRequest("知识库名称不能为空");
-			}
-			if (name.length > KB_LIMITS.nameMaxLength) {
-				throw badRequest(`知识库名称最多 ${KB_LIMITS.nameMaxLength} 个字符`);
-			}
-			const description = (input.description ?? "").trim();
-			if (description.length > KB_LIMITS.descriptionMaxLength) {
-				throw badRequest(`知识库说明最多 ${KB_LIMITS.descriptionMaxLength} 个字符`);
-			}
-			const existing = db.prepare("SELECT id FROM knowledge_bases WHERE name = ?").get(name) as
+			const normalized = normalizeKnowledgeBaseInput(input);
+			const existing = db.prepare("SELECT id FROM knowledge_bases WHERE name = ?").get(normalized.name) as
 				| { id: string }
 				| undefined;
 			if (existing) {
-				throw badRequest(`同名知识库已存在：${name}`);
+				throw badRequest(`同名知识库已存在：${normalized.name}`);
 			}
 			const id = `kb_${randomUUID()}`;
 			const now = Date.now();
@@ -294,12 +334,12 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			).run(
 				id,
-				name,
-				description.length > 0 ? description : null,
-				input.embeddingModel ?? null,
-				Math.round(clampNumber(input.chunkSize, DEFAULT_CHUNK_SIZE, 200, 4000)),
-				Math.round(clampNumber(input.chunkOverlap, DEFAULT_CHUNK_OVERLAP, 0, 1000)),
-				clampNumber(input.similarityThreshold, DEFAULT_SIMILARITY_THRESHOLD, 0, 1),
+				normalized.name,
+				normalized.description,
+				normalized.embeddingModel,
+				normalized.chunkSize,
+				normalized.chunkOverlap,
+				normalized.similarityThreshold,
 				now,
 				now,
 			);
@@ -307,8 +347,8 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 		},
 
 		listKnowledgeBases() {
-			const rows = db.prepare(`${KB_SELECT} ORDER BY kb.created_at ASC`).all() as unknown as KnowledgeBaseDbRow[];
-			return rows.map(toKnowledgeBase);
+			const rows = db.prepare(`${KB_LIST_SELECT} ORDER BY kb.created_at ASC`).all() as unknown as KnowledgeBaseDbRow[];
+			return rows.map(mapKnowledgeBaseRow);
 		},
 
 		getKnowledgeBase(id) {
@@ -390,12 +430,12 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 					`SELECT * FROM kb_documents WHERE kb_id = ? ORDER BY created_at ASC`,
 				)
 				.all(kbId) as unknown as DocumentDbRow[];
-			return rows.map(toDocument);
+			return rows.map(mapDocumentRow);
 		},
 
 		getDocument(id) {
 			const row = db.prepare("SELECT * FROM kb_documents WHERE id = ?").get(id) as DocumentDbRow | undefined;
-			return row ? toDocument(row) : undefined;
+			return row ? mapDocumentRow(row) : undefined;
 		},
 
 		removeDocument(id) {
@@ -463,7 +503,7 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 					`SELECT * FROM kb_chunks WHERE ${where.join(" AND ")} ORDER BY doc_id, seq LIMIT ?`,
 				)
 				.all(...params, limit) as unknown as ChunkDbRow[];
-			return rows.map(toChunk);
+			return rows.map(mapChunkRow);
 		},
 
 		countChunks(kbId) {
@@ -490,6 +530,33 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 					statement.run(update.embedding, update.id);
 				}
 			});
+		},
+
+		searchByEmbedding(kbId, queryVector, options) {
+			const topK = Math.max(1, Math.min(KB_LIMITS.topKMax, Math.round(options.topK)));
+			const threshold = Number.isFinite(options.threshold) ? options.threshold : 0;
+			const rows = db
+				.prepare("SELECT * FROM kb_chunks WHERE kb_id = ? AND embedding IS NOT NULL ORDER BY doc_id, seq")
+				.all(kbId) as unknown as ChunkDbRow[];
+			const hits: KbVectorHit[] = [];
+			for (const row of rows) {
+				const vector = parseEmbedding(row.embedding);
+				if (!vector) {
+					continue;
+				}
+				const score = Math.round(cosineSimilarity(queryVector, vector) * 10000) / 10000;
+				if (score < threshold) {
+					continue;
+				}
+				hits.push({ chunk: mapChunkRow(row), score });
+			}
+			hits.sort((left, right) => {
+				if (right.score !== left.score) {
+					return right.score - left.score;
+				}
+				return left.chunk.id - right.chunk.id;
+			});
+			return hits.slice(0, topK);
 		},
 
 		/* ---------------- 技能绑定 ---------------- */
@@ -531,9 +598,9 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 				return [];
 			}
 			const rows = db
-				.prepare(`${KB_SELECT} WHERE kb.id IN (${unique.map(() => "?").join(", ")}) ORDER BY kb.created_at ASC`)
+				.prepare(`${KB_LIST_SELECT} WHERE kb.id IN (${unique.map(() => "?").join(", ")}) ORDER BY kb.created_at ASC`)
 				.all(...unique) as unknown as KnowledgeBaseDbRow[];
-			return rows.map(toKnowledgeBase);
+			return rows.map(mapKnowledgeBaseRow);
 		},
 	};
 

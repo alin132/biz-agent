@@ -8,8 +8,8 @@
 1. **每阶段都要能跑**：`typecheck` / `verify` / `ui-check` / `ui-dom-check` / `smoke` 全绿 + 对应新断言。
 2. **界面不出现假的**：后端没做好的能力，界面上明确写「未接入 + 需要什么」，不摆假数据。
 3. **存储双轨**：默认 SQLite（`DB_PATH`，零依赖、跑测试快）；配了 `DATABASE_URL` 就走 Postgres。
-   同一套 DAO 接口，两种实现，测试对两边都要能跑。知识库的 pgvector 表/列已在迁移里预留，
-   但这一轮检索仍走 SQLite 本地 JSON 向量（见关键决策「KB 表走 server/kb/schema.ts」）。
+   同一套 DAO 接口，两种实现，测试对两边都要能跑。知识库也有两份 DAO（`store.ts` SQLite / `pgStore.ts` Postgres），
+   检索跟着 `DATABASE_URL` 选后端：SQLite 本地算 JSON 向量的余弦，Postgres 走 pgvector（见关键决策「KB 双后端」）。
 
 ---
 
@@ -18,10 +18,10 @@
 | # | 阶段 | 内容 | 验收 | 状态 |
 |---|---|---|---|---|
 | P1 | 侧边栏模块导航壳 | 左侧图标导航（对话/知识库/技能/模型/MCP/IM/审批/审计/成员/监控/设置）+ 模块页骨架；模块页接真实数据，接口 404 / 连不上时才回落到「未接入」说明（最终 11 个模块全部真数据） | `ui-dom-check` 覆盖 11 个模块的切换与占位文案（230 项）；`ui-shot` 截图核对（对话 / 技能 / 模块页 / 模型） | 完成 |
-| P2 | 存储层 + Postgres/pgvector | `docker-compose.yml`；`db/migrations/*.sql`；DAO 双实现；启动时迁移；`/api/health` 报存储后端 | `smoke` 在 SQLite 与 PG 上各跑一遍（含 `health.storage`）；`persist-check` 两边都过 | 完成（pgvector 待真镜像复核） |
+| P2 | 存储层 + Postgres/pgvector | `docker-compose.yml`；`db/migrations/*.sql`；DAO 双实现；启动时迁移；`/api/health` 报存储后端 | `smoke` 在 SQLite 与 PG 上各跑一遍（含 `health.storage`）；`persist-check` 两边都过；PG 侧用 PGlite（真 PG 18.6）跑迁移/pgvector | 完成（PG 用 PGlite 真内核验证；Docker 镜像本身未实机） |
 | P3 | 企业安全 | 登录（scrypt 密码）、JWT、RBAC 四角色（所有者/开发者/运营/审计员）、登录失败限流、写操作审计落库、成员管理写接口（改角色/停用/删除 + 保护规则） | `auth:selftest` 41 项 + `smoke:auth` 51 项（401/403、角色矩阵、限流、审计、成员保护）+ 默认 `smoke`（`AUTH_MODE=off` 放行） | 完成 |
 | P4 | 开放 API | API Key 生命周期（`bk_` 明文只出现一次、库里只存 sha256 + 前 8 位 prefix、软吊销）+ 令牌桶限流 + `/v1/chat`（非流式 + SSE `[DONE]`）+ `/v1/health` + 统一错误形状与 api_key 审计 | `smoke:openapi` 53 项（Key 明文一次性 / 非流式 / 流式 / 401 / 403 / 429 + `Retry-After` / 审计） | 完成 |
-| P5 | 知识库 RAG | 上传（PDF/Word/MD/TXT/CSV）→ 解析 → 分块（长度/标题/段落）→ 向量化 → 检索；技能可绑定多个知识库 + 相似度阈值；`kb_search` 工具 | `kb:selftest` 52 项 + `smoke` 场景 G 24 项（建库/上传/检索/绑定/删除；无 embedding key 时回退关键词并有断言） | 完成 |
+| P5 | 知识库 RAG | 上传（PDF/Word/MD/TXT/CSV）→ 解析 → 分块（长度/标题/段落）→ 向量化 → 检索；技能可绑定多个知识库 + 相似度阈值；`kb_search` 工具；**双存储后端**（SQLite JSON 向量 / Postgres pgvector，`0007_kb_pgvector.sql`） | `kb:selftest` 52 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项（建库/上传/检索/绑定/删除；无 embedding key 时回退关键词并有断言） | 完成 |
 | P6 | 多模型管理 | 供应商与模型两层、OpenAI 协议兼容、按工作空间配置、连通性检测；API Key 用 AES-256-GCM 加密落库、出参只回掩码；首启用 `.env` 的 key 建 `default` 供应商；切当前模型；PG 增量迁移 `0003_models.sql` | `models:selftest` 22 项 + `smoke:openapi` 的 CRUD / ping（成功 + 不可达）/ 切当前模型 / 向后兼容断言 | 完成 |
 | P7 | MCP 集成 | stdio / HTTP(Streamable) / SSE 三种传输（手写 JSON-RPC 2.0，零依赖）；注册即发现、工具进 `/api/tools` 与会话工具集、工具启停、调试调用；PG 增量迁移 `0004_mcp.sql` | `mcp:selftest` 30 项 + `smoke:mcp` 45 项（用本地 stdio 假 MCP Server 跑通发现 / 调用 / 启停 / 删除） | 完成 |
 | P8 | IM Bot 网关 | 钉钉回调（@对话）+ 加签/AES 回调解密、凭证 AES-256-GCM 加密、多轮会话映射与 msgId 幂等、出站（fake / real 传输 + 重试）；PG 增量迁移 `0006_im.sql` | `im:selftest` 26 项 + `smoke:im` 37 项（用伪造加签请求验签名与回包、同 msgId 幂等、同 conversationId 只映射一个会话、停用 403、删除 404） | 完成 |
@@ -43,10 +43,14 @@
   （`server/kb/embedding.ts`，可指向中转 / Ollama / vLLM）；没配 key 或调用失败时 `server/kb/search.ts` 自动切到
   **关键词检索**（中文 2-gram + 标题加权），响应用 `mode: "vector" | "keyword"` 如实标注，界面明示"语义检索未启用"，
   绝不假装有向量。向量化失败也不阻断上传（文档先落库，检索回退）。
-- **KB 表走 `server/kb/schema.ts`，不塞进 `db/migrations/*.sql`**：知识库这一轮只支持 SQLite（DAO 在
-  `server/kb/store.ts`），表与会话同 `DB_PATH` 库文件、启动时幂等建表；`db/migrations/0001_init.sql` 里的 PG 建表
-  与 `vector` 列只是**预留**，没有任何 DAO 会切过去。等 pgvector 检索真接上时再抽 `KbStorage`，别现在把 PG 方言
-  塞进 SQLite 的建表路径。
+- **KB 双后端，跟着 `DATABASE_URL` 自动选**：契约是 `KbStore`（`server/kb/store.ts`）。
+  SQLite 分支的表与会话同 `DB_PATH` 库文件、启动时幂等建表（`server/kb/schema.ts`），向量存 JSON 文本、检索在本地算余弦；
+  Postgres 分支的表只由迁移建（`0001_init.sql` + `0007_kb_pgvector.sql`），向量是真 pgvector 列，
+  检索用 `embedding <=> $vec` 把排序下推给数据库（`server/kb/pgStore.ts`，经同一套同步桥）。
+  **不要把 PG 方言塞进 SQLite 的建表路径**，也别在 SQLite 分支装 pgvector 索引。
+- **KB 向量列不固定维度、不建 HNSW**：`0007` 把 `vector(1024)` 改成无维度 `vector`，换 embedding 模型
+  （1536/3072）不用迁移；代价是 HNSW 必须有固定维度，所以删掉那条索引、走精确余弦扫描
+  （单机控制台规模够用；要千万级再按固定维度 + 分表建 HNSW）。
 - **RBAC 权限点矩阵的唯一真相在 `server/auth/roles.ts`**：`permissionFor()`（方法 + 路径 → 权限点）、`can()`、
   中文角色名与 403 文案都只维护这一份；路由层、`/api/auth/me`、`auth:selftest` / `smoke:auth` 全部从它读，
   别在 `server/index.ts` 或前端再抄一份矩阵。
@@ -80,7 +84,8 @@
 ## 环境前置
 
 - **Docker Desktop 需要手动启动**（本 session 里 `com.docker.service` 启动被系统拒绝，daemon 起不来）。
-  **它没启动时一切照旧走 SQLite**，功能不受影响（P5 的向量检索目前也在 SQLite 本地算，pgvector 检索尚未接入）。
+  **它没启动时一切照旧走 SQLite**，功能不受影响（P5 的向量检索在 SQLite 分支本地算 JSON 向量的余弦；
+  配了 `DATABASE_URL` 连上 Postgres 时才走 pgvector）。
   启动后按下面这套命令换成 Postgres，复现 P2 的验收：
 
   ```powershell
@@ -90,9 +95,10 @@
   $env:SMOKE_BASE="http://127.0.0.1:4330"; npm run smoke     # 期望 164 项
   ```
 
-  P2 交付时 PG 侧是用 **PGlite（真 PostgreSQL 18.6 WASM）+ 线上协议代理**验的：迁移、`db:check`、
-  `smoke`、`persist-check`、DAO 全接口与失败路径都跑过；**只有 pgvector 的 3 条语句
-  （`create extension vector`、`vector(1024)` 列、hnsw 索引）和 Docker 镜像本身没实机验证**。
+  PG 侧是用 **PGlite（真 PostgreSQL 18.6 WASM）+ 线上协议代理**验的：迁移 `0001`~`0007`、`db:check`、
+  `smoke` 164、`persist-check`、`kb:pg:selftest` 16 项、HTTP 上传 + 语义检索（`mode: "vector"`）都跑过；
+  **只有 `docker-compose.yml` 里的 pgvector/pgvector:pg16 镜像本身没实机验证**（PGlite 侧是加载了
+  `@electric-sql/pglite-pgvector` 的真 pgvector 扩展跑的）。
 - 磁盘：C 盘剩余约 8 GB，pgvector 镜像解压约 1 GB，够用但别再加别的镜像。
-- 没有 Docker 时一切照旧：`npm run dev` 走 SQLite，功能不受影响（RAG 的向量检索目前走 SQLite 本地 JSON 向量，
-  pgvector 检索尚未接入；没配 `EMBEDDING_API_KEY` 时自动回退关键词检索）。
+- 没有 Docker 时一切照旧：`npm run dev` 走 SQLite，功能不受影响（RAG 的向量检索走 SQLite 本地 JSON 向量；
+  没配 `EMBEDDING_API_KEY` 时自动回退关键词检索）。有 Postgres（`DATABASE_URL`）时知识库也落 PG，检索走 pgvector。

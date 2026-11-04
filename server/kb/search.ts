@@ -9,7 +9,6 @@
  */
 
 import { badRequest, notFound, errorMessage } from "./errors.js";
-import { parseEmbedding } from "./embedding.js";
 import type { EmbeddingClient } from "./embedding.js";
 import type { KbChunkRow } from "./schema.js";
 import type { KbStore } from "./store.js";
@@ -296,22 +295,24 @@ export async function searchInKnowledgeBase(input: {
 			if (!queryVector || queryVector.length === 0) {
 				throw badRequest("向量化服务返回了空向量");
 			}
-			const total = input.store.countChunks(input.kbId);
-			const chunks = input.store.listChunks(input.kbId, {
-				onlyEmbedded: true,
-				likeTokens: total > VECTOR_PRE_FILTER_THRESHOLD && tokens.length > 0 ? tokens : undefined,
-				limit: Math.max(VECTOR_PRE_FILTER_THRESHOLD, total),
+			// 排名下推给存储后端：SQLite 本地算余弦，Postgres 交给 pgvector（只回命中行）
+			const hits = input.store.searchByEmbedding(input.kbId, queryVector, {
+				topK: clampTopK(options.topK),
+				// 没传 threshold 就用库上配置的相似度阈值
+				threshold: options.threshold ?? knowledgeBase.similarityThreshold,
 			});
-			const candidates = chunks
-				.map((chunk) => ({ chunk, vector: parseEmbedding(chunk.embedding) }))
-				.filter((item): item is { chunk: KbChunkRow; vector: number[] } => item.vector !== null);
 			return {
 				mode: "vector",
-				results: rankVectorChunks(candidates, queryVector, {
-					topK: options.topK,
-					// 没传 threshold 就用库上配置的相似度阈值
-					threshold: options.threshold ?? knowledgeBase.similarityThreshold,
-				}),
+				results: hits.map((hit) => ({
+					chunkId: hit.chunk.id,
+					docId: hit.chunk.docId,
+					kbId: hit.chunk.kbId,
+					heading: hit.chunk.heading,
+					// 语义检索的命中通常整块都相关，直接取块开头（与旧的 JS 排名行为一致）
+					snippet: buildSnippet(hit.chunk.content, []),
+					score: hit.score,
+					mode: "vector" as const,
+				})),
 			};
 		} catch (error) {
 			// 向量化失败不能让检索不可用：退回关键词，并把原因如实带回去
