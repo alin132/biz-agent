@@ -1116,6 +1116,9 @@ async function fakeFetch(url, options = {}) {
 		kbDocs[kbId] = [...(kbDocs[kbId] ?? []), doc];
 		return jsonResponse(doc, true, 201);
 	}
+	if (/^\/api\/kb\/[^/]+\/reindex$/.test(url) && method === "POST") {
+		return jsonResponse({ chunks: 12, embedded: true });
+	}
 	if (/^\/api\/kb\/[^/]+\/search$/.test(url)) {
 		return jsonResponse({
 			mode: kbSearchMode,
@@ -1823,7 +1826,7 @@ vm.runInContext(
 		refreshSkillCatalog, renderSkillList, renderSkillCurrent, renderSkillChip, loadSkillFromRow, skillRowMenuItems,
 		setSkill, MODULES, switchModule, renderModuleView, renderModuleNav, modulePageNode, visibleSkills,
 		// P5 / P3：知识库 + 登录
-		bootstrap, submitLogin, logout, openIdentityMenu, refreshKb, selectKbLibrary, deleteKbLibrary,
+		bootstrap, submitLogin, logout, openIdentityMenu, refreshKb, selectKbLibrary, deleteKbLibrary, reindexKbLibrary,
 		openNewKbDialog, openSkillKbDialog, submitKbDialog, closeKbDialog, uploadKbDocument, handleKbFilePicked,
 		canWriteWorkflow, canLogout, roleLabel,
 		// P4：成员 / 审计 / 设置
@@ -3097,7 +3100,7 @@ await check("点「知识库」：壳切成模块视图，标题/说明/未接�
 	assert.ok(summary.includes("向量"), `说明要讲清做什么：${summary}`);
 	assert.equal(els.modulePage.querySelector(".module-badge")?.textContent, "未接入");
 	const codes = Array.from(els.modulePage.querySelectorAll(".module-api__code")).map((node) => node.textContent);
-	assert.deepEqual(codes, ["POST /api/kb", "POST /api/kb/:id/documents", "POST /api/kb/:id/search"]);
+	assert.deepEqual(codes, ["POST /api/kb", "POST /api/kb/:id/documents", "POST /api/kb/:id/search", "POST /api/kb/:id/reindex"]);
 	assert.deepEqual(currentModules(), ["knowledge"], "aria-current 只留在知识库上");
 });
 
@@ -3386,6 +3389,30 @@ await check("配了 embedding：顶上写「语义检索：<model>」，mode=vec
 	const badge = els.modulePage.querySelector(".kb-search-badge");
 	assert.equal(badge.textContent, "语义检索");
 	assert.equal(badge.classList.contains("on"), true);
+});
+
+const kbReindexButton = () =>
+	Array.from(els.modulePage.querySelectorAll("button")).find((node) => node.textContent === "重新向量化");
+
+await check("重新向量化：配了 embedding 时按钮可点 → POST /reindex，提示重算块数", async () => {
+	const button = kbReindexButton();
+	assert.ok(button, "库详情里要有「重新向量化」按钮");
+	assert.equal(button.disabled, false);
+	const before = t.calls.filter((call) => /\/reindex$/.test(call.url)).length;
+	button.click();
+	await flush(80);
+	const posts = t.calls.filter((call) => /\/reindex$/.test(call.url));
+	assert.equal(posts.length, before + 1);
+	assert.equal(posts.at(-1).url, "/api/kb/kb-1/reindex", "重算选中的那个库");
+	assert.equal(posts.at(-1).method, "POST");
+	assert.ok(lastNotice().includes("重新向量化"), lastNotice());
+});
+
+await check("重新向量化：没配 embedding 时按钮禁用", async () => {
+	t.setKbEmbedding({ available: false, model: null, baseUrl: null });
+	await t.refreshKb();
+	t.renderModuleView();
+	assert.equal(kbReindexButton().disabled, true, "没有向量化服务就不该让人点");
 });
 
 await check("删库取消：确认文案带文档/块数，取消就一个请求都不发", async () => {

@@ -114,6 +114,8 @@ export interface KbStore {
 	countChunks(kbId: string): number;
 	countEmbeddedChunks(kbId: string): number;
 	updateChunkEmbeddings(updates: { id: number; embedding: string }[]): void;
+	/** 记下这个库最近一次用的向量模型（重新向量化后刷新展示）。 */
+	setEmbeddingModel(id: string, model: string | null): void;
 
 	/**
 	 * 语义检索：由**存储后端**负责排名。SQLite 读 JSON 向量在本地算余弦；
@@ -530,6 +532,14 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 					statement.run(update.embedding, update.id);
 				}
 			});
+		},
+
+		setEmbeddingModel(id, model) {
+			db.prepare("UPDATE knowledge_bases SET embedding_model = ?, updated_at = ? WHERE id = ?").run(
+				model,
+				Date.now(),
+				id,
+			);
 		},
 
 		searchByEmbedding(kbId, queryVector, options) {

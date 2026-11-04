@@ -309,6 +309,14 @@ export function createKbPgStore(options: CreateKbPgStoreOptions): KbStore {
 			);
 		},
 
+		setEmbeddingModel(id, model) {
+			query("UPDATE knowledge_bases SET embedding_model = $1, updated_at = $2 WHERE id = $3", [
+				model,
+				Date.now(),
+				id,
+			]);
+		},
+
 		searchByEmbedding(kbId, queryVector, options) {
 			if (!vectorReady) {
 				throw new Error("这个 Postgres 没装 pgvector 扩展（create extension vector），语义检索不可用");

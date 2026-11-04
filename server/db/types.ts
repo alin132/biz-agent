@@ -700,6 +700,11 @@ export interface Storage {
 	listTraceEvents(traceId: string): TraceEventRecord[];
 	/** 监控首页聚合：`since` 是 range 窗口下界，`activeSince` 固定 24h 窗口。 */
 	monitorStats(since: number, activeSince: number): MonitorStats;
+	/**
+	 * 清理保留期之外的调用链：先删过期事件、再删过期 trace，返回删除条数。
+	 * 供采集器定时调用（`TRACE_RETENTION_DAYS`），不做任何业务判定。
+	 */
+	purgeTracesBefore(cutoffMs: number): { traces: number; events: number };
 
 	close(): void;
 }

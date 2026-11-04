@@ -1143,6 +1143,24 @@ export class PostgresStorage implements Storage {
 		return rows.map(toTraceEventRecord);
 	}
 
+	purgeTracesBefore(cutoffMs: number): { traces: number; events: number } {
+		const events = this.rows(
+			`WITH removed AS (
+			   DELETE FROM trace_events e USING traces t
+			   WHERE e.trace_id = t.id AND e.created_at < $1 AND t.workspace_id = $2
+			   RETURNING 1
+			 ) SELECT count(*)::int AS n FROM removed`,
+			[cutoffMs, this.workspaceId],
+		)[0];
+		const traces = this.rows(
+			`WITH removed AS (
+			   DELETE FROM traces WHERE started_at < $1 AND workspace_id = $2 RETURNING 1
+			 ) SELECT count(*)::int AS n FROM removed`,
+			[cutoffMs, this.workspaceId],
+		)[0];
+		return { traces: Number(traces?.n ?? 0), events: Number(events?.n ?? 0) };
+	}
+
 	monitorStats(since: number, activeSince: number): MonitorStats {
 		const sessions = this.rows(
 			`SELECT count(*)::int AS total,

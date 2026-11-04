@@ -41,21 +41,21 @@
 
 | 阶段 | 内容 | 验收入口（实测项数） | 状态 |
 |---|---|---|---|
-| P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 230 项 | 完成 |
+| P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 232 项 | 完成 |
 | P2 | 存储层 + Postgres/pgvector 路径 | `smoke` / `persist-check` / `db:check` 双后端、`kb:pg:selftest` 16 项 | 完成（PG 用 PGlite 真内核验证；Docker 镜像本身未实机） |
 | P3 | 企业安全（登录 / JWT / 四角色 / 限流 / 审计） | `auth:selftest` 41 项 + `smoke:auth` 51 项 | 完成 |
 | P4 | 开放 API（API Key + `/v1/chat` + `/v1/health`） | `smoke:openapi` 53 项 | 完成 |
-| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`） | `kb:selftest` 52 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 | 完成 |
+| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`/整库重新向量化） | `kb:selftest` 54 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 | 完成 |
 | P6 | 多模型管理（供应商 + 模型 + 当前选择 + 连通性探测） | `models:selftest` 22 项 | 完成 |
 | P7 | MCP 集成（stdio / HTTP / SSE 三种传输） | `mcp:selftest` 30 项 + `smoke:mcp` 45 项 | 完成 |
 | P8 | IM Bot 网关（钉钉回调 + 加签回推 + fake outbox） | `im:selftest` 26 项 + `smoke:im` 37 项 | 完成 |
-| P9 | 监控与可观测（trace_id / 调用链 / 聚合） | `obs:selftest` 22 项 + `smoke:monitor` 61 项 | 完成 |
+| P9 | 监控与可观测（trace_id / 调用链 / 聚合 / 保留期自动清理） | `obs:selftest` 24 项 + `smoke:monitor` 61 项 | 完成 |
 
 `npm run typecheck` 通过、`npm run verify` 55 项边界检查、`npm run ui-check` 14 项前端渲染单测、
-`npm run ui-dom-check` **230 项**控制台接线自检、`npm run kb:selftest` 52 项知识库自检、
+`npm run ui-dom-check` **232 项**控制台接线自检、`npm run kb:selftest` 54 项知识库自检、
 `npm run kb:pg:selftest` 16 项 Postgres/pgvector 自检、
 `npm run auth:selftest` 41 项安全自检、`npm run models:selftest` 22 项多模型自检、
-`npm run mcp:selftest` 30 项 MCP 自检、`npm run obs:selftest` 22 项可观测自检、
+`npm run mcp:selftest` 30 项 MCP 自检、`npm run obs:selftest` 24 项可观测自检、
 `npm run smoke` 164 项端到端检查、`npm run smoke:auth` 51 项鉴权端到端、
 `npm run smoke:openapi` 53 项开放 API / 多模型端到端、`npm run smoke:mcp` 45 项 MCP 端到端、
 `npm run smoke:monitor` 61 项监控端到端、`npm run im:selftest` 26 项 IM 自检、
@@ -179,6 +179,7 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
 | POST | `/api/kb/:id/documents` | 上传文档 `{ filename, contentBase64 }`（纯文本可传 `content`）→ 201 `{ document, chunkCount, embedded, warning? }`；单文件 20 MB |
 | DELETE | `/api/kb/documents/:docId` | 删文档 → `{ removed, chunksRemoved }`；未知 404 |
 | POST | `/api/kb/:id/search` | 检索 `{ query, topK?, threshold? }` → `{ mode: "vector" \| "keyword", results, fallbackReason? }` |
+| POST | `/api/kb/:id/reindex` | 用当前 embedding 配置整库重算向量 → `{ chunks, embedded }`；没配 key 400、库不存在 404、块数超 5000 400 |
 | GET | `/api/kb/embedding` | 向量化配置状态 `{ available, model, baseUrl }`（没配 `EMBEDDING_API_KEY` 时 `available=false`） |
 | GET | `/api/skills/:skillId/kb` | 技能绑定的知识库 `{ skillId, kbIds, knowledgeBases }` |
 | PUT | `/api/skills/:skillId/kb` | 覆盖式设置绑定 `{ kbIds: string[] }` → 同 GET；绑定不存在的库 400 |
@@ -411,6 +412,7 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 
 - `EMBEDDING_BASE_URL`（默认 `https://api.openai.com/v1`）、`EMBEDDING_MODEL`（默认 `text-embedding-3-small`）、
   `EMBEDDING_API_KEY`（没有就恒走关键词检索）。
+- `TRACE_RETENTION_DAYS`（默认 30）：调用链保留天数，`0` 关闭自动清理（见「监控」章节）。
 - `GET /api/kb/embedding` 返回 `{ available, model, baseUrl }`，页面据此显示「语义检索 / 关键词检索」；
   `available` 只表示配没配 key，具体某个库有没有向量看库行的 `embedding`（`embeddedChunkCount > 0`）。
 - **向量化失败绝不阻断上传**：文档与分块先落库（`ready`），检索退回关键词，响应里带 `warning`。
@@ -429,7 +431,8 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 ### 已知限制
 
 - PDF 没有 OCR：扫描件解析不出文字会直接报「可能是扫描件（暂不支持 OCR）」。
-- 上传后再补 `EMBEDDING_API_KEY`，**旧文档不会自动重嵌入**；要语义检索得重新上传。
+- 上传后再补 `EMBEDDING_API_KEY`，旧文档不会自动重嵌入；但在知识库页点「重新向量化」或调
+  `POST /api/kb/:id/reindex` 就能把整库分块按当前模型重算一遍（补向量），不用重新上传。
 - **pgvector 只保证"能检索"，没有 HNSW 索引**：`0007` 迁移把向量列改成无维度、删掉 HNSW 索引，
   语义检索走精确余弦扫描（知识库是单机控制台规模；要上千万级块再按固定维度 + 分表建 HNSW）。
 - **PG 的 pgvector 检索没有在真实 Docker 镜像里跑过**：本机 Docker Desktop 起不来，PG 侧（含 pgvector）
@@ -694,13 +697,13 @@ npm run demo:data        # 切片 B
 npm run demo:approval    # 切片 C
 npm run verify           # 边界能力自检（55 项）
 npm run ui-check         # 前端渲染单测（markdown，node:vm 沙盒，14 项）
-npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，230 项）
-npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具，52 项，SQLite 本地）
+npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，232 项）
+npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具/重新向量化，54 项，SQLite 本地）
 npm run kb:pg:selftest   # 知识库 Postgres/pgvector 自检（16 项；需 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest    # 安全自检（scrypt/JWT/RBAC/限流/审计/成员保护，41 项）
 npm run models:selftest  # 多模型自检（AES-256-GCM/掩码/首启 default/ping，22 项）
 npm run mcp:selftest     # MCP 自检（stdio/HTTP/SSE、命名、超时与关闭，30 项）
-npm run obs:selftest     # 可观测自检（trace_id/内存队列/批量落库/聚合，22 项）
+npm run obs:selftest     # 可观测自检（trace_id/内存队列/批量落库/聚合/保留期清理，24 项）
 npm run smoke            # 端到端冒烟（需先跑 npm run dev，164 项）
 npm run smoke:auth       # 鉴权端到端（需 AUTH_MODE=required 实例，51 项）
 npm run smoke:openapi    # 开放 API + 多模型端到端（需 AUTH_MODE=required 实例，53 项）
@@ -897,14 +900,14 @@ biz-agent/
 ├── examples/              终端 demo
 └── scripts/
     ├── selftest.ts        边界能力自检（55 项）
-    ├── kb-selftest.ts     知识库自检（52 项，SQLite 本地，解析/分块/检索/绑定/工具，不起服务）
+    ├── kb-selftest.ts     知识库自检（54 项，SQLite 本地，解析/分块/检索/绑定/工具/重新向量化，不起服务）
     ├── kb-pg-selftest.ts  知识库 Postgres/pgvector 自检（16 项，需 DATABASE_URL + 迁移，没配就跳过）
     ├── auth-selftest.ts   安全自检（41 项，scrypt/JWT/RBAC/限流/审计/成员保护，不起服务）
     ├── models-selftest.ts 多模型自检（22 项，AES-256-GCM/掩码/首启 default/ping，不起服务）
     ├── mcp-selftest.ts    MCP 自检（30 项，stdio/HTTP/SSE 传输、命名、超时/关闭，不起服务）
-    ├── observability-selftest.ts  可观测自检（22 项，trace_id/队列/批量落库/聚合，不起服务）
+    ├── observability-selftest.ts  可观测自检（24 项，trace_id/队列/批量落库/聚合/保留期清理，不起服务）
     ├── ui-check.mjs       前端渲染单测（14 项，node:vm 加载 web/markdown.js）
-    ├── ui-dom-check.mjs   控制台 DOM 桩自检（230 项，自造迷你 DOM，不起服务、不引 jsdom）
+    ├── ui-dom-check.mjs   控制台 DOM 桩自检（232 项，自造迷你 DOM，不起服务、不引 jsdom）
     ├── ui-shot.mjs        观感核对：用本机 Edge/Chrome 无头截图（不联网、不装依赖，可选）
     ├── db-migrate.ts      Postgres 迁移（npm run db:migrate，打印版本）
     ├── db-check.ts        存储后端体检（npm run db:check：类型/位置/引擎/表/迁移/数据量）
@@ -1088,7 +1091,8 @@ SQLite 的表结构继续内建在 `server/db/sqlite.ts`，知识库的四张表
   所以每个 MCP 工具调用都会弹审批卡片；想让只读 MCP 工具免审批，得先扩 RiskLevel 语义并同步 `permission.ts`。
 - **OpenAPI 建的会话没有 `ownerId`**：`/v1/chat` 自动新开的会话 `createdBy` 为空，
   developer 在监控页按"只看自己创建的会话"过滤时**看不到这些调用链**（owner / auditor 不受影响）。
-- **调用链没有 TTL**：`traces` / `trace_events` 只增不减，没有清理任务或保留窗口；长期跑要自己加定期清理。
+- **调用链按保留期自动清理**：默认保留 30 天（启动先清一次、之后每小时清一次），用 `TRACE_RETENTION_DAYS` 调
+  （0 = 永不清理）；清理失败只打日志、不影响对话。要长期归档请自己接外部存储（清理后数据不可恢复）。
 - **审批中心只有"当前挂起"**：`GET /api/approvals` 读的是内存里 `pendingApprovals` 的 Promise 与 `approvalMeta`，
   进程重启后待办全部消失；**没有审批历史表**，不能当历史审批查询用（审计里只有通用写操作记录）。
 - **审批是同步回调**：真实审批要走外部审批系统，需要异步挂起/恢复机制，`beforeToolCall` 的同步语义要改造；

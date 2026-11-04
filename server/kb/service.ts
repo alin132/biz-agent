@@ -16,7 +16,7 @@ import { parseDocument } from "./parse.js";
 import { DEFAULT_TOP_K, MAX_TOP_K, searchInKnowledgeBase } from "./search.js";
 import type { SearchOptions, SearchResponse } from "./search.js";
 import type { KbDocumentRow, KnowledgeBaseRow } from "./schema.js";
-import { createKbStore } from "./store.js";
+import { KB_LIMITS, createKbStore } from "./store.js";
 import type { KbStore, KnowledgeBaseInput, RemoveDocumentResult, RemoveKnowledgeBaseResult } from "./store.js";
 
 /** 给接口用的知识库视图：比 DAO 行多一个「这个库现在能不能语义检索」的布尔。 */
@@ -40,6 +40,13 @@ export interface IngestResult {
 	embedded: boolean;
 	/** 向量化失败时的中文提示（文档仍然可用，关键词检索） */
 	warning?: string;
+}
+
+export interface ReembedResult {
+	/** 本次重新向量化的块数 */
+	chunks: number;
+	/** 是否真的算出了向量（没配 key 会在前面就报 400） */
+	embedded: boolean;
 }
 
 export interface SkillBindingsView {
@@ -70,6 +77,12 @@ export interface KbService {
 
 	getSkillBindings(skillId: string): SkillBindingsView;
 	setSkillBindings(skillId: string, kbIds: string[]): SkillBindingsView;
+
+	/**
+	 * 用当前 embedding 配置把整个知识库的块重算一遍向量（补 `EMBEDDING_API_KEY` 后让旧文档也能语义检索）。
+	 * 库不存在 404、没配向量化 400、块数超上限 400。
+	 */
+	reembedKnowledgeBase(kbId: string): Promise<ReembedResult>;
 
 	embeddingInfo(): EmbeddingInfo;
 	close(): void;
@@ -214,6 +227,35 @@ export function createKbService(options: CreateKbServiceOptions): KbService {
 
 		removeDocument(docId) {
 			return store.removeDocument(docId);
+		},
+
+		async reembedKnowledgeBase(kbId) {
+			const knowledgeBase = store.getKnowledgeBase(kbId);
+			if (!knowledgeBase) {
+				throw notFound(`知识库不存在：${kbId}`);
+			}
+			if (!embedding.available()) {
+				throw badRequest("没配置向量化服务（EMBEDDING_API_KEY），无法重新向量化");
+			}
+			const total = store.countChunks(kbId);
+			if (total === 0) {
+				return { chunks: 0, embedded: false };
+			}
+			if (total > KB_LIMITS.listChunksLimit) {
+				throw badRequest(`分块数 ${total} 超过 ${KB_LIMITS.listChunksLimit}，请拆分文档后再试`);
+			}
+			const chunks = store.listChunks(kbId, { limit: total });
+			const vectors = await embedding.embed(
+				chunks.map((chunk) => (chunk.heading ? `${chunk.heading}\n\n${chunk.content}` : chunk.content)),
+			);
+			if (vectors.length !== chunks.length) {
+				throw badRequest(`向量化返回条数与分块数不一致（${vectors.length} / ${chunks.length}）`);
+			}
+			store.updateChunkEmbeddings(
+				chunks.map((chunk, index) => ({ id: chunk.id, embedding: serializeEmbedding(vectors[index]!) })),
+			);
+			store.setEmbeddingModel(kbId, embedding.info().model);
+			return { chunks: chunks.length, embedded: true };
 		},
 
 		async search(kbId, query, searchOptions = {}) {

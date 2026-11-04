@@ -11,6 +11,7 @@
  *   POST   /api/kb/:id/documents               { filename, contentBase64 | content, mime? } → 201
  *   DELETE /api/kb/documents/:docId            → { removed, chunksRemoved }
  *   POST   /api/kb/:id/search                  { query, topK?, threshold? } → { mode, results }
+ *   POST   /api/kb/:id/reindex                 用当前 embedding 配置整库重算向量 → { chunks, embedded }
  *   GET    /api/kb/embedding                   { available, model, baseUrl }
  *   GET    /api/skills/:skillId/kb             技能绑定的知识库
  *   PUT    /api/skills/:skillId/kb             { kbIds: string[] } 覆盖式设置
@@ -230,6 +231,17 @@ export async function handleKb(req: IncomingMessage, res: ServerResponse): Promi
 				return true;
 			}
 			methodNotAllowed(res, method);
+			return true;
+		}
+
+		const reindexMatch = /^\/api\/kb\/([^/]+)\/reindex$/.exec(pathname);
+		if (reindexMatch) {
+			if (method !== "POST") {
+				methodNotAllowed(res, method);
+				return true;
+			}
+			const kbId = decodeSegment(reindexMatch[1]!);
+			json(res, 200, await service.reembedKnowledgeBase(kbId));
 			return true;
 		}
 

@@ -615,6 +615,37 @@ async function main(): Promise<void> {
 			removeDbFiles(vectorDb);
 		});
 
+		await check("重新向量化：补 key 后整库补向量、语义检索可用；没配 key 400、库不存在 404", async () => {
+			const reDb = resolve(TMP_DIR, "kb-selftest-reembed.db");
+			removeDbFiles(reDb);
+			const reStore = createKbStore({ path: reDb });
+			const noKey = createKbService({ store: reStore, embedding: createEmbeddingClient({ config: { apiKey: "" } }) });
+			const reKb = noKey.createKnowledgeBase({ name: "补向量库" });
+			await noKey.ingestDocument({
+				kbId: reKb.id,
+				filename: "退款.md",
+				data: Buffer.from("# 退款政策\n\n退款需要审批，3 个工作日到账。"),
+			});
+			await noKey.ingestDocument({
+				kbId: reKb.id,
+				filename: "发票.md",
+				data: Buffer.from("# 发票政策\n\n发票在订单完成后开具。"),
+			});
+			assert.equal((await noKey.search(reKb.id, "退款")).mode, "keyword");
+			await expectKbError(() => noKey.reembedKnowledgeBase(reKb.id), 400, "向量化");
+			const withKey = createKbService({ store: reStore, embedding: stubEmbeddingClient() });
+			const result = await withKey.reembedKnowledgeBase(reKb.id);
+			assert.ok(result.chunks >= 2, `应重算至少 2 块，实际 ${result.chunks}`);
+			assert.equal(result.embedded, true);
+			assert.equal(withKey.listKnowledgeBases()[0]!.embedding, true);
+			const after = await withKey.search(reKb.id, "退款怎么处理");
+			assert.equal(after.mode, "vector");
+			assert.ok(after.results.length >= 1);
+			await expectKbError(() => withKey.reembedKnowledgeBase("kb_nope"), 404, "知识库不存在");
+			withKey.close();
+			removeDbFiles(reDb);
+		});
+
 		await check("检索：向量化失败自动回退关键词并说明原因", async () => {
 			const fallbackDb = resolve(TMP_DIR, "kb-selftest-fallback.db");
 			removeDbFiles(fallbackDb);
@@ -782,6 +813,14 @@ async function main(): Promise<void> {
 			assert.equal(documents.status, 200);
 			assert.equal(documents.body.length, 1);
 			assert.equal(documents.body[0]!.id, httpDocId);
+		});
+
+		await check("HTTP：POST /api/kb/:id/reindex 未配向量化 → 400 中文", async () => {
+			const created = await api<{ id: string }>(`/api/kb`, { method: "POST", body: { name: "重算库" } });
+			assert.equal(created.status, 201);
+			const response = await api<{ error: string }>(`/api/kb/${created.body.id}/reindex`, { method: "POST", body: {} });
+			assert.equal(response.status, 400);
+			assert.ok(response.body.error.includes("向量化"), response.body.error);
 		});
 
 		await check("HTTP：检索 200 mode=keyword；非法 query 400", async () => {

@@ -115,6 +115,8 @@ const apiKeys = createApiKeyService(db);
 // MCP 服务名解析通过注册表查（可观测模块本身不依赖 MCP）。
 const observability = createObservability({
 	storage: db,
+	// 调用链保留天数（默认 30 天；0 = 永不清理）
+	retentionDays: Number(process.env.TRACE_RETENTION_DAYS ?? 30),
 	resolveMcpServer: (toolName) => {
 		for (const server of mcp.registry.listServers()) {
 			if (server.tools.some((tool) => tool.toolName === toolName)) {

@@ -1247,6 +1247,19 @@ export class SqliteStorage implements Storage {
 		return rows.map(toTraceEventRecord);
 	}
 
+	purgeTracesBefore(cutoffMs: number): { traces: number; events: number } {
+		this.db.exec("BEGIN");
+		try {
+			const events = this.db.prepare("DELETE FROM trace_events WHERE created_at < ?").run(cutoffMs).changes;
+			const traces = this.db.prepare("DELETE FROM traces WHERE started_at < ?").run(cutoffMs).changes;
+			this.db.exec("COMMIT");
+			return { traces: Number(traces), events: Number(events) };
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
 	monitorStats(since: number, activeSince: number): MonitorStats {
 		const sessions = this.db
 			.prepare(

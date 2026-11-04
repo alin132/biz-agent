@@ -44,6 +44,10 @@ export interface ObservabilityOptions {
 	onLog?: (message: string) => void;
 	/** 是否启动定时器，默认 true；自检把它关掉、手动 flush */
 	autoStart?: boolean;
+	/** 调用链保留天数：>0 时启动后与每小时清理一次过期数据；0 / 负数 = 不清理。默认读 TRACE_RETENTION_DAYS（未配=30） */
+	retentionDays?: number;
+	/** 清理检查间隔，默认 1 小时 */
+	purgeIntervalMs?: number;
 }
 
 export interface TraceBeginInput {
@@ -104,6 +108,9 @@ export class Observability {
 	private readonly traces = new Map<string, TraceState>();
 	private queue: TraceEventInput[] = [];
 	private timer: ReturnType<typeof setInterval> | null = null;
+	private purgeTimer: ReturnType<typeof setInterval> | null = null;
+	private readonly retentionDays: number;
+	private readonly purgeIntervalMs: number;
 	private closed = false;
 	private droppedTraceCountValue = 0;
 	private droppedEventCountValue = 0;
@@ -116,10 +123,18 @@ export class Observability {
 		this.now = options.now ?? (() => Date.now());
 		this.resolveMcpServer = options.resolveMcpServer;
 		this.onLog = options.onLog ?? ((message) => console.error(message));
+		this.retentionDays = options.retentionDays ?? 30;
+		this.purgeIntervalMs = options.purgeIntervalMs ?? 60 * 60 * 1000;
 		if (options.autoStart !== false) {
 			this.timer = setInterval(() => this.flush(), this.flushIntervalMs);
 			// 不阻止进程退出：该退就退，退出前由 exit/SIGINT/SIGTERM 钩子补一次 flush
 			this.timer.unref?.();
+			if (this.retentionDays > 0) {
+				// 启动先清一次（上次异常退出可能留下过期数据），之后每小时一次
+				this.purgeExpired();
+				this.purgeTimer = setInterval(() => this.purgeExpired(), this.purgeIntervalMs);
+				this.purgeTimer.unref?.();
+			}
 		}
 	}
 
@@ -238,6 +253,33 @@ export class Observability {
 		if (this.timer) {
 			clearInterval(this.timer);
 			this.timer = null;
+		}
+		if (this.purgeTimer) {
+			clearInterval(this.purgeTimer);
+			this.purgeTimer = null;
+		}
+	}
+
+	/**
+	 * 清理保留期之外的调用链（`retentionDays` 天前）。失败只记日志、绝不抛错——
+	 * 监控清理不该影响对话主流程。
+	 */
+	purgeExpired(nowMs: number = this.now()): { traces: number; events: number } {
+		if (this.retentionDays <= 0) {
+			return { traces: 0, events: 0 };
+		}
+		const cutoff = nowMs - this.retentionDays * 24 * 60 * 60 * 1000;
+		try {
+			const removed = this.storage.purgeTracesBefore(cutoff);
+			if (removed.traces > 0 || removed.events > 0) {
+				this.onLog(
+					`[monitor] 清理保留期外的调用链：${removed.traces} 条 trace / ${removed.events} 条事件（保留 ${this.retentionDays} 天）`,
+				);
+			}
+			return removed;
+		} catch (error) {
+			this.onLog(`[monitor] 清理调用链失败（不影响对话）：${describeError(error)}`);
+			return { traces: 0, events: 0 };
 		}
 	}
 

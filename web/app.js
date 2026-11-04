@@ -1111,6 +1111,7 @@ const MODULE_SPECS = {
 			["POST", "/api/kb", "新建知识库"],
 			["POST", "/api/kb/:id/documents", "上传文档并解析分块"],
 			["POST", "/api/kb/:id/search", "向量检索（pgvector）"],
+			["POST", "/api/kb/:id/reindex", "补 key 后整库重算向量"],
 		],
 		next: "前端已就绪：/api/kb 一上线，这一页自动换成知识库列表 + 上传区 + 检索试跑。",
 	},
@@ -5142,6 +5143,12 @@ function kbMainColumn() {
 	titleBox.appendChild(make("h3", "kb-main-name", lib.name ?? lib.id));
 	titleBox.appendChild(make("div", "kb-main-meta", `${lib.docCount ?? 0} 文档 · ${lib.chunkCount ?? 0} 块`));
 	head.appendChild(titleBox);
+	const reindex = make("button", "btn-ghost mini", "重新向量化");
+	reindex.setAttribute("type", "button");
+	reindex.title = "用当前向量化配置把整库分块重算一遍（补 key 后让旧文档也能语义检索）";
+	reindex.disabled = !state.kb.embedding?.available || Number(lib.chunkCount ?? 0) === 0;
+	reindex.addEventListener("click", () => void reindexKbLibrary(lib));
+	head.appendChild(reindex);
 	const del = make("button", "btn-ghost mini", "删除知识库");
 	del.setAttribute("type", "button");
 	del.addEventListener("click", () => void deleteKbLibrary(lib));
@@ -5378,6 +5385,22 @@ async function deleteKbLibrary(lib) {
 	addNotice(
 		`已删除知识库「${lib.name ?? lib.id}」：${data.documentsRemoved ?? docs} 篇文档、${data.chunksRemoved ?? chunks} 个分块。`,
 	);
+}
+
+async function reindexKbLibrary(lib) {
+	const data = await fetchJsonOrNull(`/api/kb/${encodeURIComponent(lib.id)}/reindex`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({}),
+	});
+	if (!data || typeof data.chunks !== "number") {
+		addNotice("重新向量化失败：后端没接住这次请求。", true);
+		return;
+	}
+	state.kb.search = null;
+	await refreshKb();
+	if (state.module === "knowledge") renderModuleView();
+	addNotice(`已重新向量化「${lib.name ?? lib.id}」：${data.chunks} 个分块。`);
 }
 
 async function deleteKbDocument(doc) {

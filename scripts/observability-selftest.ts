@@ -518,11 +518,61 @@ async function testPermissions(): Promise<void> {
 	});
 }
 
+async function testRetention(): Promise<void> {
+	console.log("\n[4] 保留期清理");
+
+	const temp = tempStore();
+	const clock = { value: BASE };
+	const obs = new Observability({
+		storage: temp.store,
+		autoStart: false,
+		now: () => clock.value,
+		retentionDays: 30,
+		onLog: () => undefined,
+	});
+	try {
+		clock.value = BASE - 40 * DAY;
+		const oldId = obs.begin({ sessionId: "s-old" });
+		obs.record(oldId, { kind: "tool", name: "old", ok: true, ms: 5 });
+		obs.finish(oldId, "ok");
+		obs.flush();
+		clock.value = BASE - DAY;
+		const newId = obs.begin({ sessionId: "s-new" });
+		obs.record(newId, { kind: "tool", name: "new", ok: true, ms: 5 });
+		obs.finish(newId, "ok");
+		obs.flush();
+
+		await check("purgeExpired 只删超过保留期的 trace 与事件，新数据保留", () => {
+			const removed = obs.purgeExpired(BASE);
+			assert.equal(removed.traces, 1);
+			assert.equal(removed.events, 1);
+			assert.equal(temp.store.getTrace(oldId), undefined, "旧 trace 应被删");
+			assert.equal(temp.store.listTraceEvents(oldId).length, 0, "旧事件应一起删");
+			assert.ok(temp.store.getTrace(newId), "新 trace 必须保留");
+			assert.equal(temp.store.listTraceEvents(newId).length, 1);
+		});
+
+		await check("retentionDays=0 关闭清理（不动任何数据）", () => {
+			const off = new Observability({ storage: temp.store, autoStart: false, now: () => clock.value, retentionDays: 0, onLog: () => undefined });
+			try {
+				assert.deepEqual(off.purgeExpired(BASE + 1000 * DAY), { traces: 0, events: 0 });
+				assert.ok(temp.store.getTrace(newId), "关闭清理后数据仍在");
+			} finally {
+				off.close();
+			}
+		});
+	} finally {
+		obs.close();
+		temp.cleanup();
+	}
+}
+
 async function main(): Promise<void> {
 	console.log("P9 监控与可观测自检（纯进程内，不起服务）");
 	await testPure();
 	await testCollector();
 	await testSummary();
+	await testRetention();
 	await testAuditFilters();
 	await testPermissions();
 	console.log(`\n全部通过：${passed} 项检查`);
