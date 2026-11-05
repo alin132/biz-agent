@@ -41,22 +41,22 @@
 
 | 阶段 | 内容 | 验收入口（实测项数） | 状态 |
 |---|---|---|---|
-| P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 232 项 | 完成 |
+| P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 248 项 | 完成 |
 | P2 | 存储层 + Postgres/pgvector 路径 | `smoke` / `persist-check` / `db:check` 双后端、`kb:pg:selftest` 16 项 | 完成（PG 用 PGlite 真内核验证；Docker 镜像本身未实机） |
 | P3 | 企业安全（登录 / JWT / 四角色 / 限流 / 审计） | `auth:selftest` 41 项 + `smoke:auth` 51 项 | 完成 |
 | P4 | 开放 API（API Key + `/v1/chat` + `/v1/health`） | `smoke:openapi` 53 项 | 完成 |
-| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`/整库重新向量化） | `kb:selftest` 54 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 | 完成 |
+| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`/整库重新向量化） | `kb:selftest` 55 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 + 场景 G2 13 项 | 完成 |
 | P6 | 多模型管理（供应商 + 模型 + 当前选择 + 连通性探测） | `models:selftest` 22 项 | 完成 |
 | P7 | MCP 集成（stdio / HTTP / SSE 三种传输） | `mcp:selftest` 30 项 + `smoke:mcp` 45 项 | 完成 |
-| P8 | IM Bot 网关（钉钉回调 + 加签回推 + fake outbox） | `im:selftest` 26 项 + `smoke:im` 37 项 | 完成 |
+| P8 | IM Bot 网关（钉钉 + 企业微信自建应用、加密回调、测试发送与 fake outbox） | `im:selftest`、`wecom:selftest`、`smoke:im`、`smoke:wecom` | 完成（平台实网待配置凭证联调） |
 | P9 | 监控与可观测（trace_id / 调用链 / 聚合 / 保留期自动清理） | `obs:selftest` 24 项 + `smoke:monitor` 61 项 | 完成 |
 
 `npm run typecheck` 通过、`npm run verify` 55 项边界检查、`npm run ui-check` 14 项前端渲染单测、
-`npm run ui-dom-check` **232 项**控制台接线自检、`npm run kb:selftest` 54 项知识库自检、
+`npm run ui-dom-check` **248 项**控制台接线自检、`npm run kb:selftest` 55 项知识库自检、
 `npm run kb:pg:selftest` 16 项 Postgres/pgvector 自检、
 `npm run auth:selftest` 41 项安全自检、`npm run models:selftest` 22 项多模型自检、
 `npm run mcp:selftest` 30 项 MCP 自检、`npm run obs:selftest` 24 项可观测自检、
-`npm run smoke` 164 项端到端检查、`npm run smoke:auth` 51 项鉴权端到端、
+`npm run smoke` 182 项端到端检查、`npm run smoke:auth` 51 项鉴权端到端、
 `npm run smoke:openapi` 53 项开放 API / 多模型端到端、`npm run smoke:mcp` 45 项 MCP 端到端、
 `npm run smoke:monitor` 61 项监控端到端、`npm run im:selftest` 26 项 IM 自检、
 `npm run smoke:im` 37 项 IM 端到端（P8，要 `DINGTALK_TRANSPORT=fake` 实例）全部通过；
@@ -72,11 +72,12 @@
 npm run dev          # 启动后打开 http://127.0.0.1:4317
 ```
 
-**对话**模块是四列网格（模块导航 + 会话栏 + 对话区 + 技能面板；窄屏 ≤1180px 先收技能面板，≤1080px 再收会话栏）；
+**对话**模块是三列网格（模块导航 + 会话栏 + 对话区）；右侧技能栏已隐藏，技能在「技能」页加载、管理与退出。
+消息与输入框统一居中、最大宽度 800px；≤900px 收起会话栏，小屏自动换行。
 其它模块切成两列（模块导航 + 整宽模块页）：
 
-- **模块导航**（最左 56px 图标栏，11 个模块）：`对话` / `知识库` / `技能` / `模型` / `MCP` / `IM 机器人` /
-  `审批` / `审计` / `成员` / `监控` / `设置`。`对话` 就是上面的四列工作台；点其它图标切到模块页
+- **模块导航**（最左 76px 导航栏，11 个图标及中文名称）：`对话` / `知识库` / `技能` / `模型` / `MCP` / `IM 机器人` /
+  `审批` / `审计` / `成员` / `监控` / `设置`。`对话` 就是上面的三列工作台；点其它图标切到模块页
   ——`.shell.module-view` 收成两列（导航 + 整宽内容），会话栏与右栏技能面板一起收起，切回 `对话`
   恢复会话列表 / 当前会话 / 技能高亮（不重拉数据）。旧的「清空全部会话」入口随导航改造下线（暂不补）
 - **会话栏**：`新聊天` → `置顶`（本地收藏，会话行菜单里可置顶/取消，存 `localStorage`）→
@@ -96,7 +97,7 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
   文档状态 / 检索试跑 / 删库，接 `/api/kb*`；`GET /api/kb/embedding` 决定显示「语义检索」还是「关键词检索」）、
   `模型`（供应商 / 模型两层 CRUD + 连通性探测 + 切当前模型，接 `/api/models*`）、
   `MCP`（注册 / 发现 / 工具启停 / 调试调用 / 删除，接 `/api/mcp*`，失败服务的 `lastError` 原样展示）、
-  `IM 机器人`（机器人 CRUD + ping + fake outbox，接 `/api/im*`）、
+  `IM 机器人`（钉钉 / 企业微信机器人 CRUD + 测试发送 + 模拟 outbox，接 `/api/im*`；页头两个按钮成组，平台配置说明收进「配置说明」折叠区，空态就地给添加入口）、
   `审批`（跨会话待办列表 + 批准 / 拒绝 / 去会话，10 秒轮询，接 `/api/approvals*`）、
   `成员`（`/api/auth/users`：新建 + 改角色 + 停用/启用 + 删除，自己那行置灰）、
   `审计`（`/api/audit`，过滤 + 分页 + traceId 列）、
@@ -191,7 +192,7 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
 | GET | `/api/models` | 当前模型 + 选项 + 库里的两层数据 `{ mode, current, label, options, providers, models }`（`options` 仍是 `{ id, label }`，兼容旧版） |
 | GET | `/api/models/current` | 当前模型 `{ current, model, mode, label }` |
 | POST | `/api/models/current` | 切当前模型 `{ modelId }`（只影响新会话、重启回落；非 chat / 已停用 → 400，未知 → 404） |
-| GET | `/api/models/providers` | 供应商列表 `{ items }`（key 只有掩码 `apiKeyMasked`，不回明文/密文） |
+| GET | `/api/models/providers` | 供应商列表 `{ items }`（key 只有掩码 `apiKeyMasked`，不回明文/密文；密文解不开时 `apiKeyBroken:true`，页面据此给「重新填写 Key」提示） |
 | POST | `/api/models/providers` | 新建供应商 `{ name, kind, baseUrl?, apiKey?, enabled? }` → 201；重名 409 |
 | GET / PATCH / DELETE | `/api/models/providers/:id` | 详情 / 改 / 删（连带删它下面的模型） |
 | POST | `/api/models` | 新建模型 `{ providerId, modelId, name?, kind?, enabled?, contextWindow? }` → 201 |
@@ -237,7 +238,16 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
 | GET / PATCH / DELETE | `/api/im/bots/:id` | 详情 / 改 / 删（连带删会话映射） |
 | POST | `/api/im/bots/:id/ping` | 发一条测试消息（`DINGTALK_TRANSPORT=fake` 时进 outbox） |
 | POST | `/api/im/dingtalk/callback` | 钉钉回调（**免登录**：验加签或 AES 加密；同一 `msgId` 幂等） |
-| GET | `/api/im/outbox` | 仅 `DINGTALK_TRANSPORT=fake` 可用（调试/审计视图，读 `audit.read`） |
+| GET / POST | `/api/im/wecom/callback?botId=<id>` | 企业微信自建应用 URL 验证 / 加密 XML 消息回调（公开入口，必须验签解密） |
+| GET | `/api/im/outbox` | 任一平台使用 fake 时可用，只含模拟消息（调试/审计视图，读 `audit.read`） |
+
+**企业微信接入**：在「IM 机器人 → 添加机器人」选择「企业微信 · 自建应用」，填写 CorpID、应用 Secret、数字 AgentId、接收消息 Token 和 43 位 EncodingAESKey。保存后复制卡片的专属回调地址，在企业微信应用「接收消息」中配置可公网访问的 HTTPS 地址及相同密钥；配置应用可信 IP 与员工可见范围。URL 验证通过后，员工向应用发送文本即可建立独立的多轮会话，回复通过企业微信应用消息接口发回该员工。
+
+当前企业微信支持自建应用的员工文本消息，不包含群机器人 Webhook、图片、语音与外部联系人。测试消息弹窗填写员工 UserID；钉钉可选择群会话 ID 或员工 ID。停用机器人会拒绝测试发送和回调。
+
+企业微信模拟传输配置 `WECOM_TRANSPORT=fake`（未配置时沿用 `DINGTALK_TRANSPORT`）；正式传输使用 `real`。本地测试必须同时配置 `LLM_DISABLE=1`。凭证仍密文存储，企业微信 CorpID 复用 `appKey` 字段、AgentId 复用 `robotCode`，接口创建时传 `platform: "wecom"`。加密回调对企业 ID 与应用 ID 校验，重复消息按 MsgId 去重，同一员工消息串行执行。
+
+协议参考：[企业微信回调配置](https://developer.work.weixin.qq.com/document/path/90930)、[发送应用消息](https://developer.work.weixin.qq.com/document/path/90236)。
 
 权限点（都在 `server/auth/roles.ts`）：`/api/models*` 的写、`/api/api-keys*` 的读写 → `workflow.write`；
 `/api/mcp*` 读 `workflow.read` / 写 `workflow.write`；`/api/kb*` 与 `/api/skills/:id/kb` 写 → `workflow.write`；
@@ -246,7 +256,7 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
 `/api/auth/users*` 的读写都走 `member.manage`（只有所有者）。
 
 流程校验规则（`src/core/workflowSpec.ts`，控制台与后端共用同一份）：名称 1–40 字、系统提示 1–4000 字、
-1–10 个步骤、每步标题 1–40 字、`hint` ≤200 字、`via` 1–8 个且必须是工具目录里的工具名；流程重名 → 400。
+0–10 个步骤（0 = 纯技能：只写「什么时候用」和正文，调哪些工具交给模型自己判断）、每步标题 1–40 字、`hint` ≤200 字、`via` 1–8 个且必须是工具目录里的工具名；流程重名 → 400。
 技能文案同样在这里校验：一句话说明 ≤200 字、正文 ≤4000 字，两段都空 = 没写（仍能当技能用，目录里走兜底描述）。
 
 服务端零框架依赖，只用 `node:http`；前端是原生 JS，**没有构建步骤**。
@@ -261,7 +271,9 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 
 - **正文** = 流程的技能文案（`skill.description` 进技能目录，`skill.instructions` 是加载后的正文）+ 步骤清单；
   正文写职责边界、坑和汇报要求，步骤仍由 `WorkflowEngine` 按 `steps` 推进——技能和流程共用同一份定义。
-- **工具集** = 该流程步骤用到的工具（`via` 去重）；没声明工具的技能（自动编排）沿用会话现有工具。
+- **工具集** = 该流程步骤用到的工具（`via` 去重）；没有步骤的技能（自动编排、或零步骤的自定义技能）沿用会话现有工具，模型自己挑。
+- **编辑形态照着 Agent Skills 来**：主表单只有「技能名称 / 什么时候用它（必填，模型靠这句决定是否加载）/ 指导书正文」，
+  步骤与系统提示收在「高级」里——大多数技能不需要固定步骤。
 - **渐进式披露**：系统提示里只放一行「`id`（名称）：一句话描述」，模型判断需要时才调 `use_skill` 加载。
   加十条技能只多十行目录，不会把十份正文塞进上下文。
 - **加载 / 退出**：右栏技能面板里点一条技能就装进当前会话（等价 `POST /api/sessions/:id/skills`），
@@ -272,14 +284,14 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
   省上下文、定序强、过程不可见）；需要过程可见、中途能插话、能换技能 → 加载技能（正文占上下文，模型自己按步骤做）。
   加载技能后 `flow_*` 仍在工具集里，所以随时可以改成委托执行。
 
-### 右侧技能面板（查看 / 加载 / 新建 / 编辑 / 删除）
+### 技能模块（查看 / 加载 / 新建 / 编辑 / 删除）
 
-右栏常驻的「技能」面板把技能当一等公民管理，但**底层仍是流程**：一条技能 = 一条流程 + 它的技能文案。
+从左侧「技能」入口管理技能；**底层仍是流程**：一条技能 = 一条流程 + 它的技能文案。目录支持按名称或说明搜索，并筛选内置、自定义和使用中的技能。
 
-- **查看**：技能行「⋯ → 查看技能」只读打开（内置技能只有这一项；能看说明、正文与步骤，不能改）；
-- **加载**：点技能行 = 装进当前会话；没有打开的会话时提示先开会话，已经是当前技能再点幂等（不重复发请求）；
+- **查看**：技能条目「⋯ → 查看技能」只读打开（内置技能只有这一项；能看说明、正文与步骤，不能改）；
+- **加载**：点技能条目 = 装进当前会话；没有打开的会话时提示先开会话，已经是当前技能再点幂等（不重复发请求）；
 - **新建**：「＋」打开技能编辑器（标题「新建技能」，焦点直接落在技能说明）——填名称、系统提示、
-  技能说明、技能正文与步骤，保存即出现在面板里；底层就是 `POST /api/workflows`（带 `skill` 文案）；
+  技能说明、技能正文与步骤，保存后即出现在技能目录里；底层就是 `POST /api/workflows`（带 `skill` 文案）；
 - **编辑**：自定义技能「⋯ → 编辑技能」，说明/正文/步骤一起改。`PATCH /api/workflows/:id` 对 `skill` 是**替换语义**：
   只传说明时旧正文会被清掉（不会和旧值合并）；传 `null` 清空技能文案，目录里回落到「按固定步骤完成「<流程名>」。」；
 - **删除**：「⋯ → 删除技能」二次确认后 `DELETE /api/workflows/:id`。删的是整条定义，所以服务端会：
@@ -404,17 +416,22 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 
 ### 向量化与检索模式
 
-| 配置 | 检索行为 |
-|---|---|
-| 配了 `EMBEDDING_API_KEY` | 上传时按批（32 条/次）向量化；检索走向量余弦相似度，`mode: "vector"` |
-| 没配 | 自动走关键词检索（中文分词 + 2-gram + 标题加权），`mode: "keyword"` |
-| 配了但调用失败 | 回退关键词检索，`mode: "keyword"`，响应里带中文 `fallbackReason` |
+**向量模型有两条配置来源，优先用模型页那条**（每次调用现读，改完不用重启）：
 
-- `EMBEDDING_BASE_URL`（默认 `https://api.openai.com/v1`）、`EMBEDDING_MODEL`（默认 `text-embedding-3-small`）、
-  `EMBEDDING_API_KEY`（没有就恒走关键词检索）。
+| 来源 | 怎么配 | 检索行为 |
+|---|---|---|
+| ① 模型页（推荐） | 模型页建一条 `kind: "embedding"` 的模型（供应商要有 `/embeddings` 端点），在模型表对应行点「设为向量模型」 | 上传时按批（32 条/次）向量化；检索走向量余弦，`mode: "vector"` |
+| ② 环境变量 | `EMBEDDING_BASE_URL` + `EMBEDDING_MODEL` + `EMBEDDING_API_KEY` | 同上（部署期配置的老路子，仍然支持） |
+| 都没有 | —— | 自动走关键词检索（中文分词 + 2-gram + 标题加权），`mode: "keyword"` |
+| 配了但调用失败 | —— | 回退关键词检索，`mode: "keyword"`，响应里带中文 `fallbackReason` |
+
+- 模型页那条模型**优先于环境变量**；它存在但用不了（Key 解不开、没填 base_url）时，`available=false` 并在
+  `GET /api/kb/embedding` 的 `problem` 里如实写原因，**不会**悄悄换成环境变量那条（否则会用错模型还不自知）。
+- `GET /api/kb/embedding` 返回 `{ available, model, baseUrl, source, modelKey, problem }`：
+  `source` 是 `model` / `env` / `none`，`modelKey` 是模型页那条模型的行 id，页面据此标「已启用 / 未启用 / 配置有误」。
+- 具体某个库有没有向量看库行的 `embedding`（`embeddedChunkCount > 0`）——换模型后旧文档要
+  「重新向量化」或 `POST /api/kb/:id/reindex` 才带新模型算出的向量；模型可用但某个库仍有缺向量的块时，库详情会显示「待补齐」横幅和缺失块数，点「补齐向量（N 块）」即可重算整库。
 - `TRACE_RETENTION_DAYS`（默认 30）：调用链保留天数，`0` 关闭自动清理（见「监控」章节）。
-- `GET /api/kb/embedding` 返回 `{ available, model, baseUrl }`，页面据此显示「语义检索 / 关键词检索」；
-  `available` 只表示配没配 key，具体某个库有没有向量看库行的 `embedding`（`embeddedChunkCount > 0`）。
 - **向量化失败绝不阻断上传**：文档与分块先落库（`ready`），检索退回关键词，响应里带 `warning`。
 - 换模型不会崩：向量按模型返回的维度存（SQLite 是 JSON 文本、PG 是 pgvector 的无维度 `vector` 列），不假设维度；
   维度确实对不上时 SQLite 按相似度 0 处理，PG 会让 pgvector 报错 → 检索层回退关键词并带 `fallbackReason`。
@@ -427,6 +444,17 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 - 绑定关系落 `skill_kb_bindings`；删库会连带清掉绑定。
 - 会话里 `kb_search` 按当前技能 id（没加载技能时回落到会话自己的流程）查绑定并聚合检索（多库按分值合并、取 topK）；
   没绑定 / 没命中 / 知识库模块报错都返回一句中文说明，**不把工具调用打成失败**，模型可以照常回答并说明没查到。
+
+### 控制台页面
+
+- **一个库都没有时给一张空态卡**（讲清知识库是干什么的 + 主按钮「新建知识库」），不是两栏各一句占位话；
+  进页面会自动选中第一个库，右侧直接是文档与检索试跑。
+- 顶部状态条说清检索模式：`关键词检索`（按字面词匹配）/ `语义检索`（配好 embedding 后按意思召回）；
+  库标题旁显示 `N 文档 · M 块`，语义检索开启时再显示 `已向量化 x/M`。
+- 上传是同步解析：按钮先变「上传中…」并禁用（防连点），完成后提示写入的分块数；解析失败按 5xx 归类，
+  提示「这个文件没解析出文字（扫描件、加密或文件损坏）」而不是抛英文报错。
+- 「删除知识库」用危险色并带二次确认（会连带删文档与分块）；窄屏下文档表改成一条一张卡，
+  库列表与详情上下叠放（5 列表格在 300px 里放不下）。
 
 ### 已知限制
 
@@ -451,6 +479,7 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 - **模型**（`models`）：挂在供应商下，`model_id` 是供应商那边的模型名（例如 `deepseek-v4-pro`），`name` 是展示名，
   `kind` 是 `chat` / `embedding`，可单独停用。
 - 只有 `chat` + `enabled`、且供应商也 `enabled` 的模型才能被设为当前模型。
+- `embedding` 类型的模型给知识库用：模型页的「向量模型（知识库语义检索）」区块选一条，选完立刻生效（见「知识库」章节）。
 
 ### API Key 的加密与掩码
 
@@ -465,6 +494,16 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
   并把当前模型指向它——行为与 P2 完全一致，不用先到页面上配。
 - 已经建过任何供应商就完全不动（幂等）；`LLM_DISABLE=1` 时一律不建、也不用真实模型（冒烟/演示要可复现）。
 - `default` 供应商的密文解不开时（例如换了 `SECRET_KEY`）回落 `.env`，别让一次重启把真实模型变成模拟模型。
+
+### 向量模型（知识库语义检索）
+
+- `GET /api/models/embedding` → `{ modelKey, options }`（`options` 只含 `kind: "embedding"` 且启用、供应商也启用的模型）；
+  `POST` 同一路径 `{ modelId }` 设为向量模型——只能选 `embedding` 类型，选 `chat` 会 400。
+- 知识库那边通过 `initKb({ resolveEmbedding })` 拿到「端点 + 模型名 + 明文 Key」，配置每次调用现读，
+  所以**改完即时生效**（不用重启、不用重新上传；已上传的旧文档点「重新向量化」补向量）。
+- 没手动选过时，读取会自动挑第一条可用的向量模型（重启后也是这套规则）。
+- 供应商端点不支持 `/embeddings`（例如 `deepseek` / `anthropic` 没填自定义 `base_url`）时，
+  知识库页会显示「向量模型不可用 + 原因」，不会静默降级到"看起来能用"。
 
 ### 切当前模型
 
@@ -697,18 +736,20 @@ npm run demo:data        # 切片 B
 npm run demo:approval    # 切片 C
 npm run verify           # 边界能力自检（55 项）
 npm run ui-check         # 前端渲染单测（markdown，node:vm 沙盒，14 项）
-npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，232 项）
-npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具/重新向量化，54 项，SQLite 本地）
+npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，248 项）
+npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具/重新向量化/向量配置来源，55 项，SQLite 本地）
 npm run kb:pg:selftest   # 知识库 Postgres/pgvector 自检（16 项；需 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest    # 安全自检（scrypt/JWT/RBAC/限流/审计/成员保护，41 项）
-npm run models:selftest  # 多模型自检（AES-256-GCM/掩码/首启 default/ping，22 项）
+npm run models:selftest  # 多模型自检（AES-256-GCM/掩码/密文解不开/首启 default/ping，23 项）
 npm run mcp:selftest     # MCP 自检（stdio/HTTP/SSE、命名、超时与关闭，30 项）
 npm run obs:selftest     # 可观测自检（trace_id/内存队列/批量落库/聚合/保留期清理，24 项）
-npm run smoke            # 端到端冒烟（需先跑 npm run dev，164 项）
+npm run smoke            # 端到端冒烟（需先跑 npm run dev，182 项）
 npm run smoke:auth       # 鉴权端到端（需 AUTH_MODE=required 实例，51 项）
 npm run smoke:openapi    # 开放 API + 多模型端到端（需 AUTH_MODE=required 实例，53 项）
 npm run smoke:mcp        # MCP 端到端（模拟模型实例即可，45 项）
 npm run smoke:monitor    # 监控端到端（需 AUTH_MODE=required 实例，61 项）
+npm run wecom:selftest   # 企业微信加密回调、本机 HTTP 与注入发送自检（43 项，不联网）
+npm run smoke:wecom     # 完整服务企业微信收发验证（SMOKE_IM_BASE 指向 fake 隔离服务）
 npm run im:selftest      # IM Bot 自检（加签/AES/幂等/映射/出站，26 项，P8）
 npm run smoke:im         # IM 端到端（需 DINGTALK_TRANSPORT=fake 实例，37 项，P8）
 npm run persist-check -- --write   # 会话持久化验证
@@ -724,7 +765,7 @@ demo 默认用 Pi 内置的 **faux provider**（脚本化假模型），不花�
 
 ```powershell
 $env:LLM_DISABLE="1"; npm run dev                       # 终端 1：模拟模型服务
-npm run smoke                                           # 终端 2：端到端 164 项断言
+npm run smoke                                           # 终端 2：端到端 182 项断言
 
 # 想隔离数据、不动正式会话库（端口自选）
 $env:LLM_DISABLE="1"; $env:PORT="4318"; $env:DB_PATH="$PWD\data\qa-smoke.db"; npm run dev
@@ -772,7 +813,7 @@ $env:DATABASE_URL="postgres://biz:biz@127.0.0.1:5433/biz"
 npm run db:migrate                                      # 建表（db/migrations/*.sql，按版本幂等）
 npm run db:check                                        # 后端应是 postgres，表清单 19 张（0001 的 17 张 + 0003 的两张模型表）
 $env:LLM_DISABLE="1"; npm run dev                       # 启动日志会打「会话库: Postgres（…）」
-$env:SMOKE_BASE="http://127.0.0.1:4330"; npm run smoke   # 期望 164 项
+$env:SMOKE_BASE="http://127.0.0.1:4330"; npm run smoke   # 期望 182 项
 ```
 
 `db:migrate` 会依次应用 `0001_init.sql`、`0002_auth.sql`；`db:check` 的「schema 迁移」段会打印已应用版本。
@@ -894,25 +935,25 @@ biz-agent/
 ├── web/                   控制台前端（原生 JS，无构建）
 │   ├── index.html
 │   ├── style.css
-│   ├── app.js             页面逻辑：登录页、模块导航、四列布局、SSE、审批（内联卡片 + 跨会话待办轮询）、知识库、技能面板/编辑器、置顶、归档；
+│   ├── app.js             页面逻辑：登录页、模块导航、三列对话布局、SSE、审批（内联卡片 + 跨会话待办轮询）、知识库、技能面板/编辑器、置顶、归档；
 │   │                      模块页：知识库 / 模型 / MCP / IM 机器人 / 审批 / 成员（含改角色/停用/删除）/ 审计 / 设置（含 API Key）/ 监控
 │   └── markdown.js        纯函数：markdown → HTML（表格/代码块/链接白名单，先转义再套标签）
 ├── examples/              终端 demo
 └── scripts/
     ├── selftest.ts        边界能力自检（55 项）
-    ├── kb-selftest.ts     知识库自检（54 项，SQLite 本地，解析/分块/检索/绑定/工具/重新向量化，不起服务）
+    ├── kb-selftest.ts     知识库自检（55 项，SQLite 本地，解析/分块/检索/绑定/工具/重新向量化/向量配置来源，不起服务）
     ├── kb-pg-selftest.ts  知识库 Postgres/pgvector 自检（16 项，需 DATABASE_URL + 迁移，没配就跳过）
     ├── auth-selftest.ts   安全自检（41 项，scrypt/JWT/RBAC/限流/审计/成员保护，不起服务）
     ├── models-selftest.ts 多模型自检（22 项，AES-256-GCM/掩码/首启 default/ping，不起服务）
     ├── mcp-selftest.ts    MCP 自检（30 项，stdio/HTTP/SSE 传输、命名、超时/关闭，不起服务）
     ├── observability-selftest.ts  可观测自检（24 项，trace_id/队列/批量落库/聚合/保留期清理，不起服务）
     ├── ui-check.mjs       前端渲染单测（14 项，node:vm 加载 web/markdown.js）
-    ├── ui-dom-check.mjs   控制台 DOM 桩自检（232 项，自造迷你 DOM，不起服务、不引 jsdom）
+    ├── ui-dom-check.mjs   控制台 DOM 桩自检（248 项，自造迷你 DOM，不起服务、不引 jsdom）
     ├── ui-shot.mjs        观感核对：用本机 Edge/Chrome 无头截图（不联网、不装依赖，可选）
     ├── db-migrate.ts      Postgres 迁移（npm run db:migrate，打印版本）
     ├── db-check.ts        存储后端体检（npm run db:check：类型/位置/引擎/表/迁移/数据量）
     ├── fixtures/mcp-stdio-server.mjs  冒烟/自检用的假 MCP Server（stdio，零依赖）
-    ├── smoke.ts           端到端冒烟（164 项，走真实 HTTP+SSE，含知识库场景 G 与审批中心场景 H）
+    ├── smoke.ts           端到端冒烟（182 项，走真实 HTTP+SSE，含知识库场景 G / G2 与审批中心场景 H）
     ├── smoke-auth.ts      鉴权端到端（51 项，要 AUTH_MODE=required 实例）
     ├── smoke-openapi.ts   开放 API + 多模型端到端（53 项，要 AUTH_MODE=required 实例）
     ├── smoke-mcp.ts       MCP 端到端（45 项，起假 MCP Server，模拟模型实例即可）

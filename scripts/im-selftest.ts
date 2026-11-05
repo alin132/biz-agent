@@ -557,6 +557,7 @@ async function testMisc(): Promise<void> {
 
 	await check("只有钉钉回调是公开路径，机器人管理接口仍要登录", () => {
 		assert.equal(isPublicApiPath("/api/im/dingtalk/callback"), true);
+		assert.equal(isPublicApiPath("/api/im/wecom/callback"), true);
 		assert.equal(isPublicApiPath("/api/im/bots"), false);
 		assert.equal(isPublicApiPath("/api/im/outbox"), false);
 		assert.equal(isPublicApiPath("/api/health"), true);
@@ -574,6 +575,19 @@ async function main(): Promise<void> {
 		await testText();
 		await testIdempotency();
 		await testCredentials(store);
+		await check("企业微信配置必填 AES、校验 AgentId 并隔离平台回调", () => {
+			const im = new ImStore(store);
+			const body = { platform: "wecom", name: "企业微信测试", appKey: "ww-corp", appSecret: "secret", robotCode: "1000002", callbackToken: "token", aesKey: randomAesKey() };
+			assert.throws(() => im.create({ ...body, aesKey: "" }), /EncodingAESKey/);
+			assert.throws(() => im.create({ ...body, robotCode: "abc" }), /AgentId/);
+			const bot = im.create(body);
+			assert.equal(bot.platform, "wecom");
+			assert.equal(im.findForCallback(bot.id, "wecom").appKey, "ww-corp");
+			assert.throws(() => im.findForCallback(bot.id), /平台/);
+			assert.throws(() => im.update(bot.id, { aesKey: "" }), /EncodingAESKey/);
+			assert.throws(() => im.update(bot.id, { platform: "dingtalk" }), /更换平台/);
+			assert.equal(im.outboundOf(im.requireRow(bot.id)).platform, "wecom");
+		});
 		await testSessions(store);
 		await testOutbound(store);
 		await testMisc();

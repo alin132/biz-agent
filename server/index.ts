@@ -132,8 +132,15 @@ const storage = db.info();
 const auth = initAuth(db);
 // IM Bot 网关（P8）：机器人凭证（AES 加密）+ 钉钉回调（加签/AES）+ 出站（fake outbox / 真 https）
 const im = initIm({ storage: db, hub });
-// 知识库：启动时建表（幂等），表与会话库同一个 SQLite 文件
-initKb({ dbPath: DB_PATH });
+// 知识库：启动时建表（幂等），表与会话库同一个 SQLite 文件。
+// 向量模型优先用模型页那条「向量」模型，没配才回落到 EMBEDDING_* 环境变量（每次调用现读，改完即时生效）
+initKb({
+	dbPath: DB_PATH,
+	resolveEmbedding: () => {
+		const config = models.embeddingConfig();
+		return config ? { modelKey: config.modelKey, config: { baseUrl: config.baseUrl, model: config.modelId, apiKey: config.apiKey } } : null;
+	},
+});
 
 function json(res: ServerResponse, status: number, body: unknown): void {
 	const payload = JSON.stringify(body);

@@ -1,15 +1,16 @@
 /**
  * 向量化（OpenAI 兼容接口）。
  *
- * 三个环境变量（都有默认值，只有 key 没有默认）：
- *   EMBEDDING_BASE_URL  默认 https://api.openai.com/v1（中转 / Ollama / vLLM 都填这里）
- *   EMBEDDING_MODEL     默认 text-embedding-3-small
- *   EMBEDDING_API_KEY   没配 → `available() === false`，知识库自动走关键词检索
+ * **配置来源有两条，先看模型页，再看环境变量**：
+ *   ① 模型页里「类型 = 向量」且启用、供应商也启用的那条模型（base_url + 解密的 key + modelId）；
+ *   ② 环境变量 EMBEDDING_BASE_URL / EMBEDDING_MODEL / EMBEDDING_API_KEY（部署期配置，仍然支持）。
+ * 两条都没有 → `available() === false`，知识库自动走关键词检索。
+ * 每次调用都现读（不缓存），所以在模型页改完立刻生效，不用重启。
  *
  * 设计要点：
  *   - **不假设维度**：按模型返回的长度存（JSON 数组文本进 `kb_chunks.embedding`），换模型不会崩。
  *   - 批量 32 条/次、单次超时 30s、失败重试 1 次（4xx 鉴权/参数错不重试，重试也没用）。
- *   - `available()` 每次现读环境变量：服务启动后才补 key / 单测里改 env 都能立刻生效。
+ *   - 模型行的来源以`ModelService.embeddingConfig()` 为准，这里只认它给出的纯数据，不 import 模型模块（避免循环依赖）。
  */
 
 import { KbError, errorMessage } from "./errors.js";
@@ -30,6 +31,12 @@ export interface EmbeddingInfo {
 	available: boolean;
 	model: string;
 	baseUrl: string;
+	/** 配置从哪来：模型页（model）/ 环境变量（env）/ 都没有（none）。页面据此给不同引导 */
+	source: "model" | "env" | "none";
+	/** source=model 时是那条模型行的 id，页面据此标出"当前向量模型" */
+	modelKey: string | null;
+	/** 能拿到配置但实际不可用的原因（比如 key 解不开），页面直接显示 */
+	problem: string | null;
 }
 
 export interface EmbeddingClient {
@@ -105,6 +112,19 @@ export interface CreateEmbeddingClientOptions {
 	fetchImpl?: typeof fetch;
 	/** 重试等待毫秒数（单测可设为 0） */
 	retryDelayMs?: number;
+	/**
+	 * 模型页那条「向量」模型（服务端运行时注入）。
+	 * 返回 null = 模型页没配，回落到环境变量；抛错/带 problem = 有配置但用不了，不再回落（否则会悄悄用错模型）。
+	 */
+	resolveModelEmbedding?: () => ResolvedEmbedding | null;
+}
+
+/** 模型页给出的向量配置（纯数据，避免与 models 模块互相 import）。 */
+export interface ResolvedEmbedding {
+	modelKey: string;
+	config: EmbeddingConfig;
+	/** 有配置但拼不出可用客户端时的中文原因 */
+	problem?: string;
 }
 
 /** 创建客户端。同一次服务里只建一个，配置在调用时现读，避免启动后才配 key 的情况漏掉。 */
@@ -112,12 +132,78 @@ export function createEmbeddingClient(options: CreateEmbeddingClientOptions = {}
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	const retryDelayMs = options.retryDelayMs ?? 300;
 
-	const config = (): EmbeddingConfig => loadEmbeddingConfig(options.config ?? {});
+	/** 现读当前生效的配置：显式 overrides > 模型页 > 环境变量。 */
+	const resolve = (): { config: EmbeddingConfig; info: EmbeddingInfo } => {
+		if (options.resolveModelEmbedding) {
+			let resolved: ResolvedEmbedding | null = null;
+			let problem: string | null = null;
+			try {
+				resolved = options.resolveModelEmbedding();
+			} catch (error) {
+				problem = errorMessage(error);
+			}
+			if (resolved) {
+				// 模型页优先：只有它没给的那几项才用显式 overrides 补（overrides 是单测注入用的）
+				const merged = loadEmbeddingConfig({
+					baseUrl: resolved.config.baseUrl || options.config?.baseUrl,
+					model: resolved.config.model || options.config?.model,
+					apiKey: resolved.config.apiKey || options.config?.apiKey,
+				});
+				const usable = problem === null && !resolved.problem && merged.apiKey.length > 0;
+				return {
+					config: merged,
+					info: {
+						available: usable,
+						model: merged.model,
+						baseUrl: merged.baseUrl,
+						source: "model",
+						modelKey: resolved.modelKey,
+						problem: resolved.problem ?? problem,
+					},
+				};
+			}
+			if (problem) {
+				// 模型页有向量模型但读不出来（key 解不开之类）：如实报不可用，别悄悄退回环境变量
+				return {
+					config: { ...loadEmbeddingConfig(options.config ?? {}), apiKey: "" },
+					info: {
+						available: false,
+						model: "",
+						baseUrl: "",
+						source: "model",
+						modelKey: null,
+						problem,
+					},
+				};
+			}
+		}
+		const envConfig = loadEmbeddingConfig(options.config ?? {});
+		const hasKey = envConfig.apiKey.length > 0;
+		return {
+			config: envConfig,
+			info: {
+				available: hasKey,
+				model: envConfig.model,
+				baseUrl: envConfig.baseUrl,
+				source: hasKey ? "env" : "none",
+				modelKey: null,
+				problem: null,
+			},
+		};
+	};
+
+	const config = (): EmbeddingConfig => resolve().config;
+
+	/** 端点：base_url 末尾带 /embeddings 的（有些供应商直接给完整地址）就别重复拼。 */
+	function endpointOf(baseUrl: string): string {
+		const base = baseUrl.replace(/\/+$/, "");
+		return /\/embeddings$/i.test(base) ? base : `${base}/embeddings`;
+	}
 
 	async function requestBatch(batch: string[], cfg: EmbeddingConfig): Promise<number[][]> {
 		let response: Response;
 		try {
-			response = await fetchImpl(`${cfg.baseUrl}/embeddings`, {
+			response = await fetchImpl(endpointOf(cfg.baseUrl), {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
@@ -163,16 +249,18 @@ export function createEmbeddingClient(options: CreateEmbeddingClientOptions = {}
 		},
 
 		info(): EmbeddingInfo {
-			const cfg = config();
-			return { available: cfg.apiKey.length > 0, model: cfg.model, baseUrl: cfg.baseUrl };
+			return resolve().info;
 		},
 
 		async embed(texts: string[]): Promise<number[][]> {
 			const cfg = config();
 			if (cfg.apiKey.length === 0) {
+				const info = resolve().info;
 				throw new KbError(
 					400,
-					"没配置向量化服务（EMBEDDING_API_KEY 为空），无法做语义检索（已自动回退到关键词检索）",
+					info.problem
+						? `向量模型不可用：${info.problem}`
+						: "没配置向量模型：到「模型」页加一个类型为「向量」的模型并设为向量模型（或配 EMBEDDING_API_KEY），再重新向量化",
 				);
 			}
 			const inputs = texts.map((text) => text.trim());

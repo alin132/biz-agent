@@ -199,6 +199,22 @@ async function main(): Promise<void> {
 		assert.equal(decryptSecret(row!.apiKeyEncrypted!, SECRET), "sk-1234567890abcd");
 	});
 
+	await check("密文解不开：出参标 apiKeyBroken=true 并给占位掩码（列表接口不 500）", () => {
+		storage.updateModelProvider(provider.id, { apiKeyEncrypted: "v1:not-a-real-cipher", updatedAt: Date.now() });
+		const broken = store.providers().find((item) => item.id === provider.id)!;
+		assert.equal(broken.apiKeyBroken, true);
+		assert.ok((broken.apiKeyMasked ?? "").includes("无法解密"));
+		assert.ok(!JSON.stringify(broken).includes("not-a-real-cipher"), "密文也不能出现在出参里");
+		// 重填一次 Key 就该恢复正常
+		storage.updateModelProvider(provider.id, {
+			apiKeyEncrypted: encryptSecret("sk-1234567890abcd"),
+			updatedAt: Date.now(),
+		});
+		const fixed = store.providers().find((item) => item.id === provider.id)!;
+		assert.equal(fixed.apiKeyBroken, false);
+		assert.equal(fixed.apiKeyMasked, "sk-****abcd");
+	});
+
 	await check("供应商唯一名冲突 → 409；非法 kind/base_url → 400", () => {
 		expectModelError(() => store.createProvider({ name: "自检供应商", kind: "openai" }), 409, "已存在");
 		expectModelError(() => store.createProvider({ name: "坏类型", kind: "gemini" }), 400, "供应商类型");

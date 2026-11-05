@@ -556,6 +556,8 @@ const kbDocs = {
 	"kb-2": [{ id: "doc-3", filename: "话术.txt", bytes: 512, status: "ready", chunkCount: 5 }],
 };
 let kbEmbedding = { available: false, model: null, baseUrl: null };
+// resetModelFixtures 时把语义检索夹具也复原（用例会把它改成"启用了 bge-m3"）
+const KB_EMBEDDING_SEED = { ...kbEmbedding };
 let kbSearchMode = "keyword";
 let kbDeleteResult = { removed: true, documentsRemoved: 2, chunksRemoved: 14 };
 const skillKbBindings = { "report-flow": ["kb-1"] };
@@ -632,6 +634,7 @@ const MODEL_SEED = [
 		enabled: true,
 		hasApiKey: true,
 		apiKeyMasked: "sk-d…cdef",
+		apiKeyBroken: false,
 		modelCount: 1,
 	},
 	{
@@ -642,6 +645,7 @@ const MODEL_SEED = [
 		enabled: true,
 		hasApiKey: false,
 		apiKeyMasked: null,
+		apiKeyBroken: false,
 		modelCount: 1,
 	},
 ];
@@ -670,6 +674,9 @@ const MODEL_ROW_SEED = [
 let modelProviderStore = MODEL_SEED.map((item) => ({ ...item }));
 let modelRowStore = MODEL_ROW_SEED.map((item) => ({ ...item }));
 let modelCurrent = "deepseek-chat";
+// 向量模型（知识库语义检索用）：模型页的「设为向量模型」写这里
+let modelEmbeddingKey = null;
+
 // 探测结果按模型 id 覆盖；默认成功 120ms
 let modelPingResults = {};
 
@@ -1268,6 +1275,17 @@ async function fakeFetch(url, options = {}) {
 		modelRowStore = [...modelRowStore, created];
 		return jsonResponse(created, true, 201);
 	}
+	if (url === "/api/models/embedding") {
+		// 与后端一致：只有启用且供应商启用的向量模型才算"可选"
+		const options = modelRowStore.filter((item) => item.kind === "embedding" && item.enabled);
+		if (method === "GET") return jsonResponse({ modelKey: modelEmbeddingKey, options: options.map((item) => ({ ...item })) });
+		const row = modelRowStore.find((item) => item.id === payload.modelId);
+		if (!row) return jsonResponse({ error: "模型不存在" }, false, 404);
+		if (row.kind !== "embedding") return jsonResponse({ error: "只有「向量」类型的模型能设为向量模型" }, false, 400);
+		if (!row.enabled) return jsonResponse({ error: "模型已停用，不能设为向量模型" }, false, 400);
+		modelEmbeddingKey = row.id;
+		return jsonResponse({ modelKey: modelEmbeddingKey, options: options.map((item) => ({ ...item })) });
+	}
 	if (url === "/api/models/current") {
 		if (method === "GET") {
 			const row = modelRowStore.find((item) => item.modelId === modelCurrent || item.id === modelCurrent) ?? null;
@@ -1864,6 +1882,9 @@ Object.assign(sandbox.__t, {
 	setKbSearchMode: (mode) => {
 		kbSearchMode = mode;
 	},
+	setKbStore: (value) => {
+		kbStore = value;
+	},
 	setKbDeleteResult: (value) => {
 		kbDeleteResult = value;
 	},
@@ -1935,11 +1956,14 @@ Object.assign(sandbox.__t, {
 		modelsStatus = status;
 	},
 	resetModelFixtures: () => {
+		kbEmbedding = { ...KB_EMBEDDING_SEED };
 		modelsAvailable = true;
 		modelsStatus = 200;
 		modelProviderStore = MODEL_SEED.map((item) => ({ ...item }));
+		// 深拷贝：用例里改过模型行（启用/停用）不能污染别的用例
 		modelRowStore = MODEL_ROW_SEED.map((item) => ({ ...item }));
 		modelCurrent = "deepseek-chat";
+		modelEmbeddingKey = null;
 		modelPingResults = {};
 	},
 	setModelPingResult: (modelId, result) => {
@@ -1947,6 +1971,12 @@ Object.assign(sandbox.__t, {
 	},
 	setModelCurrent: (modelId) => {
 		modelCurrent = modelId;
+	},
+	setModelEmbedding: (modelKey) => {
+		modelEmbeddingKey = modelKey;
+	},
+	clearNotices: () => {
+		els.threadInner.querySelectorAll(".notice").forEach((node) => node.remove());
 	},
 	setApiKeysAvailable: (value) => {
 		apiKeysAvailable = value;
@@ -2096,14 +2126,12 @@ await check("关键 CSS 规则都在", () => {
 	assert.match(css, /\.thread-foot \{[^}]*height: 0/s, "回到底部的锚点应是 0 高度");
 });
 
-await check("技能面板是四列网格里的一列，且列表自己滚动、窄屏收起", () => {
-	assert.match(css, /\.shell \{[^}]*grid-template-columns: 56px 258px minmax\(0, 1fr\) 288px/s, "宽屏是四列");
-	assert.match(css, /\.skill-list \{[^}]*overflow-y: auto/s, "技能列表要能自己滚");
+await check("对话页已撤掉右侧技能栏：网格回到三列，DOM 仅保留（display: none）", () => {
+	assert.match(css, /\.shell \{[^}]*grid-template-columns: 76px 258px minmax\(0, 1fr\);/s, "对话页就是三列");
+	assert.match(css, /\.skill-side \{[^}]*display: none/s, "常驻技能栏视觉上彻底隐藏");
+	assert.ok(!css.includes("56px 0 minmax(0, 1fr)"), "隐藏会话栏后不能保留零宽度列，否则主区会被挤进该列");
+	assert.match(css, /\.skill-list \{[^}]*overflow-y: auto/s, "技能列表仍能自己滚（模块页复用同一套行）");
 	assert.match(css, /\.skill-list \{[^}]*min-height: 0/s, "min-height:0 才滚得起来（否则撑破网格）");
-	const narrow = css.match(/@media \(max-width: 1180px\) \{[\s\S]*?\n\}/)?.[0] ?? "";
-	assert.ok(narrow.includes(".skill-side"), "1180 以下要收起技能栏");
-	assert.match(narrow, /\.skill-side \{[^}]*display: none/s, "窄屏直接隐藏，不做抽屉兜底");
-	assert.match(narrow, /grid-template-columns: 56px 258px minmax\(0, 1fr\)/, "窄屏回到三列");
 });
 
 await check("页头的技能胶囊只是状态显示：没有下拉菜单的接线", () => {
@@ -2759,29 +2787,67 @@ await check("技能目录为空时列表给占位文案", async () => {
 
 section("技能编辑器（复用同一个弹窗）");
 
-await check("右栏「＋」打开编辑器：标题「新建技能」、默认 1 步、工具按分类分组", async () => {
+await check("右栏「＋」打开编辑器：标题「新建技能」、默认没有步骤、高级区收起", async () => {
 	documentStub.getElementById("btn-new-skill").click();
 	await flush(20);
 	assert.equal(els.flowModal.hidden, false);
 	assert.equal(els.flowModalTitle.textContent, "新建技能");
-	assert.equal(els.flowSkillDesc.disabled, false, "新建时技能文案可以填");
-	assert.equal(documentStub.activeElement, els.flowSkillDesc, "焦点直接送到「技能一句话说明」");
-	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 1, "默认给一个步骤");
+	assert.equal(els.flowSkillDesc.disabled, false, "新建时「什么时候用它」可以填");
+	assert.equal(documentStub.activeElement, els.flowSkillDesc, "焦点直接送到「什么时候用它」");
+	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 0, "技能默认不给步骤：工具由模型自己挑");
+	assert.equal(
+		els.flowStepsBox.querySelector(".placeholder")?.textContent.includes("自己决定"),
+		true,
+		"没有步骤时要说清：模型自己决定调哪些工具",
+	);
+	const advanced = documentStub.getElementById("flow-advanced");
+	assert.equal(advanced.open, false, "高级区（步骤 + 系统提示）默认收起");
+	els.flowAddStep.click();
+	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 1, "点「＋ 添加步骤」才出现步骤");
 	assert.equal(els.flowStepsBox.querySelectorAll(".tool-group").length, 3, "工具目录 3 个分类");
 	assert.equal(els.flowStepsBox.querySelectorAll(".tool-chip").length, 4, "4 个工具");
+	const removeBtn = els.flowStepsBox.querySelector(".flow-step .mini-btn.danger");
+	removeBtn.click();
+	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 0, "删到零步是允许的（不是错误）");
+});
+
+await check("只写说明和正文（零步骤）就能保存：steps 传空数组", async () => {
+	const beforeCatalog = skillListRequestCount();
+	els.flowName.value = "退款处理";
+	els.flowName.dispatch("input");
+	els.flowSkillDesc.value = "用户要退货退款或查退款进度时用它";
+	els.flowSkillDesc.dispatch("input");
+	els.flowSkillInst.value = "先核对订单，再发起退款，最后告诉用户预计到账时间。";
+	els.flowSkillInst.dispatch("input");
+	await t.saveFlow();
+	await flush(20);
+	const postCall = calls.filter((call) => call.method === "POST" && call.url === "/api/workflows").at(-1);
+	assert.ok(postCall, "应发出 POST /api/workflows");
+	assert.deepEqual(postCall.body.steps, [], "没有步骤就是空数组，不是报错");
+	assert.deepEqual(postCall.body.skill, {
+		description: "用户要退货退款或查退款进度时用它",
+		instructions: "先核对订单，再发起退款，最后告诉用户预计到账时间。",
+	});
+	assert.equal(
+		postCall.body.systemPrompt,
+		"先核对订单，再发起退款，最后告诉用户预计到账时间。",
+		"没填系统提示时用指导书正文兜底（服务端必填）",
+	);
+	assert.equal(els.flowModal.hidden, true);
+	assert.ok(skillListRequestCount() > beforeCatalog, "保存后要重新拉技能目录");
 });
 
 await check("填表 + 勾工具 + 加步骤 + 技能文案后保存：POST 带 skill，右栏重新拉目录", async () => {
 	const beforeCatalog = skillListRequestCount();
+	documentStub.getElementById("btn-new-skill").click();
+	await flush(20);
 	els.flowName.value = "退款处理";
 	els.flowName.dispatch("input");
-	els.flowPrompt.value = "负责退款处理";
-	els.flowPrompt.dispatch("input");
 	els.flowSkillDesc.value = "需要退货退款时用它";
 	els.flowSkillDesc.dispatch("input");
 	els.flowSkillInst.value = "先核对订单，再发起退款。";
 	els.flowSkillInst.dispatch("input");
-
+	els.flowAddStep.click();
 	const firstStep = els.flowStepsBox.querySelectorAll(".flow-step")[0];
 	const titleInput = firstStep.querySelectorAll(".field-input")[0];
 	titleInput.value = "核对订单";
@@ -2791,7 +2857,8 @@ await check("填表 + 勾工具 + 加步骤 + 技能文案后保存：POST 带 s
 	firstChip.dispatch("change");
 	assert.equal(firstChip.parentNode.classList.contains("checked"), true, "勾选后 chip 要高亮");
 
-	t.addFlowStep();
+	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 1);
+	els.flowAddStep.click();
 	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 2);
 	const secondStep = els.flowStepsBox.querySelectorAll(".flow-step")[1];
 	secondStep.querySelectorAll(".field-input")[0].value = "发起退款";
@@ -2805,19 +2872,61 @@ await check("填表 + 勾工具 + 加步骤 + 技能文案后保存：POST 带 s
 	const postCall = calls.filter((call) => call.method === "POST" && call.url === "/api/workflows").at(-1);
 	assert.ok(postCall, "应发出 POST /api/workflows");
 	assert.equal(postCall.body.name, "退款处理");
-	assert.equal(postCall.body.steps.length, 2);
+	assert.equal(postCall.body.steps.length, 2, "两个步骤都带上了");
 	assert.deepEqual(postCall.body.skill, { description: "需要退货退款时用它", instructions: "先核对订单，再发起退款。" });
 	assert.equal(els.flowModal.hidden, true, "保存成功应关窗");
 	assert.ok(skillListRequestCount() > beforeCatalog, "保存后右栏要重新拉一次技能目录");
 });
 
-await check("两段技能文案都空时发 skill: null（显式清空，别沿用旧值）", async () => {
+await check("不填「什么时候用它」直接拦下：不发请求，焦点回到该字段", async () => {
+	documentStub.getElementById("btn-new-skill").click();
+	await flush(20);
+	const before = calls.filter((call) => call.method === "POST" && call.url === "/api/workflows").length;
+	els.flowName.value = "没有说明的技能";
+	els.flowName.dispatch("input");
+	els.flowSkillInst.value = "正文写了但不说是啥时候用。";
+	els.flowSkillInst.dispatch("input");
+	await t.saveFlow();
+	await flush(20);
+	assert.equal(
+		calls.filter((call) => call.method === "POST" && call.url === "/api/workflows").length,
+		before,
+		"说明必填：不满足就不发请求",
+	);
+	assert.ok(els.flowError.textContent.includes("什么时候用它"), `错误要指出缺哪个字段：${els.flowError.textContent}`);
+	assert.equal(documentStub.activeElement, els.flowSkillDesc, "焦点回到「什么时候用它」");
+	assert.equal(els.flowModal.hidden, false, "弹窗不关，用户可以接着补");
+});
+
+await check("说明填了但正文与系统提示都空：拦下并提示补正文", async () => {
+	// 上个用例停在"缺说明"上：这里补上说明、并把正文与系统提示显式清空
+	els.flowName.value = "缺正文的技能";
+	els.flowName.dispatch("input");
+	els.flowSkillInst.value = "";
+	els.flowSkillInst.dispatch("input");
+	els.flowPrompt.value = "";
+	els.flowPrompt.dispatch("input");
+	els.flowSkillDesc.value = "只写了触发条件";
+	els.flowSkillDesc.dispatch("input");
+	await t.saveFlow();
+	await flush(20);
+	assert.ok(
+		els.flowError.textContent.includes("指导书正文") || els.flowError.textContent.includes("系统提示"),
+		`要提示补正文或系统提示：${els.flowError.textContent}`,
+	);
+	assert.equal(els.flowModal.hidden, false);
+	t.closeFlowEditor(true);
+});
+await check("正文留空时 skill 只带说明（不编造 instructions）", async () => {
 	documentStub.getElementById("btn-new-skill").click();
 	await flush(20);
 	els.flowName.value = "只有步骤的技能";
 	els.flowName.dispatch("input");
 	els.flowPrompt.value = "只当步骤用";
 	els.flowPrompt.dispatch("input");
+	els.flowSkillDesc.value = "临时说明";
+	els.flowSkillDesc.dispatch("input");
+	els.flowAddStep.click();
 	const step = els.flowStepsBox.querySelectorAll(".flow-step")[0];
 	step.querySelectorAll(".field-input")[0].value = "跑一步";
 	step.querySelectorAll(".field-input")[0].dispatch("input");
@@ -2827,7 +2936,12 @@ await check("两段技能文案都空时发 skill: null（显式清空，别沿�
 	await t.saveFlow();
 	await flush(20);
 	const postCall = calls.filter((call) => call.method === "POST" && call.url === "/api/workflows").at(-1);
-	assert.equal(postCall.body.skill, null, `两段都空要发 null：${JSON.stringify(postCall.body.skill)}`);
+	// 说明是必填的（服务端保持可选是为了兼容老数据），所以这里只可能缺正文
+	assert.deepEqual(
+		postCall.body.skill,
+		{ description: "临时说明" },
+		`正文空时不带 instructions：${JSON.stringify(postCall.body.skill)}`,
+	);
 });
 
 await check("编辑技能：回填技能文案与步骤，PATCH 回同一个 id", async () => {
@@ -2857,6 +2971,9 @@ await check("编辑器字段叫「技能名称」，两个技能文案字段有�
 	assert.ok(!visibleHtml.includes("流程名称"), "不该再有「流程名称」");
 	assert.match(html, /id="flow-skill-desc"[^>]*maxlength="200"/, "一句话说明上限 200");
 	assert.match(html, /id="flow-skill-inst"[^>]*maxlength="4000"/, "技能正文上限 4000");
+	assert.ok(visibleHtml.includes("什么时候用它"), "说明字段要叫「什么时候用它」");
+	assert.ok(visibleHtml.includes("高级：固定步骤与工具"), "步骤与系统提示收进高级区");
+	assert.ok(!visibleHtml.includes("技能一句话说明"), "别再叫「技能一句话说明」（用户看不懂这句话管什么）");
 });
 
 await check("保存失败时把服务端的错误显示在弹窗里（不用 alert）", async () => {
@@ -3078,16 +3195,17 @@ await check("每个模块按钮都有悬停提示与无障碍名，且只高亮�
 		assert.ok(node.title.length > 0, `${node.dataset.module} 缺 title`);
 		assert.equal(node.getAttribute("aria-label"), node.title, "aria-label 与 title 一致");
 		assert.equal(node.getAttribute("type"), "button");
+		assert.equal(node.querySelector(".rail-label")?.textContent, node.title, `${node.dataset.module} 图标下方应显示中文名称`);
 	}
 	assert.deepEqual(currentModules(), ["chat"], "启动后默认停在对话");
 	assert.equal(initialModule, "chat", "state.module 初始值就是 chat");
 });
 
-await check("对话模块 = 原来那套四列：会话栏与右栏技能面板都在", () => {
+await check("对话模块 = 三列：会话栏在，右侧技能栏不再常驻", () => {
 	assert.equal(els.shell.classList.contains("module-view"), false);
 	assert.equal(els.modulePage.querySelectorAll(".module-page").length, 0, "对话模块不画模块页");
 	assert.equal(els.sessionList.querySelectorAll(".item").length > 0, true, "会话栏有内容");
-	assert.equal(els.skillList.querySelectorAll(".skill-row").length > 0, true, "右栏技能列表在");
+	assert.match(css, /\.skill-side \{[^}]*display: none/s, "右栏技能栏只保留 DOM，不再显示");
 });
 
 await check("点「知识库」：壳切成模块视图，标题/说明/未接入徽标/接口清单都在", async () => {
@@ -3151,6 +3269,42 @@ await check("点「技能」：真实目录（过滤自动编排）+ 内置角�
 	assert.equal(rows[3].querySelector(".skill-row-desc")?.textContent, "每周五汇总本周数据");
 	// 和右栏同一套行结构（同一个 skillRowNode），不搞两套渲染
 	assert.equal(rows[3].getAttribute("role"), "button");
+	assert.equal(els.modulePage.querySelectorAll(".skill-module-filter").length, 4);
+});
+
+await check("技能目录可按名称说明搜索与类型筛选，空结果可清除", () => {
+	let search = els.modulePage.querySelector(".skill-module-search");
+	search.value = "每周五";
+	search.dispatch("input");
+	let rows = Array.from(els.modulePage.querySelectorAll(".skill-row"));
+	assert.deepEqual(rows.map((row) => row.dataset.skillId), ["report-flow"]);
+	assert.equal(els.modulePage.querySelector(".skill-module-count").textContent, "显示 1 / 5 项技能");
+	const custom = Array.from(els.modulePage.querySelectorAll(".skill-module-filter")).find((button) => button.textContent === "自定义");
+	custom.click();
+	rows = Array.from(els.modulePage.querySelectorAll(".skill-row"));
+	assert.deepEqual(rows.map((row) => row.dataset.skillId), ["report-flow"]);
+	search = els.modulePage.querySelector(".skill-module-search");
+	search.value = "完全没有这项";
+	search.dispatch("input");
+	assert.ok(els.modulePage.querySelector(".skill-module-empty"));
+	els.modulePage.querySelector(".skill-module-empty button").click();
+	assert.equal(els.modulePage.querySelectorAll(".skill-row").length, 5, "清除筛选后恢复完整目录");
+});
+
+await check("技能页装进/退出：点一条出现「当前技能」条，点「退出技能」能摘掉", async () => {
+	const row = Array.from(els.modulePage.querySelectorAll(".skill-row")).find(
+		(node) => node.dataset.skillId === "ticket-flow",
+	);
+	assert.ok(row, "技能页要能点行装进当前会话");
+	row.click();
+	await flush(80);
+	assert.equal(t.state.activeSkill?.name, "工单处理");
+	assert.ok(els.modulePage.querySelector(".skill-module-current"), "装进后要显示「当前技能」条");
+	assert.equal(els.modulePage.querySelector(".skill-module-current__name").textContent, "工单处理");
+	els.modulePage.querySelector(".skill-module-exit").click();
+	await flush(80);
+	assert.equal(t.state.activeSkill, null, "点退出后不能还挂着技能");
+	assert.equal(els.modulePage.querySelector(".skill-module-current"), null, "退出后当前技能条要消失");
 });
 
 await check("技能页的「⋯」菜单与右栏完全一致（查看 / 编辑 / 删除）", () => {
@@ -3178,7 +3332,8 @@ await check("技能页「＋ 新建技能」打开同一个编辑器（沿用现
 	await flush(30);
 	assert.equal(els.flowModal.hidden, false);
 	assert.equal(els.flowModalTitle.textContent, "新建技能");
-	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 1, "默认给一个步骤");
+	assert.equal(els.flowStepsBox.querySelectorAll(".flow-step").length, 0, "技能默认不带步骤");
+	assert.equal(els.flowSkillDesc.disabled, false, "「什么时候用它」可以直接填");
 	t.closeFlowEditor(true);
 });
 
@@ -3239,13 +3394,13 @@ await check("health.storage 是字符串时原样显示（后端两种形状都�
 	t.renderModuleView();
 });
 
-await check("点回「对话」：会话栏与右栏技能面板原样恢复，当前会话没变", async () => {
+await check("点回「对话」：会话栏原样恢复、当前会话没变（右栏技能栏已撤）", async () => {
 	const beforeId = t.state.currentId;
 	const beforeSessions = t.state.sessions.length;
 	moduleButton("chat").click();
 	await flush(40);
 	assert.equal(t.state.module, "chat");
-	assert.equal(els.shell.classList.contains("module-view"), false, "回到四列布局");
+	assert.equal(els.shell.classList.contains("module-view"), false, "回到对话的三列布局");
 	assert.equal(els.modulePage.querySelectorAll(".module-page").length, 0, "模块页清空");
 	assert.equal(t.state.currentId, beforeId, "当前会话不该被切模块改掉");
 	assert.equal(t.state.sessions.length, beforeSessions);
@@ -3266,7 +3421,7 @@ await check("Ctrl+K 在模块页里会先切回对话再打开搜索行", async 
 });
 
 await check("模块视图的 CSS 接线：两列 + 收三块 + 模块页默认不显示", () => {
-	assert.match(css, /\.shell\.module-view \{[^}]*grid-template-columns: 56px minmax\(0, 1fr\)/s, "模块视图两列");
+	assert.match(css, /\.shell\.module-view \{[^}]*grid-template-columns: 76px minmax\(0, 1fr\)/s, "模块视图两列");
 	// 三条收起规则写在同一个选择器列表里
 	const hiddenRule = css.match(/\.shell\.module-view \.sidebar,[\s\S]*?\}/)?.[0] ?? "";
 	for (const selector of [".sidebar", ".main", ".skill-side"]) {
@@ -3303,7 +3458,7 @@ await check("点「知识库」：/api/kb 有数据时画真页面（库列表 +
 await check("embedding 没配：顶上写「语义检索未启用」，徽标是「关键词检索」", () => {
 	assert.equal(els.modulePage.querySelector(".kb-status__badge").textContent, "关键词检索");
 	assert.ok(
-		els.modulePage.textContent.includes("语义检索未启用（没配 embedding，当前用关键词检索）"),
+		els.modulePage.textContent.includes("语义检索未启用：按字面词匹配"),
 		"要明确告诉用户当前是关键词检索",
 	);
 });
@@ -3317,6 +3472,13 @@ await check("选中的库：文档表格画出文件名 / 大小 / 状态徽标 
 	assert.equal(rows[0].querySelector(".kb-td-chunks").textContent, "9");
 	assert.equal(rows[1].querySelector(".kb-badge").textContent, "解析失败");
 	assert.equal(rows[1].querySelector(".kb-doc-error").textContent, "扫描件没有文字层，解析不出内容");
+	// 危险操作单独成组：删除知识库在操作区里、带 .kb-danger；标题区不带按钮
+	assert.equal(
+		els.modulePage.querySelector(".kb-main-actions .danger")?.textContent,
+		"删除知识库",
+		"删除知识库要放进操作区并标成危险动作",
+	);
+	assert.equal(els.modulePage.querySelector(".kb-main-title button"), null, "标题区不该塞按钮（窄屏会把标题挤坏）");
 });
 
 await check("＋新建知识库：弹窗填名字 → POST /api/kb（JSON），成功后关弹窗并刷新列表", async () => {
@@ -3356,6 +3518,7 @@ await check("上传文档：FileReader 读成 base64，POST 的是 JSON（不是
 	assert.ok(typeof body === "object" && body !== null, "body 是 JSON.parse 出来的对象，说明发的是 JSON 字符串");
 	const names = Array.from(els.modulePage.querySelectorAll(".kb-td-name")).map((node) => node.textContent);
 	assert.ok(names.includes("退款政策.txt"), `表格要刷新出新文件：${names.join("|")}`);
+	assert.ok(lastNotice().includes("已上传「退款政策.txt」"), `上传成功要给提示：${lastNotice()}`);
 });
 
 await check("检索试跑（mode=keyword）：结果列表 + 「关键词检索」徽标 + 请求带 query/topK", async () => {
@@ -3373,6 +3536,25 @@ await check("检索试跑（mode=keyword）：结果列表 + 「关键词检索�
 	const posts = t.calls.filter((call) => /\/search$/.test(call.url));
 	assert.equal(posts.at(-1).body.query, "退款要多久到账");
 	assert.equal(posts.at(-1).body.topK, 5);
+});
+
+await check("语义检索开着但有块没向量：库详情出现「待补齐」横幅，点它就是整库重算", async () => {
+	t.setKbEmbedding({ available: true, model: "bge-m3", baseUrl: "http://127.0.0.1:11434" });
+	await t.refreshKb();
+	t.renderModuleView();
+	const banner = els.modulePage.querySelector(".kb-reembed");
+	assert.ok(banner, "有块没向量时要有一条显眼的提醒");
+	assert.ok(banner.textContent.includes("还没有向量"), banner.textContent);
+	assert.equal(banner.querySelector(".kb-reembed__badge").textContent, "待补齐");
+	// 夹具：kb-1 共 14 块、embeddedChunkCount 缺失 = 0 → 14 块待补齐
+	assert.ok(banner.textContent.includes("14 个块"), `要写清待补块数：${banner.textContent}`);
+	const fix = banner.querySelector(".kb-reembed__fix");
+	assert.equal(fix.textContent, "补齐向量（14 块）");
+	const before = t.calls.filter((call) => /\/reindex$/.test(call.url)).length;
+	fix.click();
+	await flush(80);
+	assert.equal(t.calls.filter((call) => /\/reindex$/.test(call.url)).length, before + 1, "点横幅就是整库重算");
+	assert.equal(t.calls.filter((call) => /\/reindex$/.test(call.url)).at(-1).url, "/api/kb/kb-1/reindex");
 });
 
 await check("配了 embedding：顶上写「语义检索：<model>」，mode=vector 时徽标变「语义检索」", async () => {
@@ -3439,6 +3621,28 @@ await check("删库确认：DELETE → 列表少一个，提示用后端返回�
 	const notice = lastNotice();
 	assert.ok(notice.includes("已删除知识库「客服话术」"), notice);
 	assert.ok(notice.includes("1 篇文档") && notice.includes("5 个分块"), `用响应里的数：${notice}`);
+});
+
+await check("一个库都没有：不摆两栏占位，给一张「新建知识库」空态卡", async () => {
+	t.setKbStore([]);
+	await t.refreshKb();
+	t.renderModuleView();
+	assert.equal(kbItems().length, 0, "没有库就不画列表");
+	const empty = els.modulePage.querySelector(".kb-empty");
+	assert.ok(empty, "要有空态卡");
+	assert.ok(empty.textContent.includes("资料夹"), `空态要讲清知识库是干什么的：${empty.textContent}`);
+	const addBtn = Array.from(empty.querySelectorAll("button")).find((node) => node.textContent === "新建知识库");
+	assert.ok(addBtn, "空态卡里要有一个主按钮");
+	addBtn.click();
+	await flush(20);
+	assert.equal(els.kbModal.hidden, false, "点它要打开新建弹窗");
+	assert.equal(els.kbModalTitle.textContent, "新建知识库");
+	t.closeKbDialog();
+	// 恢复夹具，后面的用例还要用两个库
+	t.resetKbFixtures();
+	await t.refreshKb();
+	t.renderModuleView();
+	assert.equal(kbItems().length, 2, "恢复夹具后回到两个库");
 });
 
 await check("GET /api/kb 404：整页回落「未接入」空态（旧文案 + 接口清单），不弹错误", async () => {
@@ -4019,6 +4223,9 @@ const btnByText = (scope, selector, text) =>
 const providerRowByName = (name) => providerRows().find((row) => row.querySelector(".provider-name")?.textContent === name) ?? null;
 const modelRowByModelId = (modelId) =>
 	modelAdminRows().find((row) => row.querySelector(".model-admin-modelid")?.textContent === modelId) ?? null;
+const setModelRowEnabled = (rowId, enabled) => {
+	modelRowStore = modelRowStore.map((row) => (row.id === rowId ? { ...row, enabled } : row));
+};
 const keyOne = () => t.calls.filter((call) => call.url === "/api/api-keys" || call.url.startsWith("/api/api-keys/"));
 
 await check("模型页：切到「模型」才拉接口，ready 时画当前模型 / 模式徽标 / 供应商与模型表", async () => {
@@ -4035,6 +4242,32 @@ await check("模型页：切到「模型」才拉接口，ready 时画当前模�
 	assert.equal(els.modulePage.querySelector(".model-mode-badge")?.textContent, "真实模型");
 	assert.equal(providerRows().length, 2, "夹具给了 2 个供应商");
 	assert.equal(modelAdminRows().length, 2, "夹具给了 2 个模型");
+});
+
+await check("供应商 Key 解不开：页面给解释与重填入口，填好后提示消失", async () => {
+	assert.equal(els.modulePage.querySelector(".model-key-warn"), null, "正常状态不该有这条警告");
+	t.state.modelAdmin.providers[0].apiKeyBroken = true;
+	t.state.modelAdmin.providers[0].apiKeyMasked = "****（无法解密，请重新填写）";
+	t.renderModuleView();
+	const warn = els.modulePage.querySelector(".model-key-warn");
+	assert.ok(warn, "解不开时要在页面上给提示，不能只在表格里一行红字");
+	assert.ok(warn.textContent.includes("SECRET_KEY"), "要说明原因（没配 SECRET_KEY / 换过密钥）");
+	assert.ok(warn.textContent.includes("重新填写"), "要给恢复办法");
+	warn.querySelector(".model-key-warn__fix").click();
+	assert.equal(els.kbModal.hidden, false);
+	assert.equal(els.kbModalTitle.textContent, "编辑供应商", "点按钮直接打开该供应商的编辑弹窗");
+	els.kbModalClose.click();
+	t.state.modelAdmin.providers[0].apiKeyBroken = false;
+	t.state.modelAdmin.providers[0].apiKeyMasked = "sk-d…cdef";
+	t.renderModuleView();
+	assert.equal(els.modulePage.querySelector(".model-key-warn"), null, "Key 恢复正常后提示要消失");
+});
+
+await check("当前模型卡说明「只在本进程生效，重启回落」", () => {
+	const note = els.modulePage.querySelector(".model-status__note")?.textContent ?? "";
+	assert.ok(note.includes("重启"), `要写清重启后的行为：${note}`);
+	assert.ok(note.includes("运行中的会话不会换"), `要写清对现有会话的影响：${note}`);
+	assert.ok(els.modulePage.querySelector(".model-switch")?.title.includes("重启"), "切换按钮也要有悬停说明");
 });
 
 await check("供应商表：中文类型 / 端点 / Key 掩码或未配置 / 启用状态", () => {
@@ -4161,6 +4394,81 @@ await check("设为当前：POST /api/models/current（modelId 用模型行 id�
 	assert.equal(els.modulePage.querySelector(".model-status__current").textContent, "DeepSeek Chat");
 });
 
+// 种子里的向量模型是停用的（既有的模型表断言依赖「停用」）：这两条用例自己打开它
+await check("向量模型区块：没选时显示「未启用」+ 引导，按钮叫「新建向量模型」", () => {
+	const section = els.modulePage.querySelector(".model-embedding");
+	assert.ok(section, "模型页要有「向量模型」区块");
+	assert.ok(section.textContent.includes("向量模型"), section.textContent);
+	assert.equal(section.querySelector(".model-embedding__badge").textContent, "未启用");
+	// 种子里唯一那条向量模型是停用的 → 一条可选都没有 → 按钮是"新建"而不是"选择"
+	const pick = section.querySelector(".model-embedding__pick");
+	assert.equal(pick.textContent, "新建向量模型");
+	assert.ok(
+		section.querySelector(".model-embedding__hint").textContent.includes("向量接口"),
+		"没有可选模型时要写清下一步（建供应商 + 向量模型，DeepSeek/Anthropic 没有向量接口）",
+	);
+});
+
+await check("向量模型和「当前模型」同一套操作：模型表里点行内「设为向量模型」→ POST /api/models/embedding", async () => {
+	setModelRowEnabled("model-embed", true);
+	await t.switchModule("chat");
+	await t.switchModule("models");
+	await flush(80);
+	// 对话模型行不该有这个动作（只有「向量」类型才有）
+	assert.equal(modelRowByModelId("deepseek-chat").querySelector(".model-embedding-pick"), null, "对话模型不能设为向量模型");
+	const embedRow = modelRowByModelId("nomic-embed-text");
+	const pick = embedRow.querySelector(".model-embedding-pick");
+	assert.ok(pick, "向量模型行要有「设为向量模型」");
+	assert.equal(pick.textContent, "设为向量模型");
+	assert.equal(pick.disabled, false);
+	const before = t.calls.filter((call) => call.url === "/api/models/embedding" && call.method === "POST").length;
+	pick.click();
+	await flush(80);
+	const posts = t.calls.filter((call) => call.url === "/api/models/embedding" && call.method === "POST");
+	assert.equal(posts.length, before + 1);
+	assert.deepEqual(posts.at(-1).body, { modelId: "model-embed" });
+	assert.equal(els.kbModal.hidden, true, "行内动作不该弹窗");
+	// 选中后：名字旁有「向量模型」标签、动作置灰、上方区块变已启用
+	assert.equal(modelRowByModelId("nomic-embed-text").querySelector(".model-current-tag").textContent, "向量模型");
+	const currentPick = modelRowByModelId("nomic-embed-text").querySelector(".model-embedding-pick");
+	assert.equal(currentPick.disabled, true, "已经是当前向量模型就置灰");
+	assert.ok(currentPick.title.includes("已经是当前向量模型"), currentPick.title);
+	const after = els.modulePage.querySelector(".model-embedding");
+	assert.equal(after.querySelector(".model-embedding__badge").textContent, "已启用");
+	assert.ok(after.querySelector(".model-embedding__name").textContent.includes("本地向量"), after.textContent);
+	assert.equal(after.querySelector(".model-embedding__pick"), null, "有候选模型时区块不再放按钮，改为指向表格");
+	assert.ok(after.querySelector(".model-embedding__hint").textContent.includes("设为向量模型"), after.textContent);
+	assert.ok(lastNotice().includes("设为向量模型"), lastNotice());
+});
+
+await check("一条向量模型都没有：区块直接给「新建向量模型」入口，点了打开新建模型弹窗", async () => {
+	// 场景：种子里的向量模型停用了 → 一条可选的都没有
+	setModelRowEnabled("model-embed", false);
+	await t.switchModule("chat");
+	await t.switchModule("models");
+	await flush(80);
+	assert.equal(t.state.modelAdmin.embeddingOptions.length, 0, "停用的模型不能出现在可选项里");
+	const section = els.modulePage.querySelector(".model-embedding");
+	const pick = section.querySelector(".model-embedding__pick");
+	assert.equal(pick.textContent, "新建向量模型", "没有可选模型时按钮要变成新建入口");
+	assert.ok(
+		section.querySelector(".model-embedding__hint").textContent.includes("没有向量接口"),
+		"引导里要说清 DeepSeek/Anthropic 没有向量接口（不然用户会白建一条）",
+	);
+	pick.click();
+	await flush(20);
+	assert.equal(els.kbModal.hidden, false, "点了要直接打开新建模型弹窗");
+	assert.equal(els.kbModalTitle.textContent, "新建模型");
+	// 类型预选成「向量」，省得用户再挑一次
+	assert.equal(els.kbModalBody.querySelector(".model-form-kind").value, "chat");
+	t.closeKbDialog();
+	// 只把向量模型恢复成种子的"停用"，别整个 reset——后面的用例还要用这一步之前建好的供应商
+	setModelRowEnabled("model-embed", false);
+	await t.switchModule("chat");
+	await t.switchModule("models");
+	await flush(80);
+});
+
 await check("「＋ 新建模型」：providerId 下拉来自供应商表；POST body 带正确的 providerId", async () => {
 	const add = btnByText(els.modulePage.querySelector(".module-page__actions"), "button", "新建模型");
 	add.click();
@@ -4184,6 +4492,7 @@ await check("「＋ 新建模型」：providerId 下拉来自供应商表；POST
 		enabled: true,
 		contextWindow: 64000,
 	});
+	console.log("DEBUG ROWS", JSON.stringify(modelAdminRows().map((row) => [row.querySelector(".model-admin-modelid")?.textContent, row.querySelector(".model-admin-provider")?.textContent])));
 	assert.equal(modelAdminRows().length, 3, "列表刷新出新模型");
 	assert.equal(modelRowByModelId("local-small").querySelector(".model-admin-provider").textContent, "本地测试供应商（改）");
 });
@@ -4773,15 +5082,48 @@ await check("IM 页：ready 时画机器人卡片（名称 / 状态 / 掩码 / A
 	assert.equal(second.querySelector(".im-bot-sessions").textContent, "会话 0 个");
 });
 
-await check("页头有「＋ 添加机器人」，说明写清回调地址与 fake 只进 outbox", () => {
-	const add = els.modulePage.querySelector(".im-add");
-	assert.ok(add, "页头要能添加机器人");
+await check("页头：添加与刷新在同一组里，主说明不出现实现细节", () => {
+	const actions = els.modulePage.querySelector(".module-page__actions");
+	assert.ok(actions, "两个按钮要成组，别被 space-between 摊到页头两端");
+	const add = actions.querySelector(".im-add");
 	assert.equal(add.textContent, "＋ 添加机器人");
 	assert.equal(add.getAttribute("type"), "button");
+	assert.equal(actions.querySelector(".im-refresh").textContent, "刷新");
 	const lead = els.modulePage.querySelector(".module-page__lead")?.textContent ?? "";
-	assert.ok(lead.includes("/api/im/dingtalk/callback"), `说明要写回调地址：${lead}`);
-	assert.ok(lead.includes("outbox"), `说明要写出站只进 outbox：${lead}`);
-	assert.ok(lead.includes("fake"), `说明要点明 fake 传输：${lead}`);
+	assert.ok(lead.includes("专属回调地址"), `说明要提示专属回调地址：${lead}`);
+	assert.ok(!lead.includes("outbox") && !lead.includes("fake"), `主说明用用户能懂的话，别出现 outbox / fake：${lead}`);
+});
+
+await check("配置说明默认收起，点一下展开、再点收起", () => {
+	const toggle = els.modulePage.querySelector(".im-guide__toggle");
+	const panel = els.modulePage.querySelector(".im-guide__panel");
+	assert.equal(toggle.getAttribute("aria-expanded"), "false");
+	assert.equal(panel.hidden, true, "默认收起：主页面留给机器人列表");
+	toggle.click();
+	assert.equal(panel.hidden, false);
+	assert.equal(toggle.getAttribute("aria-expanded"), "true");
+	assert.ok(panel.textContent.includes("EncodingAESKey"), "展开后能看到两个平台的配置说明");
+	toggle.click();
+	assert.equal(panel.hidden, true);
+	assert.equal(toggle.getAttribute("aria-expanded"), "false");
+});
+
+await check("一个机器人都没有时给空态引导，并可就地打开添加弹窗", async () => {
+	t.state.im.bots = [];
+	t.state.im.outbox = null;
+	t.renderModuleView();
+	const empty = els.modulePage.querySelector(".im-empty");
+	assert.ok(empty, "没有机器人时要给空态，别只剩一句「点右上角」");
+	assert.ok(empty.textContent.includes("钉钉") && empty.textContent.includes("企业微信"), "空态要说清支持哪两个平台");
+	empty.querySelector(".im-empty__add").click();
+	assert.equal(els.kbModal.hidden, false, "空态里的按钮直接打开添加弹窗");
+	els.kbModalClose.click();
+	// 恢复夹具：后面的用例继续按「两个机器人」跑
+	t.resetImFixtures();
+	await t.switchModule("chat");
+	await t.switchModule("im");
+	await flush(80);
+	assert.equal(imCards().length, 2);
 });
 
 await check("回调说明卡：回调地址 / timestamp + sign / 1 小时 / 5 分钟 / 消息转会话", () => {
@@ -4812,6 +5154,7 @@ await check("添加弹窗：字段齐全、appSecret 是 password，POST body �
 	const posts = imPosts();
 	assert.equal(posts.length, before + 1);
 	assert.deepEqual(posts.at(-1).body, {
+		platform: "dingtalk",
 		name: "值班机器人",
 		appKey: "ding-key-3",
 		robotCode: "robot-3",
@@ -4823,6 +5166,19 @@ await check("添加弹窗：字段齐全、appSecret 是 password，POST body �
 	assert.equal(els.kbModal.hidden, true, "保存成功要关弹窗");
 	assert.ok(imCard("值班机器人"), "列表要刷新出新机器人");
 	assert.equal(imCards().length, 3);
+});
+
+await check("企业微信平台表单使用 CorpID 与 AgentId，并支持专属回调地址", () => {
+	els.modulePage.querySelector(".im-add").click();
+	const platform = els.kbModalBody.querySelector(".im-form-platform");
+	platform.value = "wecom";
+	platform.dispatch("change");
+	assert.ok(els.kbModalBody.textContent.includes("CorpID"));
+	assert.ok(els.kbModalBody.textContent.includes("AgentId"));
+	assert.ok(els.kbModalBody.textContent.includes("EncodingAESKey（必填）"));
+	els.kbModalClose.click();
+	assert.ok(els.modulePage.querySelector(".im-wecom-guide").textContent.includes("可信 IP"));
+	assert.ok(els.modulePage.querySelector(".im-bot-callback-url").textContent.includes("botId="));
 });
 
 await check("编辑：appSecret / callbackToken / aesKey 留空都不进 PATCH body", async () => {
@@ -4860,14 +5216,17 @@ await check("启用 / 停用：PATCH 只有 { enabled }，徽标与按钮文案�
 	assert.equal(imCard("告警机器人").querySelector(".im-state-badge").textContent, "停用");
 });
 
-await check("发测试消息成功：POST ping（空 body），卡片显示已发送并刷新 outbox", async () => {
+await check("发测试消息成功：弹窗填写群目标，POST ping 并刷新 outbox", async () => {
 	const beforeOutbox = t.state.im.outbox.length;
 	const beforePings = imPings().length;
 	imCard("客服机器人（改）").querySelector(".im-ping").click();
+	assert.equal(els.kbModal.hidden, false);
+	els.kbModalBody.querySelector(".im-ping-target").value = "cid-test-group";
+	els.kbSave.click();
 	await flush(100);
 	const pings = imPings();
 	assert.equal(pings.length, beforePings + 1);
-	assert.deepEqual(pings.at(-1).body, {});
+	assert.deepEqual(pings.at(-1).body, { conversationId: "cid-test-group" });
 	assert.equal(t.state.im.outbox.length, beforeOutbox + 1, "fake 传输下 ping 要进 outbox");
 	const result = imCard("客服机器人（改）").querySelector(".im-ping-result");
 	assert.equal(result.hidden, false);
@@ -4882,12 +5241,32 @@ await check("发测试消息失败：HTTP 200 + ok:false 也显示后端中文�
 	t.setImPingError("imb-1", "钉钉返回 HTTP 500：mock 发送失败");
 	const beforeOutbox = t.state.im.outbox.length;
 	imCard("客服机器人（改）").querySelector(".im-ping").click();
+	assert.equal(els.kbModal.hidden, false);
+	els.kbModalBody.querySelector(".im-ping-target").value = "cid-test-group";
+	els.kbSave.click();
 	await flush(100);
 	const result = imCard("客服机器人（改）").querySelector(".im-ping-result");
 	assert.equal(result.classList.contains("err"), true);
 	assert.ok(result.textContent.includes("钉钉返回 HTTP 500"), `失败文案：${result.textContent}`);
 	assert.equal(t.state.im.outbox.length, beforeOutbox, "失败不该往 outbox 写消息");
+	assert.equal(els.kbModal.hidden, false, "发送失败保留弹窗便于修正");
+	els.kbModalClose.click();
 	t.setImPingError("imb-1", null);
+});
+
+await check("测试发送支持员工目标，停用机器人禁发，刷新重新拉取状态", async () => {
+	const before = imPings().length;
+	imCard("客服机器人（改）").querySelector(".im-ping").click();
+	els.kbModalBody.querySelector(".im-ping-type").value = "staffId";
+	els.kbModalBody.querySelector(".im-ping-target").value = "staff-001";
+	els.kbSave.click();
+	await flush(100);
+	assert.equal(imPings().length, before + 1);
+	assert.deepEqual(imPings().at(-1).body, { staffId: "staff-001" });
+	assert.equal(imCard("告警机器人").querySelector(".im-ping").disabled, true);
+	els.modulePage.querySelector(".im-refresh").click();
+	await flush(80);
+	assert.ok(imCard("客服机器人（改）"));
 });
 
 await check("删除：二次确认写清连带会话映射，DELETE 后卡片消失", async () => {

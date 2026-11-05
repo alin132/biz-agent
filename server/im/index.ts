@@ -10,6 +10,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Storage } from "../db/types.js";
 import type { SessionHub } from "../session.js";
 import { DingTalkGateway } from "./dingtalk.js";
+import { WeComGateway } from "./wecom.js";
 import type { DingTalkTransport } from "./outbound.js";
 import { OutboundService } from "./outbound.js";
 import { handleImRoute } from "./routes.js";
@@ -43,8 +44,9 @@ export function initIm(options: InitImOptions): ImRuntime {
 		now: options.now,
 		timeoutMs: options.callbackTimeoutMs,
 	});
+	const wecom = new WeComGateway({ store, hub: options.hub, outbound, now: options.now, timeoutMs: options.callbackTimeoutMs });
 	return {
-		handle: (req, res, url) => handleImRoute(req, res, url, { store, outbound, gateway }),
+		handle: (req, res, url) => handleImRoute(req, res, url, { store, outbound, gateway, wecom }),
 		store,
 		outbound,
 		gateway,

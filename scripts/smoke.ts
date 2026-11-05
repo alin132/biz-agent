@@ -426,6 +426,31 @@ async function scenarioRuntimeWorkflow(): Promise<void> {
 	const builtinDetail = await api<WorkflowDetailView>("GET", "/api/workflows/ticket-flow");
 	assert(builtinDetail.status === 200 && builtinDetail.data.builtin === true, "内置流程详情标 builtin=true 且未被改动");
 
+	// --- 纯技能（零步骤）：只写"什么时候用 + 正文"，不预设任何工具 ---
+	const pureSkill = await api<WorkflowDetailView>("POST", "/api/workflows", {
+		name: `冒烟纯技能-${runId}`,
+		systemPrompt: "你是客服：按指导书处理退款。",
+		steps: [],
+		skill: {
+			description: "用户要退货退款或查退款进度时用我",
+			instructions: "先核对订单状态，再说明下一步，最后告诉用户预计到账时间。",
+		},
+	});
+	assert(pureSkill.status === 201, `零步骤技能可以建（HTTP ${pureSkill.status}）`);
+	assert(pureSkill.data.steps.length === 0, "零步骤技能 steps 为空数组");
+	const pureSkillSession = await createSession(pureSkill.data.id);
+	assert(pureSkillSession.steps.length === 0, "零步骤技能建出来的会话没有预设步骤");
+	assert(
+		pureSkillSession.tools.length > 0 && !pureSkillSession.tools.includes(flowToolName(pureSkill.data.id)),
+		"零步骤技能会装上工具目录（交给模型自己挑），但不含自己的 flow 工具",
+	);
+	const pureSkills = await api<SkillView[]>("GET", "/api/skills");
+	assert(
+		pureSkills.data.find((skill) => skill.id === pureSkill.data.id)?.steps === 0,
+		"技能目录里这条技能是 0 步",
+	);
+	await api("DELETE", `/api/workflows/${pureSkill.data.id}`);
+
 	// --- 校验边界：未知工具、重名、未知流程、未知 id ---
 	const invalid = await api<{ error?: string }>("POST", "/api/workflows", {
 		name: `冒烟非法流程-${runId}`,
@@ -958,6 +983,165 @@ async function scenarioKnowledgeBase(): Promise<void> {
 	);
 }
 
+/* ---------------- 场景 G2：模型页的「向量模型」接通知识库 ---------------- */
+
+interface ProviderView {
+	id: string;
+	name: string;
+	kind: string;
+	enabled: boolean;
+}
+
+interface ModelView {
+	id: string;
+	providerId: string;
+	name: string;
+	modelId: string;
+	kind: string;
+	enabled: boolean;
+}
+
+interface EmbeddingView {
+	modelKey: string | null;
+	options: ModelView[];
+}
+
+interface EmbeddingInfoView2 {
+	available: boolean;
+	model: string;
+	baseUrl: string;
+	source: "model" | "env" | "none";
+	modelKey: string | null;
+	problem: string | null;
+}
+
+/**
+ * 模型页新加的「向量模型」要真能驱动知识库的向量化。
+ * 放在 G 之后单独跑：这一段会把"当前向量模型"临时指向一个假端点，必须在 G 的关键词断言之后，
+ * 结束时再清干净（否则后面的 G 复跑会变成 vector 模式、断言全乱）。
+ */
+async function scenarioEmbeddingModelWiring(): Promise<void> {
+	console.log("\n[G2] 向量模型接通知识库");
+
+	// 上一轮失败可能留下"冒烟向量供应商-xxx"：先清掉（删供应商会连带删它的模型），
+	// 否则基线断言与"选完变 model"都会变成假通过/假失败
+	const providers = await api<{ items: ProviderView[] }>("GET", "/api/models/providers");
+	for (const leftover of providers.data.items.filter((item) => item.name.startsWith("冒烟向量供应商-"))) {
+		await api("DELETE", `/api/models/providers/${leftover.id}`);
+	}
+	// 这台实例上可能已经有别人配好的向量模型（手工建的、演示用）：临时停用它们，
+	// 让"基线 = 没有向量模型"成立，结束时再按原样恢复（别把用户的配置弄坏）
+	const allModels = await api<{ models: ModelView[] }>("GET", "/api/models");
+	const paused = allModels.data.models.filter((model) => model.kind === "embedding" && model.enabled);
+	for (const model of paused) {
+		await api("PATCH", `/api/models/${model.id}`, { enabled: false });
+	}
+
+	// 动手之前：这台实例没有可用的向量模型（断言基线，避免残留让下面的"选中后变 model"变成假通过）
+	const before = await api<EmbeddingInfoView2>("GET", "/api/kb/embedding");
+	assert(
+		before.data.source !== "model",
+		`场景开始前 source 不是 model（${String(before.data.source)}）`,
+	);
+
+	const providerName = `冒烟向量供应商-${Date.now().toString(36)}`;
+	const createdProvider = await api<ProviderView>("POST", "/api/models/providers", {
+		name: providerName,
+		kind: "custom",
+		// 故意指向一个关着的端口：这里只验证"配置解析"，不真的打网络
+		baseUrl: "http://127.0.0.1:9/v1",
+		apiKey: "sk-smoke-embedding",
+	});
+	assert(
+		createdProvider.status === 201 && typeof createdProvider.data.id === "string",
+		`POST /api/models/providers 建向量供应商返回 201（HTTP ${createdProvider.status}）`,
+	);
+	const providerId = createdProvider.data.id;
+
+	const createdModel = await api<ModelView>("POST", "/api/models", {
+		providerId,
+		name: "冒烟向量模型",
+		modelId: "smoke-embedding",
+		kind: "embedding",
+		enabled: true,
+	});
+	assert(
+		createdModel.status === 201 && createdModel.data.kind === "embedding",
+		`POST /api/models 建「向量」类型模型返回 201（HTTP ${createdModel.status}）`,
+	);
+	const modelRowId = createdModel.data.id;
+
+	const chatModel = await api<ModelView>("POST", "/api/models", {
+		providerId,
+		name: "冒烟对话模型",
+		modelId: "smoke-chat",
+		kind: "chat",
+		enabled: true,
+	});
+	assert(chatModel.status === 201, `顺带建一条对话模型（HTTP ${chatModel.status}）`);
+
+	// --- 只能选「向量」类型，选了对话模型要被拒 ---
+	const wrongPick = await api<{ error?: string }>("POST", "/api/models/embedding", { modelId: chatModel.data.id });
+	assert(
+		wrongPick.status === 400 && String(wrongPick.data.error ?? "").includes("向量"),
+		`对话模型不能设为向量模型（HTTP ${wrongPick.status} / ${String(wrongPick.data.error)}）`,
+	);
+	const missing = await api<{ error?: string }>("POST", "/api/models/embedding", { modelId: "model_nope" });
+	assert(missing.status === 404, `不存在的模型设为向量模型返回 404（HTTP ${missing.status}）`);
+
+	// --- 选中之后：/api/kb/embedding 立刻反映出来（不用重启） ---
+	const picked = await api<EmbeddingView>("POST", "/api/models/embedding", { modelId: modelRowId });
+	assert(
+		picked.status === 200 && picked.data.modelKey === modelRowId,
+		`POST /api/models/embedding 选中向量模型返回 200 且 modelKey 对得上（HTTP ${picked.status}）`,
+	);
+	const after = await api<EmbeddingInfoView2>("GET", "/api/kb/embedding");
+	assert(
+		after.status === 200 && after.data.available === true && after.data.source === "model",
+		`选完向量模型后知识库立刻可用（available=${String(after.data.available)} / source=${String(after.data.source)}）`,
+	);
+	assert(
+		after.data.model === "smoke-embedding" && after.data.baseUrl === "http://127.0.0.1:9/v1",
+		`模型名与端点来自模型页那条模型（${after.data.model} @ ${after.data.baseUrl}）`,
+	);
+	assert(
+		after.data.modelKey === modelRowId && after.data.problem === null,
+		"同步带 modelKey、problem 为空（页面据此标「已启用」）",
+	);
+
+	// --- 停用这条模型：知识库立刻退回关键词检索，并如实说清原因 ---
+	const disabled = await api<ModelView>("PATCH", `/api/models/${modelRowId}`, { enabled: false });
+	assert(disabled.status === 200, `PATCH 停用向量模型返回 200（HTTP ${disabled.status}）`);
+	const afterDisable = await api<EmbeddingInfoView2>("GET", "/api/kb/embedding");
+	assert(
+		afterDisable.data.available === false,
+		`停用后知识库立刻不可用（available=${String(afterDisable.data.available)}）`,
+	);
+
+	// --- 收尾：恢复启用，再删模型与供应商，别把状态留给下一次 ---
+	await api("PATCH", `/api/models/${modelRowId}`, { enabled: true });
+	await api("DELETE", `/api/models/${chatModel.data.id}`);
+	await api("DELETE", `/api/models/${modelRowId}`);
+	await api("DELETE", `/api/models/providers/${providerId}`);
+	// 收尾断言必须在"恢复先前停用的模型"之前做：那之后 source 可能又变回 model 了
+	const cleaned = await api<EmbeddingInfoView2>("GET", "/api/kb/embedding");
+	assert(
+		cleaned.data.source === before.data.source,
+		`清理后回到场景开始前的状态（source ${String(cleaned.data.source)} / 期望 ${String(before.data.source)}）`,
+	);
+	// 把先前临时停用的向量模型恢复启用（可能已经不存在了，忽略即可）
+	for (const model of paused) {
+		await api("PATCH", `/api/models/${model.id}`, { enabled: true });
+	}
+	const restored = await api<EmbeddingInfoView2>("GET", "/api/kb/embedding");
+	if (paused.length > 0) {
+		assert(
+			restored.data.source === "model" && restored.data.available === true,
+			`先前就有的向量模型要恢复成可用（source=${String(restored.data.source)} / available=${String(restored.data.available)}）`,
+		);
+	}
+}
+
 /* ---------------- 场景 H：审批中心（全局待办） ---------------- */
 
 interface PendingApprovalItemView {
@@ -1105,6 +1289,7 @@ async function main(): Promise<void> {
 	await runScenario("E 会话归档", scenarioArchive);
 	await runScenario("F 技能", scenarioSkills);
 	await runScenario("G 知识库 RAG", scenarioKnowledgeBase);
+	await runScenario("G2 向量模型接通知识库", scenarioEmbeddingModelWiring);
 	await runScenario("H 审批中心", scenarioApprovalCenter);
 
 	console.log(`\n冒烟测试全部通过：${assertions} 项断言（${summary.join("、")}）`);

@@ -108,13 +108,26 @@ function resolveBaseUrl(provider: ModelProviderRecord, templateBase: string | un
 	return templateBase ?? null;
 }
 
+/** 知识库向量化要的那点信息（纯数据，别把 ModelRecord 泄给 kb 模块）。 */
+export interface EmbeddingModelConfig {
+	modelKey: string;
+	modelId: string;
+	label: string;
+	baseUrl: string;
+	apiKey: string;
+	source: "model";
+}
+
 export class ModelService {
 	readonly store: ModelStore;
 	private currentKey: string | null;
+	/** 用户选中的「向量模型」：只存内存，与当前对话模型同一套语义（重启按规则重挑） */
+	private embeddingKey: string | null = null;
 
 	constructor(storage: Storage) {
 		this.store = new ModelStore(storage);
 		this.currentKey = this.pickInitialCurrent();
+		this.embeddingKey = this.pickInitialEmbedding();
 	}
 
 	/** 首次启动：没配 key 就不建；已经建过任何供应商就完全不动（幂等）。 */
@@ -179,6 +192,116 @@ export class ModelService {
 
 	currentModelKey(): string | undefined {
 		return this.currentRow()?.id;
+	}
+
+	/** 挑一条可用的向量模型：用户选过的优先，否则第一条启用且供应商启用的。 */
+	private pickInitialEmbedding(): string | null {
+		const rows = this.store.modelRows().filter((row) => row.kind === "embedding" && row.enabled && this.providerEnabled(row.providerId));
+		return rows[0]?.id ?? null;
+	}
+
+	private embeddingRow(): ModelRecord | null {
+		if (this.embeddingKey) {
+			const row = this.store.modelRow(this.embeddingKey);
+			if (row && row.enabled && row.kind === "embedding" && this.providerEnabled(row.providerId)) {
+				return row;
+			}
+		}
+		const fallback = this.store
+			.modelRows()
+			.find((row) => row.kind === "embedding" && row.enabled && this.providerEnabled(row.providerId));
+		this.embeddingKey = fallback?.id ?? null;
+		return fallback ?? null;
+	}
+
+	/** 模型页「向量模型」那一栏要展示的：当前选中的那条 + 所有可选的行。 */
+	embeddingView(): { modelKey: string | null; options: ModelView[] } {
+		const options = this.store.models().filter((model) => model.kind === "embedding");
+		return { modelKey: this.embeddingRow()?.id ?? null, options };
+	}
+
+	/**
+	 * 把选中的向量模型解成「端点 + 模型名 + 明文 Key」给知识库用。
+	 * 没配就返回 null（知识库回落到环境变量）；有模型但用不了就抛中文错误，让页面如实显示原因。
+	 */
+	embeddingConfig(): EmbeddingModelConfig | null {
+		const row = this.embeddingRow();
+		if (!row) {
+			return null;
+		}
+		const provider = this.store.providerRow(row.providerId);
+		const label = `${provider?.name ?? "供应商"} · ${row.name}`;
+		const baseUrl = this.embeddingBaseUrl(provider, row);
+		if (!baseUrl) {
+			throw new ModelError(
+				400,
+				`向量模型「${label}」没有可用的接口地址：自定义供应商要先填 base_url（例如 https://api.openai.com/v1）`,
+			);
+		}
+		let apiKey: string;
+		try {
+			apiKey = this.store.secretOf(provider!) ?? "";
+		} catch {
+			throw new ModelError(
+				400,
+				`向量模型「${label}」的 API Key 解不开（多半是 SECRET_KEY 换过），到模型页重新填一次`,
+			);
+		}
+		if (apiKey.length === 0 && provider?.kind !== "ollama") {
+			// 只有本地 ollama 允许空 key（它的服务端不校验）；别家空 key 只会一路 401
+			throw new ModelError(400, `向量模型「${label}」的供应商还没填 API Key`);
+		}
+		return {
+			modelKey: row.id,
+			modelId: row.modelId,
+			label,
+			baseUrl,
+			// ollama 不校验 Key，但知识库那边用「key 非空」判断是否可用，这里补一个占位值
+			apiKey: apiKey.length > 0 ? apiKey : "ollama",
+			source: "model",
+		};
+	}
+
+	/** 向量端点：显式 base_url > ollama 默认 > 内置模板（deepseek / anthropic 没有向量接口，所以是 null）。 */
+	private embeddingBaseUrl(
+		provider: ModelProviderRecord | undefined,
+		row: ModelRecord,
+	): string | null {
+		if (provider) {
+			const resolved = resolveBaseUrl(provider, pickTemplate(providerKindToPi(provider.kind), row.modelId)?.baseUrl);
+			if (!resolved) {
+				return null;
+			}
+			if (provider.kind !== "ollama" && !provider.baseUrl?.trim()) {
+				// deepseek / anthropic 这类没有 /embeddings 接口的供应商，内置模板地址不能瞎用
+				return provider.kind === "openai" ? resolved : null;
+			}
+			return resolved;
+		}
+		return null;
+	}
+
+	/** 设为向量模型（模型页「设为向量模型」按钮）。 */
+	setEmbeddingModel(modelKey: unknown): { modelKey: string | null; options: ModelView[] } {
+		if (typeof modelKey !== "string" || modelKey.trim().length === 0) {
+			throw new ModelError(400, "modelId 不能为空");
+		}
+		const row = this.store.findModelByKey(modelKey.trim());
+		if (!row) {
+			throw new ModelError(404, "模型不存在");
+		}
+		if (row.kind !== "embedding") {
+			throw new ModelError(400, "只有「向量」类型的模型能设为向量模型（知识库语义检索用）");
+		}
+		if (!row.enabled) {
+			throw new ModelError(400, "模型已停用，不能设为向量模型");
+		}
+		const provider = this.store.providerRow(row.providerId);
+		if (!provider || !provider.enabled) {
+			throw new ModelError(400, "供应商已停用，不能把它的模型设为向量模型");
+		}
+		this.embeddingKey = row.id;
+		return this.embeddingView();
 	}
 
 	currentView(): CurrentModelView {

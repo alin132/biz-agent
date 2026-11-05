@@ -185,7 +185,7 @@ function vectorFor(text: string): number[] {
 function stubEmbeddingClient(overrides: Partial<EmbeddingClient> = {}): EmbeddingClient {
 	return {
 		available: () => true,
-		info: () => ({ available: true, model: "stub-embedding", baseUrl: "stub://local" }),
+		info: () => ({ available: true, model: "stub-embedding", baseUrl: "stub://local", source: "env" as const, modelKey: null, problem: null }),
 		embed: async (texts: string[]) => texts.map((text) => vectorFor(text)),
 		...overrides,
 	};
@@ -530,7 +530,7 @@ async function main(): Promise<void> {
 			assert.equal(client.available(), false);
 			assert.equal(client.info().available, false);
 			assert.equal(client.info().model, "text-embedding-3-small");
-			await expectKbError(() => client.embed(["退款"]), 400, "没配置向量化服务");
+			await expectKbError(() => client.embed(["退款"]), 400, "没配置向量模型");
 		});
 
 		await check("向量化：OpenAI 兼容请求按 32 条分批并解析向量", async () => {
@@ -644,6 +644,58 @@ async function main(): Promise<void> {
 			await expectKbError(() => withKey.reembedKnowledgeBase("kb_nope"), 404, "知识库不存在");
 			withKey.close();
 			removeDbFiles(reDb);
+		});
+
+		await check("向量模型来自模型页：resolveModelEmbedding 生效，info.source=model；报错就不再回落环境变量", async () => {
+			const calls: string[] = [];
+			const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+				calls.push(String(url));
+				const payload = JSON.parse(String(init?.body)) as { model: string; input: string[] };
+				assert.equal(payload.model, "bge-m3");
+				return new Response(
+					JSON.stringify({ data: payload.input.map((_, index) => ({ index, embedding: [1, index, 0] })) }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+			const client = createEmbeddingClient({
+				fetchImpl: fakeFetch,
+				retryDelayMs: 0,
+				// 环境变量那条路留着，用来验证"模型页优先"
+				config: { apiKey: "env-key", baseUrl: "http://env.invalid/v1", model: "env-model" },
+				resolveModelEmbedding: () => ({
+					modelKey: "model-1",
+					config: { baseUrl: "http://model.invalid/v1", model: "bge-m3", apiKey: "model-key" },
+				}),
+			});
+			const info = client.info();
+			assert.equal(info.available, true);
+			assert.equal(info.source, "model", "模型页配了就用模型页的");
+			assert.equal(info.modelKey, "model-1");
+			assert.equal(info.model, "bge-m3");
+			assert.equal(info.problem, null);
+			await client.embed(["退款"]);
+			assert.equal(calls[0], "http://model.invalid/v1/embeddings", "端点来自模型页那条模型");
+
+			// 模型页有配置但读不出来（比如 key 解不开）：如实不可用，别悄悄用环境变量顶上去
+			const broken = createEmbeddingClient({
+				config: { apiKey: "env-key", baseUrl: "http://env.invalid/v1", model: "env-model" },
+				resolveModelEmbedding: () => {
+					throw new Error("向量模型「default · bge-m3」的 API Key 解不开");
+				},
+			});
+			const brokenInfo = broken.info();
+			assert.equal(brokenInfo.available, false);
+			assert.equal(brokenInfo.source, "model");
+			assert.ok(brokenInfo.problem?.includes("解不开"), brokenInfo.problem ?? "");
+			await expectKbError(() => broken.embed(["退款"]), 400, "向量模型不可用");
+
+			// 模型页没配：回落到环境变量，source=env
+			const envOnly = createEmbeddingClient({
+				config: { apiKey: "env-key", baseUrl: "http://env.invalid/v1", model: "env-model" },
+				resolveModelEmbedding: () => null,
+			});
+			assert.equal(envOnly.info().source, "env");
+			assert.equal(envOnly.info().model, "env-model");
 		});
 
 		await check("检索：向量化失败自动回退关键词并说明原因", async () => {

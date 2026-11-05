@@ -8,6 +8,7 @@
  *   DELETE /api/models/:id                     → { removed }
  *   POST   /api/models/:id/ping                → { id, ok, latencyMs, error? }（8 秒超时，失败也是 200）
  *   GET/POST /api/models/current               { modelId } → { current, model, mode }
+ *   GET/POST /api/models/embedding             { modelId } → { modelKey, options }（知识库语义检索用的向量模型）
  *   GET    /api/models/providers               → { items: [...] }（key 永远只有掩码）
  *   POST   /api/models/providers               { name, kind, baseUrl?, apiKey?, enabled? } → 201
  *   GET/PATCH/DELETE /api/models/providers/:id
@@ -109,6 +110,20 @@ async function route(
 		if (method === "POST") {
 			const body = await readJsonBody(req);
 			json(res, 200, service.setCurrent(body.modelId));
+			return;
+		}
+		methodNotAllowed(res, method, "GET / POST");
+		return;
+	}
+
+	if (pathname === `${MODELS_PREFIX}/embedding`) {
+		if (method === "GET") {
+			json(res, 200, service.embeddingView());
+			return;
+		}
+		if (method === "POST") {
+			const body = await readJsonBody(req);
+			json(res, 200, service.setEmbeddingModel(body.modelId));
 			return;
 		}
 		methodNotAllowed(res, method, "GET / POST");

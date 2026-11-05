@@ -56,7 +56,7 @@ function vectorText(values: number[]): string {
 function fakeEmbedding(dim = 3, behavior: "ok" | "throw" = "ok"): EmbeddingClient {
 	return {
 		available: () => true,
-		info: () => ({ available: true, model: `fake-embedding-${dim}d`, baseUrl: "in-process" }),
+		info: () => ({ available: true, model: `fake-embedding-${dim}d`, baseUrl: "in-process", source: "env" as const, modelKey: null, problem: null }),
 		async embed(texts: string[]): Promise<number[][]> {
 			if (behavior === "throw") {
 				throw new Error("假向量化服务故意失败（验证关键词回退）");

@@ -40,6 +40,8 @@ export interface ProviderView {
 	enabled: boolean;
 	hasApiKey: boolean;
 	apiKeyMasked: string | null;
+	/** 密文解不开（没配 SECRET_KEY 或换过密钥）：页面据此提示"重新填写 Key"，别让前端猜文案 */
+	apiKeyBroken: boolean;
 	modelCount: number;
 	createdAt: number;
 	updatedAt: number;
@@ -227,6 +229,7 @@ export class ModelStore {
 
 	private toProviderView(row: ModelProviderRecord, modelCount: number): ProviderView {
 		const hasApiKey = Boolean(row.apiKeyEncrypted);
+		const masked = hasApiKey ? this.maskedKeyOf(row) : { masked: null, broken: false };
 		return {
 			id: row.id,
 			name: row.name,
@@ -234,7 +237,8 @@ export class ModelStore {
 			baseUrl: row.baseUrl,
 			enabled: row.enabled,
 			hasApiKey,
-			apiKeyMasked: hasApiKey ? this.maskedKeyOf(row) : null,
+			apiKeyMasked: masked.masked,
+			apiKeyBroken: masked.broken,
 			modelCount,
 			createdAt: row.createdAt,
 			updatedAt: row.updatedAt,
@@ -264,12 +268,12 @@ export class ModelStore {
 		return decryptSecret(row.apiKeyEncrypted);
 	}
 
-	private maskedKeyOf(row: ModelProviderRecord): string | null {
+	private maskedKeyOf(row: ModelProviderRecord): { masked: string | null; broken: boolean } {
 		try {
-			return maskSecret(this.secretOf(row));
+			return { masked: maskSecret(this.secretOf(row)), broken: false };
 		} catch {
 			// 密文解不开（多半是 SECRET_KEY 变了）也不该让列表接口 500，给个占位让用户重填
-			return "****（无法解密，请重新填写）";
+			return { masked: "****（无法解密，请重新填写）", broken: true };
 		}
 	}
 

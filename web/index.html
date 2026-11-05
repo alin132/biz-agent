@@ -186,7 +186,8 @@
 				<div class="module-page" id="module-page"></div>
 			</main>
 
-			<!-- 右栏：技能常驻在这里（点一条装进当前会话；模型也会自己按对话挑） -->
+			<!-- 右侧技能栏已从对话页撤掉（视觉隐藏，DOM/接线保留以便回滚）；
+			     装进/退出技能统一走「技能」模块页 -->
 			<aside class="skill-side" id="skill-side">
 				<div class="skill-side-head">
 					<span class="skill-side-title">技能</span>
@@ -239,38 +240,43 @@
 							<input class="field-input" id="flow-name" type="text" maxlength="40" placeholder="例如：销售数据分析" autocomplete="off" spellcheck="false" />
 						</label>
 
+						<!-- 技能 = 什么时候用（description，唯一进目录的一句）+ 加载后怎么做的正文 -->
 						<label class="field">
 							<span class="field-row">
-								<span class="field-label">系统提示</span>
-								<span class="field-note">必填</span>
+								<span class="field-label">什么时候用它</span>
+								<span class="field-note">必填 · 模型靠这句话决定要不要加载</span>
 							</span>
-							<textarea class="field-textarea" id="flow-prompt" rows="3" maxlength="4000" placeholder="告诉 Agent 这个技能负责什么、边界在哪…"></textarea>
-						</label>
-
-						<!-- 技能文案：加载这个技能时模型看到的是这两段（不填就退回系统提示） -->
-						<label class="field">
-							<span class="field-row">
-								<span class="field-label">技能一句话说明</span>
-								<span class="field-note">可选 · 用户说什么话时该用它</span>
-							</span>
-							<input class="field-input" id="flow-skill-desc" type="text" maxlength="200" placeholder="例如：让我分析销售数据时用它" autocomplete="off" spellcheck="false" />
+							<input class="field-input" id="flow-skill-desc" type="text" maxlength="200" placeholder="例如：用户要退货退款或查退款进度时用它" autocomplete="off" spellcheck="false" />
 						</label>
 
 						<label class="field">
 							<span class="field-row">
-								<span class="field-label">技能正文</span>
-								<span class="field-note">可选 · 加载后怎么做好</span>
+								<span class="field-label">指导书正文</span>
+								<span class="field-note">加载后模型照着做；工具由它自己按需要选</span>
 							</span>
-							<textarea class="field-textarea" id="flow-skill-inst" rows="3" maxlength="4000" placeholder="加载后怎么做好；留空则用系统提示"></textarea>
+							<textarea class="field-textarea" id="flow-skill-inst" rows="4" maxlength="4000" placeholder="这个技能负责什么、边界在哪、按什么顺序做、做完怎么汇报。留空则用下面的系统提示。"></textarea>
 						</label>
 
-						<div class="field">
-							<div class="field-row">
-								<span class="field-label">步骤</span>
-								<button class="btn-ghost mini" id="flow-add-step" type="button">＋ 添加步骤</button>
+						<details class="flow-advanced" id="flow-advanced">
+							<summary class="flow-advanced__summary">高级：固定步骤与工具（可选）</summary>
+							<p class="flow-advanced__note">
+								不填步骤时，模型自己决定调哪些工具；填了步骤，Agent 会按顺序推进、没走完会催。只在步骤必须固定时才填。
+							</p>
+							<div class="field">
+								<div class="field-row">
+									<span class="field-label">步骤</span>
+									<button class="btn-ghost mini" id="flow-add-step" type="button">＋ 添加步骤</button>
+								</div>
+								<div class="flow-steps" id="flow-steps"></div>
 							</div>
-							<div class="flow-steps" id="flow-steps"></div>
-						</div>
+							<label class="field">
+								<span class="field-row">
+									<span class="field-label">系统提示</span>
+									<span class="field-note">指导书正文留空时逐字用它</span>
+								</span>
+								<textarea class="field-textarea" id="flow-prompt" rows="3" maxlength="4000" placeholder="告诉 Agent 这个技能负责什么、边界在哪…"></textarea>
+							</label>
+						</details>
 
 						<div class="flow-error" id="flow-error" hidden></div>
 					</div>

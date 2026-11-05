@@ -80,7 +80,7 @@ const els = {
 const PIN_KEY = "biz-agent.pinned";
 
 const state = {
-	// 当前模块：chat = 对话（四列布局），其余模块整宽显示模块页
+	// 当前模块：chat = 对话（三列布局），其余模块整宽显示模块页
 	module: "chat",
 	// 模块页只读展示用：模型列表（GET /api/models）与健康信息（GET /api/health）
 	models: null,
@@ -110,13 +110,15 @@ const state = {
 	tools: [],
 	// 技能目录（GET /api/skills）：左栏技能区画的就是它；会话视图里的 skills 只用来标 active
 	skillCatalog: [],
+	skillQuery: "",
+	skillFilter: "all",
 	// 登录态：me = GET /api/auth/me 的响应（后端没有登录功能时为 null）
 	me: null,
 	permissions: [],
 	loginVisible: false,
 	loginBusy: false,
 	// 知识库（P5）：status = unknown 还没问 | ready 有接口 | unavailable 404/连不上 → 回落「未接入」空态
-	kb: { status: "unknown", libraries: [], selectedId: null, documents: [], embedding: null, search: null },
+	kb: { status: "unknown", libraries: [], selectedId: null, documents: [], embedding: null, search: null, uploading: false },
 	// 成员 / 审计（P4）：同样的三态 + forbidden（403 说清"角色不够"，不混进「未接入」）
 	members: { status: "unknown", items: [], notice: null },
 	audit: { status: "unknown", items: [], total: 0, action: "", actor: "", loading: false },
@@ -585,13 +587,13 @@ function activeSkillOf(view) {
 	return { id, name: found?.name ?? id };
 }
 
-/** 页头的技能胶囊只是状态显示：不做入口，加载/退出都在右栏或由模型触发。 */
+/** 页头的技能胶囊只是状态显示：不做入口，加载/退出都在「技能」模块页或由模型触发。 */
 function renderSkillChip() {
 	const active = state.activeSkill;
 	els.skillChipLabel.textContent = active ? `技能：${active.name}` : "技能：无";
 	els.skillChip.classList.toggle("on", Boolean(active));
 	els.skillChip.title = active ? `当前技能：${active.name}` : "未加载技能";
-	// 技能状态的两处观测点一起刷：右栏列表高亮、右栏「当前技能」块（一个入口，别各刷各的）
+	// 技能状态的观测点一起刷：隐藏的旧右栏 DOM（保留接线）与页头胶囊（一个入口，别各刷各的）
 	renderSkillList();
 	renderSkillCurrent();
 }
@@ -656,6 +658,7 @@ async function setSkill(skillId) {
 		return;
 	}
 	applySkillPayload(session.id, data ?? {});
+	if (state.module === "skills") renderModuleView();
 	// 成功提示交给紧随其后的 SSE skill 事件播报：同一个动作只弹一条，别这里也报一次
 }
 
@@ -680,13 +683,15 @@ function applySkillEvent(event) {
 	renderSkillChip();
 	// 左栏会话行要立刻挂上（或摘掉）技能徽标
 	renderSidebar();
+	if (state.module === "skills") renderModuleView();
 	const text = event.skillId
 		? `已加载技能「${event.name}」${event.description ? `：${event.description}` : ""}`
 		: "已退出技能，回到默认模式（模型按你的话自己挑工具）。";
 	addNotice(text, false);
 }
 
-/* ---------------- 右栏技能面板（技能 = 一套说明 + 一组工具 + 它自己的步骤） ---------------- */
+/* ---------------- 技能行渲染（技能 = 一套说明 + 一组工具 + 它自己的步骤）
+   右侧常驻栏已从对话页撤掉：这套行现在只服务「技能」模块页（隐藏 DOM 仅保留接线与回滚）。 ---------------- */
 
 /**
  * 「自动编排」是默认聊天模式：它没有固定步骤、工具是整个目录，模型本来就会按你的话自己挑。
@@ -697,6 +702,7 @@ const SKILL_LIST_HIDDEN = new Set(["auto-flow"]);
 
 /** 拉技能目录。技能就是流程的投影，所以这里没有第二套数据。 */
 async function refreshSkillCatalog() {
+	const previousIds = state.skillCatalog.map((skill) => skill.id).join("\0");
 	try {
 		const response = await api("/api/skills");
 		if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -705,8 +711,14 @@ async function refreshSkillCatalog() {
 		// 拉不到不该卡住整页：右栏给占位，页头胶囊仍能按会话视图工作
 		state.skillCatalog = [];
 	}
+	const nextIds = state.skillCatalog.map((skill) => skill.id).join("\0");
+	if (previousIds !== nextIds) {
+		state.skillQuery = "";
+		state.skillFilter = "all";
+	}
 	renderSkillList();
 	renderSkillCurrent();
+	if (state.module === "skills") renderModuleView();
 }
 
 /** 面板里能看到的技能：自动编排是默认聊天模式，点它等于什么都没换（见 SKILL_LIST_HIDDEN）。 */
@@ -716,7 +728,7 @@ function visibleSkills() {
 
 /**
  * 一行技能：名字 + 内置角标 + 一句话说明 + ⋯。
- * 右栏面板与「技能」模块页共用这一份，避免两套渲染走样。
+ * 「技能」模块页（以及已隐藏的旧右栏）共用这一份，避免两套渲染走样。
  */
 function skillRowNode(skill, activeId) {
 	const row = make("div", "skill-row");
@@ -756,7 +768,7 @@ function skillRowNode(skill, activeId) {
 	return row;
 }
 
-/** 右栏一行一条技能：名字 + 内置角标 + 一句话说明，点行 = 装进当前会话。 */
+/** 一行一条技能：名字 + 内置角标 + 一句话说明，点行 = 装进当前会话。 */
 function renderSkillList() {
 	if (!els.skillList) return;
 	els.skillList.innerHTML = "";
@@ -803,7 +815,7 @@ function skillRowMenuItems(skill) {
 	return items;
 }
 
-/** 右栏「当前技能」块：现在按哪份说明在跑，以及一键退出。 */
+/** 旧的右栏「当前技能」块（视觉已隐藏）：继续刷新状态，退出入口已挪到「技能」模块页。 */
 function renderSkillCurrent() {
 	if (!els.skillCurrentName) return;
 	const skill = state.activeSkill;
@@ -882,7 +894,7 @@ function openMenu(anchor, items) {
 
 /**
  * 新建聊天 = 直接给一个「自动编排」会话，不先让人选技能。
- * 发消息后由模型自己判断要不要加载某个技能；想显式加载就点右栏那条。
+ * 发消息后由模型自己判断要不要加载某个技能；想显式加载就去「技能」页点一条。
  */
 async function newChat() {
 	await createSession("auto-flow");
@@ -1198,7 +1210,7 @@ function renderModuleNav() {
 		button.title = module.label;
 		button.setAttribute("aria-label", module.label);
 		// 图标是代码里的常量 SVG（不是用户数据），和别处图标按钮一致用 innerHTML
-		button.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${module.icon}</svg>`;
+		button.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${module.icon}</svg><span class="rail-label">${module.label}</span>`;
 		button.classList.toggle("active", module.id === state.module);
 		if (module.id === state.module) button.setAttribute("aria-current", "true");
 		else button.removeAttribute("aria-current");
@@ -1276,12 +1288,22 @@ async function ensureModuleData(moduleId) {
 	state.health = await getJson("/api/health");
 	const models = await getJson("/api/models");
 	if (models) state.models = models;
-	// 设置页还要展示语义检索有没有配好；模型页不看这一项，就别多发一个请求
-	state.embedding = await getJson("/api/kb/embedding");
+	await refreshEmbeddingStatus();
 	await refreshApiKeys();
 }
 
-/** 对话模块 = 原来的四列布局；其它模块整宽显示模块页（靠 .shell.module-view 切列数）。 */
+/** 语义检索状态（GET /api/kb/embedding）：设置页与模型页的「向量模型」区块共用一份。 */
+async function refreshEmbeddingStatus() {
+	try {
+		const response = await api("/api/kb/embedding");
+		state.embedding = response.ok ? await response.json() : null;
+	} catch {
+		state.embedding = null;
+	}
+	if (state.embedding) state.kb.embedding = state.embedding;
+}
+
+/** 对话模块 = 三列布局（右侧技能栏已撤）；其它模块整宽显示模块页（靠 .shell.module-view 切列数）。 */
 function renderModuleView() {
 	const isChat = state.module === "chat";
 	els.shell.classList.toggle("module-view", !isChat);
@@ -1338,13 +1360,27 @@ function modulePageNode(moduleId) {
 		add.addEventListener("click", () => openMcpServerDialog(null));
 		head.appendChild(add);
 	}
-	if (moduleId === "im" && state.im.status !== "forbidden") {
-		// 同理：403 已经在整页提示权限，不摆添加按钮
-		const add = make("button", "btn-ghost mini im-add", "＋ 添加机器人");
-		add.setAttribute("type", "button");
-		guardImWrite(add);
-		add.addEventListener("click", () => openImBotDialog(null));
-		head.appendChild(add);
+	if (moduleId === "im") {
+		// 两个按钮放进同一组：直接塞进 space-between 的页头会被摊开，看着像散落的
+		const actions = make("div", "module-page__actions");
+		if (state.im.status !== "forbidden") {
+			// 403 已经在整页提示权限，不摆一个点了也白点的添加按钮
+			const add = make("button", "btn-ghost mini im-add", "＋ 添加机器人");
+			add.setAttribute("type", "button");
+			guardImWrite(add);
+			add.addEventListener("click", () => openImBotDialog(null));
+			actions.appendChild(add);
+		}
+		const refresh = make("button", "btn-ghost mini im-refresh", "刷新");
+		refresh.setAttribute("type", "button");
+		refresh.addEventListener("click", async () => {
+			refresh.disabled = true;
+			refresh.textContent = "刷新中…";
+			await refreshIm();
+			if (state.module === "im") renderModuleView();
+		});
+		actions.appendChild(refresh);
+		head.appendChild(actions);
 	}
 	if (moduleId === "models" && state.modelAdmin.status === "ready") {
 		// 供应商 / 模型各一个入口；没 workflow.write 时统一置灰（后端仍会拦）
@@ -1460,7 +1496,7 @@ function moduleKvRow(label, value) {
 	return row;
 }
 
-/** 「技能」模块页：和右栏同一套行（同一个 skillRowNode），只是排成整宽列表。 */
+/** 「技能」模块页：装进/退出技能的唯一入口（复用同一个 skillRowNode）。 */
 function renderSkillsModule(body) {
 	body.appendChild(
 		make(
@@ -1469,15 +1505,83 @@ function renderSkillsModule(body) {
 			"技能就是一套带说明和步骤的能力：模型会在对话里按你的话自己挑，也可以在这里点一条装进当前会话。",
 		),
 	);
-	const skills = visibleSkills();
+	// 右侧常驻技能栏撤掉后，「退出技能」挪到这里：正是本页把技能装进会话的，反悔入口也放这
+	const active = state.activeSkill;
+	if (active) {
+		const bar = make("div", "skill-module-current");
+		bar.appendChild(make("span", "skill-module-current__label", "当前技能"));
+		bar.appendChild(make("span", "skill-module-current__name", active.name ?? active.id));
+		const exit = make("button", "btn-ghost mini skill-module-exit", "退出技能");
+		exit.setAttribute("type", "button");
+		exit.addEventListener("click", () => void setSkill(null));
+		bar.appendChild(exit);
+		body.appendChild(bar);
+	}
+	const toolbar = make("div", "skill-module-toolbar");
+	const search = make("input", "skill-module-search");
+	search.type = "search";
+	search.placeholder = "搜索技能名称或说明";
+	search.setAttribute("aria-label", "搜索技能名称或说明");
+	search.value = state.skillQuery;
+	search.addEventListener("input", () => {
+		state.skillQuery = search.value.trim();
+		refreshSkillsModuleList(body);
+	});
+	toolbar.appendChild(search);
+	const filters = make("div", "skill-module-filters");
+	for (const [id, label] of [["all", "全部"], ["builtin", "内置"], ["custom", "自定义"], ["active", "使用中"]]) {
+		const button = make("button", "skill-module-filter", label);
+		button.setAttribute("type", "button");
+		button.setAttribute("aria-pressed", String(state.skillFilter === id));
+		button.classList.toggle("active", state.skillFilter === id);
+		button.addEventListener("click", () => {
+			state.skillFilter = id;
+			renderModuleView();
+		});
+		filters.appendChild(button);
+	}
+	toolbar.appendChild(filters);
+	body.appendChild(toolbar);
+	body.appendChild(make("div", "skill-module-count"));
+	const list = make("div", "module-skill-list");
+	list.dataset.skillList = "true";
+	body.appendChild(list);
+	refreshSkillsModuleList(body);
+}
+
+function refreshSkillsModuleList(body) {
+	if (!body) return;
+	const list = body.querySelector(".module-skill-list");
+	const count = body.querySelector(".skill-module-count");
+	if (!list || !count) return;
+	const all = visibleSkills();
+	const activeId = state.currentView?.activeSkillId ?? state.activeSkill?.id ?? null;
+	const query = state.skillQuery.toLocaleLowerCase();
+	const skills = all.filter((skill) => {
+		if (state.skillFilter === "builtin" && !skill.builtin) return false;
+		if (state.skillFilter === "custom" && skill.builtin) return false;
+		if (state.skillFilter === "active" && skill.id !== activeId) return false;
+		return !query || `${skill.name} ${skill.description ?? ""}`.toLocaleLowerCase().includes(query);
+	});
+	count.textContent = `显示 ${skills.length} / ${all.length} 项技能`;
+	list.innerHTML = "";
 	if (skills.length === 0) {
-		body.appendChild(make("div", "placeholder", "还没有技能，点右上角「＋ 新建技能」开始"));
+		const empty = make("div", "skill-module-empty");
+		empty.appendChild(make("span", "placeholder", all.length ? "没有符合条件的技能" : "暂无可用技能"));
+		if (all.length && (state.skillQuery || state.skillFilter !== "all")) {
+			const clear = make("button", "btn-ghost mini", "清除筛选");
+			clear.setAttribute("type", "button");
+			clear.addEventListener("click", () => {
+				state.skillQuery = "";
+				state.skillFilter = "all";
+				renderModuleView();
+			});
+			empty.appendChild(clear);
+		}
+		list.appendChild(empty);
 		return;
 	}
-	const list = make("div", "module-skill-list");
-	const activeId = state.currentView?.activeSkillId ?? null;
 	for (const skill of skills) list.appendChild(skillRowNode(skill, activeId));
-	body.appendChild(list);
 }
 
 /** 「模型」模块页：模拟模式时仍展示旧版只读信息，避免老后端/接口 404 时白屏。 */
@@ -1554,6 +1658,12 @@ function isCurrentModel(row) {
 	return row.modelId === current || row.id === current;
 }
 
+/** 当前向量模型行：与「当前模型」同一套写法（行 id 对得上就是它）。 */
+function isCurrentEmbedding(row) {
+	const key = state.modelAdmin.embeddingKey ?? null;
+	return Boolean(key && row && row.id === key);
+}
+
 function guardModelWrite(button) {
 	if (canWriteWorkflow()) return button;
 	button.disabled = true;
@@ -1622,7 +1732,18 @@ async function refreshModelAdmin() {
 		current: data.current ?? null,
 		mode: data.mode ?? null,
 		options: Array.isArray(data.options) ? data.options : [],
+		embeddingKey: null,
+		embeddingOptions: [],
 	};
+	// 向量模型（知识库语义检索用）：只在模型管理本身 ready 时才问——降级路径不该多打一个请求
+	const embeddingResponse = await api("/api/models/embedding").catch(() => null);
+	if (embeddingResponse?.ok) {
+		const embeddingView = await embeddingResponse.json().catch(() => null);
+		if (embeddingView) {
+			state.modelAdmin.embeddingKey = embeddingView.modelKey ?? null;
+			state.modelAdmin.embeddingOptions = Array.isArray(embeddingView.options) ? embeddingView.options : [];
+		}
+	}
 }
 
 /** 顶部当前模型：模拟模式就说清楚为什么没有真模型，别只印一个 id。 */
@@ -1649,9 +1770,46 @@ function modelStatusNode() {
 	line.appendChild(main);
 	const switchBtn = make("button", "btn-ghost mini model-switch", "切换当前模型");
 	switchBtn.setAttribute("type", "button");
+	switchBtn.title = "只影响新会话；重启后回落到第一条启用的对话模型";
 	switchBtn.addEventListener("click", () => openSwitchModelDialog());
 	line.appendChild(guardModelWrite(switchBtn));
+	// 「当前模型只存内存」是设计如此（见 AGENTS 坑 27）：不写清楚，用户重启后发现模型变回去会以为是 bug
+	line.appendChild(
+		make("p", "model-status__note", "当前模型只在这个进程里生效，重启后回落到第一条启用的对话模型；运行中的会话不会换。"),
+	);
 	return line;
+}
+
+/** 供应商 Key 解不开（没配 SECRET_KEY / 换过密钥）：给解释 + 就地重填入口，而不是只在表格里一行红字。 */
+function modelKeyWarnNode(provider) {
+	const wrap = make("div", "model-key-warn");
+	wrap.appendChild(make("span", "model-key-warn__badge", "需要处理"));
+	const body = make("div", "model-key-warn__body");
+	body.appendChild(
+		make(
+			"p",
+			"model-key-warn__text",
+			`供应商「${provider.name ?? provider.id}」保存的 API Key 解不开：通常是本机没配置固定的 SECRET_KEY（每次重启都会换一个随机密钥），或者换过密钥。`,
+		),
+	);
+	body.appendChild(
+		make(
+			"p",
+			"model-key-warn__hint",
+			"重新填写一次 Key 即可恢复；也可以在 .env 里设置固定的 SECRET_KEY 后重启，让已存的密文一直可解。",
+		),
+	);
+	const fix = make("button", "btn-ghost mini model-key-warn__fix", "重新填写 Key");
+	fix.setAttribute("type", "button");
+	if (!canWriteWorkflow()) {
+		fix.disabled = true;
+		fix.title = MODEL_WRITE_TITLE;
+	} else {
+		fix.addEventListener("click", () => openProviderDialog(provider));
+	}
+	body.appendChild(fix);
+	wrap.appendChild(body);
+	return wrap;
 }
 
 function applyPingResult(node, result) {
@@ -1771,6 +1929,8 @@ function modelTableNode(models) {
 		const nameCell = make("td", "module-td model-admin-name");
 		nameCell.appendChild(make("span", "model-admin-name-text", model.name ?? model.modelId ?? "—"));
 		if (isCurrentModel(model)) nameCell.appendChild(make("span", "model-current-tag", "当前"));
+		// 向量模型和「当前模型」用同一套表达：名字旁的标签 + 行内动作，别另开一个弹窗
+		if (isCurrentEmbedding(model)) nameCell.appendChild(make("span", "model-current-tag", "向量模型"));
 		row.appendChild(nameCell);
 
 		row.appendChild(make("td", "module-td model-admin-provider", model.providerName || "—"));
@@ -1789,17 +1949,37 @@ function modelTableNode(models) {
 		row.appendChild(enabledCell);
 
 		const actions = make("td", "module-td model-actions");
-		const setCurrent = make("button", "link-btn model-current", "设为当前");
-		setCurrent.setAttribute("type", "button");
-		// 没权限时统一用「当前角色不能修改模型配置」，别再混进"模型本身不可设当前"的说明
-		if (!canWriteWorkflow()) {
-			setCurrent.disabled = true;
-			setCurrent.title = MODEL_WRITE_TITLE;
-		} else if (model.kind !== "chat" || model.enabled === false || !adminProviderEnabled(model.providerId)) {
-			setCurrent.disabled = true;
-			setCurrent.title = "只有启用的对话模型能设为当前";
-		} else {
-			setCurrent.addEventListener("click", () => void setCurrentModel(model));
+		if (model.kind === "embedding") {
+			const setEmbedding = make("button", "link-btn model-embedding-pick", "设为向量模型");
+			setEmbedding.setAttribute("type", "button");
+			if (!canWriteWorkflow()) {
+				setEmbedding.disabled = true;
+				setEmbedding.title = MODEL_WRITE_TITLE;
+			} else if (isCurrentEmbedding(model)) {
+				setEmbedding.disabled = true;
+				setEmbedding.title = "它已经是当前向量模型了";
+			} else if (model.enabled === false || !adminProviderEnabled(model.providerId)) {
+				setEmbedding.disabled = true;
+				setEmbedding.title = "只有启用的向量模型（且供应商也启用）能设为向量模型";
+			} else {
+				setEmbedding.addEventListener("click", () => void setEmbeddingModelRow(model));
+			}
+			actions.appendChild(setEmbedding);
+		}
+		if (model.kind === "chat") {
+			const setCurrent = make("button", "link-btn model-current", "设为当前");
+			setCurrent.setAttribute("type", "button");
+			// 没权限时统一用「当前角色不能修改模型配置」，别再混进"模型本身不可设当前"的说明
+			if (!canWriteWorkflow()) {
+				setCurrent.disabled = true;
+				setCurrent.title = MODEL_WRITE_TITLE;
+			} else if (model.enabled === false || !adminProviderEnabled(model.providerId)) {
+				setCurrent.disabled = true;
+				setCurrent.title = "只有启用的对话模型能设为当前";
+			} else {
+				setCurrent.addEventListener("click", () => void setCurrentModel(model));
+			}
+			actions.appendChild(setCurrent);
 		}
 		const edit = guardModelWrite(make("button", "link-btn model-edit", "编辑"));
 		edit.setAttribute("type", "button");
@@ -1811,7 +1991,6 @@ function modelTableNode(models) {
 		ping.setAttribute("type", "button");
 		const resultNode = make("span", "ping-result");
 		ping.addEventListener("click", () => void pingModelRow(model, ping, resultNode));
-		actions.appendChild(setCurrent);
 		actions.appendChild(edit);
 		actions.appendChild(remove);
 		actions.appendChild(ping);
@@ -1834,6 +2013,21 @@ async function setCurrentModel(model) {
 	await refreshModelAdmin();
 	if (state.module === "models") renderModuleView();
 	addNotice(`已把「${model.name ?? model.modelId}」设为当前模型，运行中的会话不会换，只影响新会话。`);
+}
+
+async function setEmbeddingModelRow(model) {
+	if (!canWriteWorkflow()) return;
+	const result = await requestJson("/api/models/embedding", "POST", { modelId: model.id });
+	if (!result.ok) {
+		addNotice(requestError(result, "设置向量模型失败"), true);
+		return;
+	}
+	await refreshModelAdmin();
+	await refreshEmbeddingStatus();
+	if (state.module === "models") renderModuleView();
+	addNotice(
+		`已把「${model.name ?? model.modelId}」设为向量模型；知识库页的旧文档要点「补齐向量」才会带新模型的向量。`,
+	);
 }
 
 async function deleteProvider(provider) {
@@ -1993,7 +2187,29 @@ function openModelDialog(model) {
 
 	const body = make("div", "kb-form");
 	for (const field of [provider, name, modelId, kind, contextWindow, enabled]) body.appendChild(field.node);
-	body.appendChild(make("p", "kb-bind-hint", "只有「对话」模型能设为当前模型；向量模型用于知识库检索。"));
+	// 类型/供应商一改就更新提示：深色坑是"在 DeepSeek 供应商下建向量模型"——它没有 /embeddings 接口
+	const hint = make("p", "kb-bind-hint");
+	const updateHint = () => {
+		const providerRow = providers.find((item) => item.id === String(provider.select.value ?? ""));
+		const isEmbedding = String(kind.select.value ?? "chat") === "embedding";
+		if (!isEmbedding) {
+			hint.textContent = "只有「对话」模型能设为当前模型；向量模型用于知识库检索。";
+			hint.classList.remove("err");
+			return;
+		}
+		const needsBaseUrl = !providerRow?.baseUrl && providerRow?.kind !== "ollama" && providerRow?.kind !== "openai";
+		if (needsBaseUrl) {
+			hint.textContent = `${providerKindLabel(providerRow?.kind)} 没有向量接口：要给供应商填 base_url（例如 https://api.openai.com/v1），或换成本地 Ollama / OpenAI 兼容网关。`;
+			hint.classList.add("err");
+			return;
+		}
+		hint.textContent = "向量模型（例如 text-embedding-3-small、bge-m3）给知识库做语义检索；建好后到上方「向量模型」区块选它。";
+		hint.classList.remove("err");
+	};
+	updateHint();
+	provider.select.addEventListener("change", updateHint);
+	kind.select.addEventListener("change", updateHint);
+	body.appendChild(hint);
 	openKbDialog({
 		title: editing ? "编辑模型" : "新建模型",
 		body,
@@ -2074,12 +2290,15 @@ function openSwitchModelDialog() {
 function renderModelAdmin(body) {
 	body.appendChild(modelStatusNode());
 	const providers = modelAdminProviders();
+	const brokenKey = providers.find((provider) => provider.apiKeyBroken);
+	if (brokenKey) body.appendChild(modelKeyWarnNode(brokenKey));
 	body.appendChild(make("div", "module-section-title", `供应商（${providers.length}）`));
 	if (providers.length === 0) {
 		body.appendChild(make("div", "placeholder", "还没有供应商，点右上角「＋ 新建供应商」开始。"));
 	} else {
 		body.appendChild(providerTableNode(providers));
 	}
+	body.appendChild(modelEmbeddingSectionNode());
 	const models = modelAdminModels();
 	body.appendChild(make("div", "module-section-title", `模型（${models.length}）`));
 	if (models.length === 0) {
@@ -2094,6 +2313,62 @@ function renderModelAdmin(body) {
 			"API Key 只在保存时加密落库、列表只回显掩码；连通性检测会向供应商端点发一条极短请求，失败文案直接来自服务端。",
 		),
 	);
+}
+
+/**
+ * 「向量模型」区块：知识库的语义检索用哪条模型，就在这儿选。
+ * 以前这个开关只在 .env 里，界面上「类型=向量」是个摆设；现在选完即时生效，不用重启。
+ */
+function modelEmbeddingSectionNode() {
+	const admin = state.modelAdmin;
+	const wrap = make("div", "model-embedding");
+	const fromModels = Array.isArray(admin.embeddingOptions) ? admin.embeddingOptions : [];
+	const current = admin.embeddingKey ? fromModels.find((model) => model.id === admin.embeddingKey) : null;
+	const title = make("div", "module-section-title", "向量模型（知识库语义检索）");
+	wrap.appendChild(title);
+
+	const line = make("div", "model-embedding__line");
+	if (current) {
+		line.appendChild(make("span", "model-embedding__badge ok", "已启用"));
+		line.appendChild(
+			make("span", "model-embedding__name", `${current.providerName || "供应商"} · ${current.name}`),
+		);
+		line.appendChild(make("span", "model-embedding__id", current.modelId ?? ""));
+	} else if (state.embedding?.available) {
+		// 模型页没选，但环境变量里配了 EMBEDDING_*：如实说清来源，别让人以为没开
+		line.appendChild(make("span", "model-embedding__badge ok", "已启用"));
+		line.appendChild(make("span", "model-embedding__name", state.embedding.model ?? "环境变量里的向量模型"));
+		line.appendChild(make("span", "model-embedding__id", "来自 .env（EMBEDDING_*）"));
+	} else if (state.embedding?.problem) {
+		line.appendChild(make("span", "model-embedding__badge off", "配置有误"));
+		line.appendChild(make("span", "model-embedding__name", "知识库暂时退回关键词检索"));
+	} else {
+		line.appendChild(make("span", "model-embedding__badge off", "未启用"));
+		line.appendChild(make("span", "model-embedding__name", "知识库现在按字面词匹配（关键词检索）"));
+	}
+	wrap.appendChild(line);
+
+	if (state.embedding?.problem) {
+		wrap.appendChild(make("p", "model-embedding__warn", state.embedding.problem));
+	}
+	// 一条「向量」模型都没有时，直接把入口做成"新建模型"；有候选则去下面的模型表点「设为向量模型」
+	const noOptions = fromModels.length === 0;
+	if (noOptions) {
+		const create = make("button", "btn-ghost mini model-embedding__pick", "新建向量模型");
+		create.setAttribute("type", "button");
+		create.addEventListener("click", () => openModelDialog());
+		line.appendChild(guardModelWrite(create));
+	}
+	wrap.appendChild(
+		make(
+			"p",
+			"model-embedding__hint",
+			noOptions
+				? "还没有「向量」类型的模型。先「＋ 新建供应商」（OpenAI、本地 Ollama，或任意带 /v1 的 OpenAI 兼容网关），再在这里新建一条类型为「向量」的模型；DeepSeek / Anthropic 没有向量接口。"
+				: "在下面「模型」表格里，对类型为「向量」的那一行点「设为向量模型」即可切换（和「设为当前」同一套操作）。",
+		),
+	);
+	return wrap;
 }
 
 function renderModelsModule(body, spec) {
@@ -3107,7 +3382,7 @@ function renderImModule(body, spec) {
 		make(
 			"p",
 			"module-page__lead",
-			`钉钉机器人：回调地址填 POST ${IM_CALLBACK_PATH}，并按钉钉后台的加签 token 校验签名；本机 DINGTALK_TRANSPORT=fake 时出站只进 outbox，不联网。`,
+			"把钉钉或企业微信自建应用接进来：员工发来的消息会自动交给 AI 回复，多轮对话各自独立。添加机器人后，按卡片里的专属回调地址完成平台配置。",
 		),
 	);
 	if (!canWriteWorkflow()) {
@@ -3115,23 +3390,22 @@ function renderImModule(body, spec) {
 	}
 	const bots = state.im.bots;
 	if (bots.length === 0) {
-		body.appendChild(
-			make("div", "placeholder", "还没有添加机器人，点右上角「＋ 添加机器人」把钉钉机器人接进来。"),
-		);
+		body.appendChild(imEmptyNode());
 	} else {
 		body.appendChild(make("div", "module-section-title", `机器人（${bots.length}）`));
 		const list = make("div", "im-bot-list");
 		for (const bot of bots) list.appendChild(imBotCard(bot));
 		body.appendChild(list);
 	}
-	body.appendChild(imCallbackCard());
+	// 平台侧怎么配是一次性说明：默认收起，别让文档压住机器人列表
+	body.appendChild(imGuideSection());
 	// outbox 是 fake 传输的额外能力：接口 404 / 403 / 连不上时 null，整块不出现
 	if (Array.isArray(state.im.outbox)) body.appendChild(imOutboxNode(state.im.outbox));
 	body.appendChild(
 		make(
 			"p",
 			"module-page__hint",
-			"凭证只以密文落库，列表只回掩码；删除机器人会连带删掉它的外部会话映射，钉钉侧再回调会 404。",
+			"凭证只以密文落库，列表只回掩码；删除机器人会连带删掉它的外部会话映射，平台侧再回调会 404。",
 		),
 	);
 }
@@ -3151,11 +3425,12 @@ function imBotCard(bot) {
 	titleRow.appendChild(
 		make("span", bot.hasAesKey ? "im-aes-badge on" : "im-aes-badge off", bot.hasAesKey ? "AES 已配置" : "未配置 AES"),
 	);
+	titleRow.appendChild(make("span", "module-tag", bot.platform === "wecom" ? "企业微信" : "钉钉"));
 	main.appendChild(titleRow);
 
 	const keys = make("div", "im-bot-keys");
-	keys.appendChild(imBotMetaNode("appKey", bot.appKey ?? "—", "im-bot-appkey"));
-	keys.appendChild(imBotMetaNode("robotCode", bot.robotCode ?? "—", "im-bot-robotcode"));
+	keys.appendChild(imBotMetaNode(bot.platform === "wecom" ? "CorpID" : "appKey", bot.appKey ?? "—", "im-bot-appkey"));
+	keys.appendChild(imBotMetaNode(bot.platform === "wecom" ? "AgentId" : "robotCode", bot.robotCode ?? "—", "im-bot-robotcode"));
 	// 接口只回掩码：没有掩码就别编一个，老实写「—」
 	keys.appendChild(imBotMetaNode("appSecret", bot.appSecretMasked ?? "—", "im-bot-secret"));
 	main.appendChild(keys);
@@ -3181,7 +3456,11 @@ function imBotCard(bot) {
 
 	const ping = guardImWrite(make("button", "link-btn im-ping", "发测试消息"));
 	ping.setAttribute("type", "button");
-	ping.addEventListener("click", () => void pingImBot(bot));
+	ping.addEventListener("click", () => openImPingDialog(bot));
+	if (canWriteWorkflow() && bot.enabled === false) {
+		ping.disabled = true;
+		ping.title = "请先启用机器人";
+	}
 	actions.appendChild(ping);
 
 	const remove = guardImWrite(make("button", "link-btn im-delete", "删除"));
@@ -3191,6 +3470,15 @@ function imBotCard(bot) {
 
 	head.appendChild(actions);
 	card.appendChild(head);
+	const callbackPath = bot.platform === "wecom" ? "/api/im/wecom/callback" : IM_CALLBACK_PATH;
+	const callbackUrl = `${window.location?.origin ?? ""}${callbackPath}?botId=${encodeURIComponent(bot.id)}`;
+	const callback = make("div", "im-bot-callback-url");
+	callback.appendChild(make("code", "im-callback-code", callbackUrl));
+	const copy = make("button", "link-btn im-copy-callback", "复制回调地址");
+	copy.setAttribute("type", "button");
+	copy.addEventListener("click", () => void copyText(callbackUrl, copy));
+	callback.appendChild(copy);
+	card.appendChild(callback);
 
 	// 测试消息的结果贴在卡片里：失败原因可能很长，不塞进按钮
 	const pingResult = make("div", "im-ping-result");
@@ -3204,6 +3492,67 @@ function imBotMetaNode(label, value, className) {
 	row.appendChild(make("span", "im-bot-meta__label", label));
 	row.appendChild(make("span", `im-bot-meta__value ${className}`, value));
 	return row;
+}
+
+/** 一个机器人都没有时的引导：说清支持哪两个平台，并就地给添加入口。 */
+function imEmptyNode() {
+	const card = make("div", "im-empty");
+	card.appendChild(make("p", "im-empty__title", "还没有接入机器人"));
+	card.appendChild(
+		make(
+			"p",
+			"im-empty__text",
+			"钉钉自建应用和企业微信自建应用都支持：添加后填上平台给的凭证，把卡片里的回调地址贴到平台后台，员工消息就会自动转成对话。",
+		),
+	);
+	if (canWriteWorkflow()) {
+		const add = make("button", "btn-ghost mini im-empty__add", "＋ 添加机器人");
+		add.setAttribute("type", "button");
+		add.addEventListener("click", () => openImBotDialog(null));
+		card.appendChild(add);
+	}
+	return card;
+}
+
+/** 平台配置说明：内容长、平时用不到，收进一次点击展开的折叠区。 */
+function imGuideSection() {
+	const section = make("section", "im-guide");
+	const toggle = make("button", "im-guide__toggle", "配置说明：钉钉 / 企业微信怎么接");
+	toggle.setAttribute("type", "button");
+	toggle.setAttribute("aria-expanded", "false");
+	const panel = make("div", "im-guide__panel");
+	panel.hidden = true;
+	panel.appendChild(imCallbackCard());
+	panel.appendChild(imWecomGuideCard());
+	toggle.addEventListener("click", () => {
+		const open = panel.hidden;
+		panel.hidden = !open;
+		toggle.setAttribute("aria-expanded", String(open));
+	});
+	section.appendChild(toggle);
+	section.appendChild(panel);
+	return section;
+}
+
+/** 企业微信自建应用的配置步骤（和钉钉那套放在同一个折叠区里）。 */
+function imWecomGuideCard() {
+	const card = make("section", "im-callback im-wecom-guide");
+	card.appendChild(make("h3", "module-section-heading", "企业微信自建应用怎么配"));
+	card.appendChild(
+		make(
+			"p",
+			"im-callback-text",
+			"在企业微信管理后台创建自建应用，填企业 ID、AgentId 与应用 Secret。在「接收消息」里填卡片的公网 HTTPS 回调地址，并配相同的 Token 与 EncodingAESKey，保存时平台会自动校验这个地址。",
+		),
+	);
+	card.appendChild(
+		make(
+			"p",
+			"im-callback-text",
+			"把服务器出口 IP 配进应用可信 IP，并确认接收员工在应用可见范围内。当前支持员工向自建应用发文本，多轮对话按员工独立保存；图片、语音与群机器人 Webhook 不在这种接入方式里。",
+		),
+	);
+	return card;
 }
 
 /** 回调说明卡：钉钉侧要填什么、签名怎么校验、消息怎么变成内部会话。 */
@@ -3285,8 +3634,8 @@ function imOutboxNode(items) {
 	const section = make("section", "im-outbox");
 	const head = make("div", "module-section-head");
 	const count = Math.min(items.length, IM_OUTBOX_LIMIT);
-	head.appendChild(make("h3", "module-section-heading", `fake 出站队列（最近 ${count} 条）`));
-	head.appendChild(make("span", "im-outbox-hint", "DINGTALK_TRANSPORT=fake：不联网，只写这里"));
+	head.appendChild(make("h3", "module-section-heading", `模拟出站队列（最近 ${count} 条）`));
+	head.appendChild(make("span", "im-outbox-hint", "模拟传输：不联网，只写到本机队列"));
 	section.appendChild(head);
 
 	if (items.length === 0) {
@@ -3330,6 +3679,9 @@ function imOutboxNode(items) {
 function openImBotDialog(bot) {
 	if (!canWriteWorkflow()) return;
 	const editing = Boolean(bot);
+	const platform = selectField("接入平台", bot?.platform ?? "dingtalk", [["dingtalk", "钉钉"], ["wecom", "企业微信 · 自建应用"]]);
+	platform.select.classList.add("im-form-platform");
+	platform.select.disabled = editing;
 	const name = kbField("名称", bot?.name ?? "", 80, "例如：客服机器人");
 	name.input.classList.add("im-form-name");
 	const appKey = kbField("appKey", bot?.appKey ?? "", 200, "钉钉开放平台的 AppKey");
@@ -3365,7 +3717,7 @@ function openImBotDialog(bot) {
 	enabled.input.classList.add("im-form-enabled");
 
 	const body = make("div", "kb-form");
-	for (const field of [name, appKey, appSecret, robotCode, callbackToken, aesKey, enabled]) {
+	for (const field of [platform, name, appKey, appSecret, robotCode, callbackToken, aesKey, enabled]) {
 		body.appendChild(field.node);
 	}
 	body.appendChild(
@@ -3376,6 +3728,19 @@ function openImBotDialog(bot) {
 		),
 	);
 
+	const updatePlatformLabels = () => {
+		const wecom = platform.select.value === "wecom";
+		for (const [field, text] of [[appKey, wecom ? "企业 ID（CorpID）" : "appKey"], [robotCode, wecom ? "应用 AgentId" : "robotCode"], [appSecret, wecom ? "应用 Secret" : "appSecret"], [callbackToken, wecom ? "回调 Token" : "callbackToken"], [aesKey, wecom ? "EncodingAESKey（必填）" : "aesKey（可选）"]]) {
+			field.node.querySelector(".kb-field-label").textContent = text + (editing && [appSecret, callbackToken, aesKey].includes(field) ? "（留空不修改）" : "");
+		}
+		appSecret.input.placeholder = editing ? "要换就填新的；列表只回掩码" : wecom ? "企业微信应用详情中的 Secret" : "钉钉开放平台的 AppSecret";
+		callbackToken.input.placeholder = wecom ? "企业微信接收消息设置中的 Token" : "钉钉回调的加签 token";
+		appKey.input.placeholder = wecom ? "企业微信管理后台的企业 ID" : "钉钉开放平台的 AppKey";
+		robotCode.input.placeholder = wecom ? "应用详情中的数字 AgentId" : "机器人编码，例如 dingxxxxxx";
+		aesKey.input.placeholder = wecom ? "接收消息设置中的 43 位 EncodingAESKey" : "钉钉后台的 43 位 EncodingAESKey；可不填";
+	};
+	platform.select.addEventListener("change", updatePlatformLabels);
+	updatePlatformLabels();
 	openKbDialog({
 		title: editing ? "编辑机器人" : "添加机器人",
 		body,
@@ -3387,6 +3752,7 @@ function openImBotDialog(bot) {
 				robotCode: String(robotCode.input.value ?? "").trim(),
 				enabled: Boolean(enabled.input.checked),
 			};
+			if (!editing) payload.platform = platform.select.value;
 			const secretValue = String(appSecret.input.value ?? "").trim();
 			if (secretValue) payload.appSecret = secretValue;
 			const tokenValue = String(callbackToken.input.value ?? "").trim();
@@ -3412,9 +3778,45 @@ function openImBotDialog(bot) {
 }
 
 /** 发测试消息：fake 模式会进 outbox；真实传输失败也回 200 + ok:false，失败原因照原样显示。 */
-async function pingImBot(bot) {
-	if (!canWriteWorkflow()) return;
-	const result = await requestJson(`/api/im/bots/${encodeURIComponent(bot.id)}/ping`, "POST", {});
+function openImPingDialog(bot) {
+	if (!canWriteWorkflow() || bot.enabled === false) return;
+	const wecom = bot.platform === "wecom";
+	const targetType = selectField("接收方式", wecom ? "staffId" : "conversationId", wecom ? [["staffId", "企业微信员工 UserID"]] : [
+		["conversationId", "群聊（群会话 ID）"],
+		["staffId", "单聊（员工 ID）"],
+	]);
+	targetType.select.classList.add("im-ping-type");
+	const target = kbField("接收目标", "", 200, "填写群会话 ID 或员工 ID");
+	target.input.classList.add("im-ping-target");
+	const body = make("div", "kb-form");
+	body.appendChild(targetType.node);
+	body.appendChild(target.node);
+	body.appendChild(make("p", "kb-bind-hint", "将发送一条固定测试消息。真实钉钉必须填写接收目标；模拟传输可留空，消息只进入本机出站队列。"));
+	let sending = false;
+	openKbDialog({
+		title: `发送测试消息 · ${bot.name}`,
+		body,
+		saveLabel: "发送测试消息",
+		save: async () => {
+			const value = String(target.input.value ?? "").trim();
+			if (!value && bot.transport !== "fake" && !(bot.transport === undefined && Array.isArray(state.im.outbox))) {
+				setKbDialogError("请填写群会话 ID 或员工 ID。");
+				return false;
+			}
+			if (sending) return false;
+			sending = true;
+			try {
+				return await pingImBot(bot, value ? { [targetType.select.value]: value } : {});
+			} finally {
+				sending = false;
+			}
+		},
+	});
+}
+
+async function pingImBot(bot, target) {
+	if (!canWriteWorkflow() || bot.enabled === false) return false;
+	const result = await requestJson(`/api/im/bots/${encodeURIComponent(bot.id)}/ping`, "POST", target);
 	const data = result.data;
 	const ok = result.ok && data?.ok !== false;
 	let message;
@@ -3432,6 +3834,8 @@ async function pingImBot(bot) {
 	state.im.outbox = await fetchImOutbox();
 	if (state.module === "im") renderModuleView();
 	showImPingResult(bot.id, ok, message);
+	if (!ok) setKbDialogError(message);
+	return ok;
 }
 
 /** 重画后把结果贴回对应的卡片（整页重画会丢掉临时节点）。 */
@@ -5069,10 +5473,36 @@ function renderKnowledgeModule(body, spec) {
 		return;
 	}
 	body.appendChild(kbEmbeddingNode());
+	// 一个库都没有时，两栏布局里全是占位符，看着像坏了；直接给一张能动手的空态卡
+	if (state.kb.libraries.length === 0) {
+		body.appendChild(kbEmptyState());
+		return;
+	}
 	const layout = make("div", "kb-layout");
 	layout.appendChild(kbListColumn());
 	layout.appendChild(kbMainColumn());
 	body.appendChild(layout);
+}
+
+/** 空态：说清知识库是干什么的，并把「新建」放成主按钮（列表头那个「＋」太小，新人看不见）。 */
+function kbEmptyState() {
+	const box = make("div", "kb-empty");
+	box.appendChild(make("h3", "kb-empty__title", "还没有知识库"));
+	box.appendChild(
+		make(
+			"p",
+			"kb-empty__text",
+			"知识库是给 Agent 用的资料夹：把产品手册、客服话术、政策条款放进去，它在对话里需要时会先检索这些段落，再据此回答。",
+		),
+	);
+	const add = make("button", "btn-primary", "新建知识库");
+	add.setAttribute("type", "button");
+	add.addEventListener("click", () => openNewKbDialog());
+	box.appendChild(add);
+	box.appendChild(
+		make("p", "kb-empty__hint", "建好后可以到「技能」页把它绑给某个技能，让模型加载技能时优先查这里。"),
+	);
+	return box;
 }
 
 /** 顶部状态：语义检索有没有配好，直接决定检索走向量还是关键词。 */
@@ -5086,7 +5516,9 @@ function kbEmbeddingNode() {
 		make(
 			"span",
 			"kb-status__text",
-			enabled ? `语义检索：${embedding.model ?? "已启用"}` : "语义检索未启用（没配 embedding，当前用关键词检索）",
+			enabled
+				? `语义检索：${embedding.model ?? "已启用"}——按意思找段落，措辞不一样也能召回`
+				: "语义检索未启用：按字面词匹配（到「模型」页选一条「向量」模型就能开启语义检索）",
 		),
 	);
 	return line;
@@ -5113,7 +5545,9 @@ function kbListColumn() {
 		row.setAttribute("role", "button");
 		row.tabIndex = 0;
 		if (lib.id === state.kb.selectedId) row.classList.add("active");
-		row.appendChild(make("span", "kb-item-name", lib.name ?? lib.id));
+		const nameNode = make("span", "kb-item-name", lib.name ?? lib.id);
+		nameNode.title = lib.name ?? lib.id;
+		row.appendChild(nameNode);
 		row.appendChild(make("span", "kb-item-meta", `${lib.docCount ?? 0} 文档 · ${lib.chunkCount ?? 0} 块`));
 		row.addEventListener("click", () => void selectKbLibrary(lib.id));
 		row.addEventListener("keydown", (event) => {
@@ -5141,28 +5575,60 @@ function kbMainColumn() {
 	const head = make("div", "kb-main-head");
 	const titleBox = make("div", "kb-main-title");
 	titleBox.appendChild(make("h3", "kb-main-name", lib.name ?? lib.id));
-	titleBox.appendChild(make("div", "kb-main-meta", `${lib.docCount ?? 0} 文档 · ${lib.chunkCount ?? 0} 块`));
+	const chunks = Number(lib.chunkCount ?? 0);
+	const metaText =
+		state.kb.embedding?.available && chunks > 0
+			? `${lib.docCount ?? 0} 文档 · ${chunks} 块 · 已向量化 ${lib.embeddedChunkCount ?? 0}/${chunks}`
+			: `${lib.docCount ?? 0} 文档 · ${chunks} 块`;
+	titleBox.appendChild(make("div", "kb-main-meta", metaText));
 	head.appendChild(titleBox);
+	// 操作区单独包一层：窄屏整行换行时两个按钮一起下去，别把标题挤成一字一行
+	const actions = make("div", "kb-main-actions");
 	const reindex = make("button", "btn-ghost mini", "重新向量化");
 	reindex.setAttribute("type", "button");
 	reindex.title = "用当前向量化配置把整库分块重算一遍（补 key 后让旧文档也能语义检索）";
-	reindex.disabled = !state.kb.embedding?.available || Number(lib.chunkCount ?? 0) === 0;
+	reindex.disabled = !state.kb.embedding?.available || chunks === 0;
 	reindex.addEventListener("click", () => void reindexKbLibrary(lib));
-	head.appendChild(reindex);
-	const del = make("button", "btn-ghost mini", "删除知识库");
+	actions.appendChild(reindex);
+	const del = make("button", "btn-ghost mini danger", "删除知识库");
 	del.setAttribute("type", "button");
+	del.title = "连这个库的文档和分块一起删掉，不可恢复";
 	del.addEventListener("click", () => void deleteKbLibrary(lib));
-	head.appendChild(del);
+	actions.appendChild(del);
+	head.appendChild(actions);
 	main.appendChild(head);
 	if (lib.description) main.appendChild(make("p", "kb-desc", lib.description));
 
+	// 语义检索开着、但库里还有块没向量：这批块只能被关键词命中，得显眼地说清楚并给一键补齐
+	const missingVectors = state.kb.embedding?.available ? Math.max(0, chunks - Number(lib.embeddedChunkCount ?? 0)) : 0;
+	if (missingVectors > 0) {
+		const banner = make("div", "kb-reembed");
+		const body = make("div", "kb-reembed__body");
+		body.appendChild(make("span", "kb-reembed__badge", "待补齐"));
+		body.appendChild(
+			make(
+				"p",
+				"kb-reembed__text",
+				`有 ${missingVectors} 个块还没有向量（共 ${chunks} 块），语义检索暂时命中不到它们；补齐后按意思也能召回。`,
+			),
+		);
+		banner.appendChild(body);
+		const fix = make("button", "btn-primary mini kb-reembed__fix", `补齐向量（${missingVectors} 块）`);
+		fix.setAttribute("type", "button");
+		fix.addEventListener("click", () => void reindexKbLibrary(lib));
+		banner.appendChild(fix);
+		main.appendChild(banner);
+	}
+
 	const uploadRow = make("div", "kb-upload");
-	const upload = make("button", "btn-primary mini", "上传文档");
+	const uploading = Boolean(state.kb.uploading);
+	const upload = make("button", "btn-primary mini", uploading ? "上传中…" : "上传文档");
 	upload.setAttribute("type", "button");
+	upload.disabled = uploading;
 	upload.title = "支持 .txt / .md / .csv / .pdf / .docx";
 	upload.addEventListener("click", () => els.kbFile.click());
 	uploadRow.appendChild(upload);
-	uploadRow.appendChild(make("span", "kb-upload-hint", "上传后自动解析分块、向量化；PDF / Word 也能直接传。"));
+	uploadRow.appendChild(make("span", "kb-upload-hint", "支持 .txt / .md / .csv / .pdf / .docx，上传后自动解析分块。"));
 	main.appendChild(uploadRow);
 
 	main.appendChild(kbDocsTable());
@@ -5190,7 +5656,9 @@ function kbDocsTable() {
 	for (const doc of state.kb.documents) {
 		const row = make("tr", "kb-table-row kb-doc-row");
 		row.dataset.docId = doc.id;
-		row.appendChild(make("td", "kb-td kb-td-name", doc.filename ?? doc.id));
+		const nameCell = make("td", "kb-td kb-td-name", doc.filename ?? doc.id);
+		nameCell.title = doc.filename ?? doc.id;
+		row.appendChild(nameCell);
 		row.appendChild(make("td", "kb-td kb-td-size", formatBytes(doc.bytes)));
 
 		const statusCell = make("td", "kb-td kb-td-status");
@@ -5245,7 +5713,7 @@ function renderKbSearchResults(badge, container, data) {
 
 function kbSearchNode() {
 	const box = make("div", "kb-search");
-	box.appendChild(make("div", "kb-section-title", "检索试跑"));
+	box.appendChild(make("div", "kb-section-title", "检索试跑（只在当前知识库里找）"));
 	const row = make("div", "kb-search-row");
 	const input = make("input", "kb-search-input");
 	input.type = "search";
@@ -5432,14 +5900,28 @@ function dataUrlToBase64(dataUrl) {
 
 async function uploadKbDocument(filename, contentBase64) {
 	if (!state.kb.selectedId) return null;
-	const data = await fetchJsonOrNull(`/api/kb/${encodeURIComponent(state.kb.selectedId)}/documents`, {
-		method: "POST",
-		// 后端只认 JSON base64；这里绝不能变成 multipart/form-data
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ filename, contentBase64 }),
-	});
+	let response;
+	try {
+		response = await api(`/api/kb/${encodeURIComponent(state.kb.selectedId)}/documents`, {
+			method: "POST",
+			// 后端只认 JSON base64；这里绝不能变成 multipart/form-data
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ filename, contentBase64 }),
+		});
+	} catch {
+		addNotice("上传失败：连不上服务，稍后再试。", true);
+		return null;
+	}
+	const data = await response.json().catch(() => null);
+	if (!response.ok) {
+		// 400 是文件名/内容问题，直接把后端中文文案给用户；
+		// 5xx 多半是解析失败（扫描件、加密 PDF、损坏文件），给一句人话而不是英文报错
+		const reason = response.status >= 500 ? "这个文件没解析出文字（扫描件、加密或文件损坏），换个文件再试。" : data?.error;
+		addNotice(`上传「${filename}」失败：${reason ?? `HTTP ${response.status}`}`, true);
+		return null;
+	}
 	if (!data) {
-		addNotice("上传失败：后端没接住这个文件。", true);
+		addNotice("上传失败：后端没返回结果。", true);
 		return null;
 	}
 	await selectKbLibrary(state.kb.selectedId);
@@ -5451,12 +5933,22 @@ async function uploadKbDocument(filename, contentBase64) {
 async function handleKbFilePicked() {
 	const file = els.kbFile.files?.[0] ?? null;
 	els.kbFile.value = "";
-	if (!file) return;
+	if (!file || !state.kb.selectedId) return;
+	// 解析是同步完成的（大文件要等几秒），按钮先变成「上传中…」并禁用，避免连点重复上传
+	state.kb.uploading = true;
+	if (state.module === "knowledge") renderModuleView();
 	try {
 		const dataUrl = await readFileAsDataUrl(file);
-		await uploadKbDocument(file.name, dataUrlToBase64(dataUrl));
+		const created = await uploadKbDocument(file.name, dataUrlToBase64(dataUrl));
+		if (created) {
+			if (created.warning) addNotice(`已上传「${file.name}」：${created.warning}`, true);
+			else addNotice(`已上传「${file.name}」：${created.chunkCount ?? 0} 个分块。`);
+		}
 	} catch {
 		addNotice("读文件失败，换一个格式再试。", true);
+	} finally {
+		state.kb.uploading = false;
+		if (state.module === "knowledge") renderModuleView();
 	}
 }
 
@@ -5537,7 +6029,9 @@ function emptyFlowDraft() {
 		systemPrompt: "",
 		skillDescription: "",
 		skillInstructions: "",
-		steps: [{ title: "", hint: "", via: [] }],
+		// 新建技能默认不给步骤：技能 = 说明 + 正文，工具由模型自己按需要挑；
+		// 需要固定流程的人再展开「高级」加步骤
+		steps: [],
 	};
 }
 
@@ -5586,6 +6080,12 @@ function applyFlowChrome() {
 	els.flowSkillInst.disabled = readonly;
 	els.flowSave.hidden = readonly;
 	els.flowAddStep.hidden = readonly;
+	// 只读（内置技能）时高级区也给用户看一眼：里面是它的固定步骤
+	const advanced = document.getElementById("flow-advanced");
+	if (advanced) {
+		advanced.hidden = false;
+		if (readonly) advanced.open = true;
+	}
 	els.flowCancel.textContent = readonly ? "关闭" : "取消";
 }
 
@@ -5645,6 +6145,9 @@ function renderFlowEditor() {
 	els.flowPrompt.value = draft.systemPrompt;
 	els.flowSkillDesc.value = draft.skillDescription ?? "";
 	els.flowSkillInst.value = draft.skillInstructions ?? "";
+	// 高级区（步骤 + 系统提示）只在真有内容时展开：新技能默认就是"只写说明"的形态
+	const advanced = document.getElementById("flow-advanced");
+	if (advanced) advanced.open = draft.steps.length > 0;
 	renderFlowStepList();
 }
 
@@ -5653,7 +6156,9 @@ function renderFlowStepList() {
 	if (!draft) return;
 	els.flowStepsBox.innerHTML = "";
 	if (draft.steps.length === 0) {
-		els.flowStepsBox.appendChild(make("div", "placeholder", "还没有步骤，点「＋ 添加步骤」加一步。"));
+		els.flowStepsBox.appendChild(
+			make("div", "placeholder", "没有固定步骤：模型会自己决定调哪些工具。需要按顺序强制走完时，点「＋ 添加步骤」。"),
+		);
 		return;
 	}
 	draft.steps.forEach((step, index) => {
@@ -5791,10 +6296,7 @@ function addFlowStep() {
 
 function removeFlowStep(index) {
 	if (!state.flowDraft || state.flowReadonly) return;
-	if (state.flowDraft.steps.length === 1) {
-		setFlowError("至少要保留一个步骤。");
-		return;
-	}
+	// 删到零步是允许的：那就是"没有固定步骤、交给模型自己编排"
 	state.flowDraft.steps.splice(index, 1);
 	markFlowDirty();
 	renderFlowStepList();
@@ -5821,10 +6323,19 @@ async function saveFlow() {
 		els.flowName.focus();
 		return;
 	}
-	// 系统提示是服务端必填项，先在前端拦一道，省一次往返
-	if (draft.systemPrompt.trim() === "") {
-		setFlowError("请填写系统提示。");
-		els.flowPrompt.focus();
+	const skillDescription = (draft.skillDescription ?? "").trim();
+	const skillInstructions = (draft.skillInstructions ?? "").trim();
+	// 「什么时候用它」是模型挑技能的唯一线索：前端当必填，免得不填就建出一条永远不会被加载的技能
+	if (skillDescription === "") {
+		setFlowError("请填写「什么时候用它」：模型靠这句话决定要不要加载这个技能。");
+		document.getElementById("flow-advanced").open = false;
+		els.flowSkillDesc.focus();
+		return;
+	}
+	if (skillInstructions === "" && draft.systemPrompt.trim() === "") {
+		document.getElementById("flow-advanced").open = true;
+		setFlowError("请填写「指导书正文」（或展开高级填系统提示），模型加载后总得看到点什么。");
+		els.flowSkillInst.focus();
 		return;
 	}
 	const steps = draft.steps.map((step) => ({
@@ -5832,10 +6343,6 @@ async function saveFlow() {
 		hint: step.hint.trim(),
 		via: [...step.via],
 	}));
-	if (steps.length === 0) {
-		setFlowError("至少需要一个步骤。");
-		return;
-	}
 	for (let index = 0; index < steps.length; index += 1) {
 		if (steps[index].title === "") {
 			setFlowError(`第 ${index + 1} 步缺少标题。`);
@@ -5847,10 +6354,12 @@ async function saveFlow() {
 		}
 	}
 
+	// 正文优先；没写正文就用系统提示；系统提示也空就用「什么时候用它」兜底（服务端系统提示必填）
+	const systemPrompt = draft.systemPrompt.trim() || skillInstructions || skillDescription;
 	// hint 留空就不传，交给服务端用默认提示
 	const payload = {
 		name,
-		systemPrompt: draft.systemPrompt.trim(),
+		systemPrompt,
 		steps: steps.map((step) => {
 			const item = { title: step.title, via: step.via };
 			if (step.hint !== "") item.hint = step.hint;
@@ -5858,10 +6367,8 @@ async function saveFlow() {
 		}),
 	};
 
-	// 技能文案：两段都空就发 null（显式清空），否则只发填了的那段
+	// 技能文案：什么时候用它必填（上面已校验），正文可为空（服务端回落到系统提示）
 	const skillText = {};
-	const skillDescription = (draft.skillDescription ?? "").trim();
-	const skillInstructions = (draft.skillInstructions ?? "").trim();
 	if (skillDescription !== "") skillText.description = skillDescription;
 	if (skillInstructions !== "") skillText.instructions = skillInstructions;
 	payload.skill = Object.keys(skillText).length > 0 ? skillText : null;
@@ -5885,7 +6392,7 @@ async function saveFlow() {
 		closeFlowEditor(true);
 		await refreshSessions();
 		await refreshWorkflows();
-		// 右栏技能列表是流程的投影：定义改了，列表里的名字/说明也要跟着变
+		// 技能列表（含已隐藏的旧右栏）是流程的投影：定义改了，名字/说明也要跟着变
 		await refreshSkillCatalog();
 	} catch {
 		setFlowError("保存失败：无法连接服务，请稍后重试。");
@@ -6475,7 +6982,7 @@ document.getElementById("btn-new").addEventListener("click", () => void newChat(
 
 /* ---------------- 技能编辑器事件 ---------------- */
 
-// 右栏的「＋」= 新建技能：同一个编辑器，标题不同、焦点直接送到技能文案上
+// 「+ 新建技能」（旧右栏头部与技能页共用）：同一个编辑器，标题不同、焦点直接送到技能文案上
 els.newSkillBtn.addEventListener("click", () =>
 	void openFlowEditor(null, { title: "新建技能", focusSkill: true }),
 );
@@ -6546,7 +7053,7 @@ for (const id of ["btn-audit", "btn-audit-top"]) {
 }
 els.drawerClose.addEventListener("click", () => toggleDrawer(false));
 
-/* ---------------- 右栏技能面板的事件 ---------------- */
+/* ---------------- 旧右栏技能面板的事件（DOM 隐藏，接线保留） ---------------- */
 
 // 「退出技能」：和模型自己 use_skill(null) 走同一条路
 els.skillCurrentExit.addEventListener("click", () => void setSkill(null));

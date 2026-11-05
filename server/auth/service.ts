@@ -136,7 +136,7 @@ const PASSWORD_MAX = 200;
  * 放行的只是回调本身，机器人管理接口（/api/im/bots*）仍然要登录 + 权限矩阵。
  * 别把整个 `/api/im` 放进白名单——那会把凭证管理接口暴露出去。
  */
-const PUBLIC_API_PATHS: ReadonlySet<string> = new Set(["/api/im/dingtalk/callback"]);
+const PUBLIC_API_PATHS: ReadonlySet<string> = new Set(["/api/im/dingtalk/callback", "/api/im/wecom/callback"]);
 
 /** 健康探针、登录/退出/me、以及外部回调不需要令牌。 */
 export function isPublicApiPath(pathname: string): boolean {

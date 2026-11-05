@@ -36,7 +36,7 @@ const MASK_DECRYPT_FAILED = "****（无法解密，请重新填写）";
 export interface ImBotView {
 	id: string;
 	name: string;
-	platform: "dingtalk";
+	platform: "dingtalk" | "wecom";
 	appKey: string;
 	hasAppSecret: boolean;
 	appSecretMasked: string | null;
@@ -150,18 +150,19 @@ export class ImStore {
 	}
 
 	/** 回调入口：按 botId 找启用的机器人；没传 botId 时只在"唯一启用"时兜底。 */
-	findForCallback(botId?: string): ImBotRecord {
+	findForCallback(botId?: string, platform: "dingtalk" | "wecom" = "dingtalk"): ImBotRecord {
 		if (botId !== undefined && botId.length > 0) {
 			const row = this.storage.getImBot(botId);
 			if (!row) {
 				throw new ImError(404, "机器人不存在");
 			}
+			if (row.platform !== platform) throw new ImError(400, "机器人平台与回调地址不匹配");
 			if (!row.enabled) {
 				throw new ImError(403, "机器人已停用");
 			}
 			return row;
 		}
-		const enabled = this.storage.listImBots().filter((row) => row.enabled);
+		const enabled = this.storage.listImBots().filter((row) => row.enabled && row.platform === platform);
 		if (enabled.length === 0) {
 			throw new ImError(404, "还没有启用的机器人");
 		}
@@ -173,12 +174,18 @@ export class ImStore {
 	}
 
 	create(body: Record<string, unknown>): ImBotView {
+		const platform = body.platform ?? "dingtalk";
+		if (platform !== "dingtalk" && platform !== "wecom") throw new ImError(400, "请选择钉钉或企业微信平台");
 		const name = requiredString(body.name, "机器人名称", MAX_NAME);
 		const appKey = requiredString(body.appKey, "appKey", MAX_APP_KEY);
 		const appSecret = requiredString(body.appSecret, "appSecret", MAX_SECRET);
 		const robotCode = requiredString(body.robotCode, "robotCode", MAX_ROBOT_CODE);
 		const callbackToken = requiredString(body.callbackToken, "callbackToken", MAX_SECRET);
 		const aesKey = parseAesKey(body.aesKey);
+		if (platform === "wecom") {
+			if (!aesKey) throw new ImError(400, "企业微信必须配置 EncodingAESKey");
+			if (!/^[1-9][0-9]{0,9}$/.test(robotCode)) throw new ImError(400, "企业微信 AgentId 必须为正整数");
+		}
 		const enabled = parseEnabled(body.enabled, true);
 		const workflowId = parseWorkflowId(body.workflowId, IM_DEFAULT_WORKFLOW);
 		const now = Date.now();
@@ -186,7 +193,7 @@ export class ImStore {
 			id: `imb-${randomUUID().slice(0, 8)}`,
 			workspaceId: DEFAULT_WORKSPACE_ID,
 			name,
-			platform: "dingtalk",
+			platform,
 			appKey,
 			appSecretEnc: encryptSecret(appSecret),
 			callbackTokenEnc: encryptSecret(callbackToken),
@@ -202,6 +209,7 @@ export class ImStore {
 
 	update(id: string, body: Record<string, unknown>): ImBotView {
 		const current = this.requireRow(id);
+		if (body.platform !== undefined && body.platform !== current.platform) throw new ImError(400, "已有机器人不能更换平台，请新建机器人");
 		const patch: ImBotPatch = { updatedAt: Date.now() };
 		if ("name" in body) {
 			patch.name = requiredString(body.name, "机器人名称", MAX_NAME);
@@ -229,6 +237,10 @@ export class ImStore {
 		}
 		if ("enabled" in body) {
 			patch.enabled = parseEnabled(body.enabled, current.enabled);
+		}
+		if (current.platform === "wecom") {
+			if (patch.aesKeyEnc === null) throw new ImError(400, "企业微信不能清空 EncodingAESKey");
+			if (!/^[1-9][0-9]{0,9}$/.test(patch.robotCode ?? current.robotCode)) throw new ImError(400, "企业微信 AgentId 必须为正整数");
 		}
 		const updated = this.storage.updateImBot(id, patch);
 		if (!updated) {
@@ -260,6 +272,7 @@ export class ImStore {
 			name: row.name,
 			appKey: row.appKey,
 			appSecret: this.decrypt(row.appSecretEnc, "appSecret"),
+			platform: row.platform,
 			robotCode: row.robotCode,
 		};
 	}
@@ -340,7 +353,7 @@ export class ImStore {
 		return {
 			id: row.id,
 			name: row.name,
-			platform: "dingtalk",
+			platform: row.platform,
 			appKey: row.appKey,
 			hasAppSecret: Boolean(row.appSecretEnc),
 			appSecretMasked: row.appSecretEnc ? this.maskedSecret(row.appSecretEnc) : null,

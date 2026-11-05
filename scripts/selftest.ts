@@ -389,7 +389,8 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 			new RegExp(`流程名称\\s*最多\\s*${WORKFLOW_LIMITS.name}\\s*个字符`),
 		);
 		assert.throws(() => validateWorkflowInput({ ...base, systemPrompt: "" }, { knownTools }), /系统提示.*不能为空/);
-		assert.throws(() => validateWorkflowInput({ ...base, steps: [] }, { knownTools }), /至少要有一个步骤/);
+		// 零步骤是合法形态（技能只写指导书，工具交给模型挑），不再报错
+		assert.deepEqual(validateWorkflowInput({ ...base, steps: [] }, { knownTools }).steps, []);
 		assert.throws(
 			() => validateWorkflowInput({ ...base, steps: [{ title: "查询", via: [] }] }, { knownTools }),
 			/第 1 步至少要选一个工具/,
@@ -423,7 +424,7 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 		assert.equal(patched.name, "新名字");
 		assert.equal(patched.systemPrompt, "旧提示", "没传 systemPrompt 时应沿用旧值");
 		assert.equal(patched.steps.length, 2);
-		assert.throws(() => mergeWorkflowInput(current, { steps: [] }, { knownTools }), /至少要有一个步骤/);
+		assert.deepEqual(mergeWorkflowInput(current, { steps: [] }, { knownTools }).steps, [], "PATCH 也能把步骤清空");
 	});
 }
 

@@ -21,6 +21,7 @@ import { json, methodNotAllowed, readJsonBody } from "./http.js";
 import type { OutboundService } from "./outbound.js";
 import type { DingTalkGateway } from "./dingtalk.js";
 import type { ImStore } from "./store.js";
+import type { WeComGateway } from "./wecom.js";
 
 const IM_PREFIX = "/api/im";
 
@@ -28,6 +29,7 @@ export interface ImRouteDeps {
 	store: ImStore;
 	outbound: OutboundService;
 	gateway: DingTalkGateway;
+	wecom: WeComGateway;
 }
 
 function decodeSegment(raw: string): string {
@@ -59,6 +61,15 @@ async function route(
 	const pathname = url.pathname;
 	const method = req.method ?? "GET";
 
+	if (pathname === `${IM_PREFIX}/wecom/callback`) {
+		if (method !== "GET" && method !== "POST") {
+			methodNotAllowed(res, method, "GET / POST");
+			return;
+		}
+		await deps.wecom.handleCallback(req, res, url);
+		return;
+	}
+
 	if (pathname === `${IM_PREFIX}/dingtalk/callback`) {
 		if (method !== "POST") {
 			methodNotAllowed(res, method, "POST");
@@ -85,7 +96,7 @@ async function route(
 
 	if (pathname === `${IM_PREFIX}/bots`) {
 		if (method === "GET") {
-			json(res, 200, { items: deps.store.list() });
+			json(res, 200, { items: deps.store.list().map((bot) => ({ ...bot, transport: bot.platform === "wecom" ? deps.outbound.wecomTransport : deps.outbound.transport })) });
 			return;
 		}
 		if (method === "POST") {
@@ -106,15 +117,21 @@ async function route(
 		const botId = decodeSegment(pingMatch[1]!);
 		const body = await readJsonBody(req);
 		const row = deps.store.requireRow(botId);
+		if (!row.enabled) throw new ImError(403, "机器人已停用，请启用后再发送测试消息");
 		const conversationId = optionalBodyString(body, "conversationId");
 		const staffId = optionalBodyString(body, "staffId");
+		if (row.platform === "wecom" && conversationId) throw new ImError(400, "企业微信自建应用请填写员工 UserID");
+		if (conversationId && staffId) throw new ImError(400, "群会话和员工只能选择一个接收目标");
+		if ((conversationId?.length ?? 0) > 200 || (staffId?.length ?? 0) > 200) {
+			throw new ImError(400, "接收目标不能超过 200 个字符");
+		}
 		let target: { conversationId?: string; staffId?: string } = { conversationId, staffId };
 		if (!target.conversationId && !target.staffId) {
-			if (!deps.outbound.fake) {
+			if ((row.platform === "wecom" ? deps.outbound.wecomTransport : deps.outbound.transport) !== "fake") {
 				throw new ImError(400, "请提供 conversationId 或 staffId（真实钉钉要知道发给谁）");
 			}
 			// fake 模式没有真实会话：给一个稳定的假会话 id，方便在 outbox 里认出是哪次 ping
-			target = { conversationId: `fake-${row.id}` };
+			target = row.platform === "wecom" ? { staffId: `fake-${row.id}` } : { conversationId: `fake-${row.id}` };
 		}
 		const result = await deps.outbound.send(
 			deps.store.outboundOf(row),

@@ -10,6 +10,8 @@
  */
 
 import { createKbPgStore } from "./pgStore.js";
+import { createEmbeddingClient } from "./embedding.js";
+import type { ResolvedEmbedding } from "./embedding.js";
 import { createKbService } from "./service.js";
 import type { KbService } from "./service.js";
 import { createKbStore } from "./store.js";
@@ -21,6 +23,11 @@ export interface InitKbOptions {
 	dbPath?: string | null;
 	/** Postgres 连接串；不传就现读 `DATABASE_URL`（有值即走 pgvector 后端） */
 	databaseUrl?: string | null;
+	/**
+	 * 向量模型来源（模型页那条「向量」模型）。返回 null = 模型页没配，回落到 EMBEDDING_* 环境变量。
+	 * 由宿主注入：知识库不认识模型模块，只认它给出的端点/模型名/Key。
+	 */
+	resolveEmbedding?: () => ResolvedEmbedding | null;
 }
 
 /**
@@ -42,7 +49,7 @@ export function initKb(options: InitKbOptions = {}): KbService {
 		`[kb] 知识库存储后端：${store.info().kind}（${store.info().path}）` +
 			(store.info().kind === "postgres" ? "；语义检索走 pgvector" : "；语义检索在本地算余弦（JSON 向量）"),
 	);
-	current = createKbService({ store });
+	current = createKbService({ store, embedding: createEmbeddingClient({ resolveModelEmbedding: options.resolveEmbedding }) });
 	return current;
 }
 

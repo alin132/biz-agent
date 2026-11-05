@@ -82,8 +82,10 @@ function parseSteps(value: unknown, knownTools: string[]): WorkflowStep[] {
 	if (!Array.isArray(value)) {
 		fail("steps 必须是数组");
 	}
+	// 零步骤是合法形态：技能只写"指导书"，具体调哪些工具交给模型自己判断
+	// （引擎对空 steps 有专门分支，见 WorkflowEngine.nextPrompt）
 	if (value.length === 0) {
-		fail("至少要有一个步骤");
+		return [];
 	}
 	if (value.length > WORKFLOW_LIMITS.steps) {
 		fail(`步骤最多 ${WORKFLOW_LIMITS.steps} 个`);
@@ -117,7 +119,12 @@ function parseSteps(value: unknown, knownTools: string[]): WorkflowStep[] {
 	});
 }
 
-/** 技能文案：两段都空 = 没写（返回 undefined，仍可当技能用，只是目录里用兜底描述）。 */
+/**
+ * 技能文案：两段都空 = 没写（返回 undefined，仍可当技能用，只是目录里用兜底描述）。
+ *
+ * 「一句话说明」（description）是模型挑技能的唯一线索：有正文没说明、或两个字段都没有时，
+ * 技能目录里只能看到流程名，模型基本不会主动加载它，所以控制台把它当必填来引导。
+ */
 function parseSkill(value: unknown): WorkflowSkillText | undefined {
 	if (value === undefined || value === null) {
 		return undefined;

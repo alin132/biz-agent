@@ -281,6 +281,20 @@ async function main(): Promise<void> {
 	assert(ping.status === 200 && ping.body.ok === true, `ping → 200 ok（实际 ${ping.status} ${JSON.stringify(ping.body)}）`);
 	assert(ping.body.transport === "fake", "ping 走 fake 传输");
 	await waitOutbox(baseCount + 3, "ping 消息");
+	const pingPath = `/api/im/bots/${encodeURIComponent(botId)}/ping`;
+	const bothTargets = await request("POST", pingPath, { conversationId: "cid-test", staffId: "staff-test" });
+	assert(bothTargets.status === 400, "测试消息拒绝同时指定群和员工");
+	const invalidTarget = await request("POST", pingPath, { staffId: 123 });
+	assert(invalidTarget.status === 400, "测试消息拒绝非字符串目标");
+	const tooLong = await request("POST", pingPath, { conversationId: "x".repeat(201) });
+	assert(tooLong.status === 400, "测试消息拒绝过长目标");
+	for (const target of [{ conversationId: "cid-explicit" }, { staffId: "staff-explicit" }]) {
+		const sent = await request("POST", pingPath, target);
+		assert(sent.status === 200 && sent.body.ok === true, "测试消息支持显式群或员工目标");
+		const box = await request("GET", "/api/im/outbox");
+		const items = box.body.items as Array<{ target: Record<string, string> }>;
+		assert(JSON.stringify(items.at(-1)?.target) === JSON.stringify(target), "出站队列保留准确接收目标");
+	}
 
 	// ---------- 7. AES 加密回调（可选模式） ----------
 	console.log("\n[7] AES 加密回调");
@@ -348,6 +362,8 @@ async function main(): Promise<void> {
 	assert(patched.status === 200 && patched.body.name === "冒烟机器人（改名）", "PATCH 改名成功");
 	const disabled = await request("PATCH", `/api/im/bots/${encodeURIComponent(botId)}`, { enabled: false });
 	assert(disabled.status === 200 && disabled.body.enabled === false, "PATCH 停用成功");
+	const disabledPing = await request("POST", `/api/im/bots/${encodeURIComponent(botId)}/ping`, { staffId: "staff-test" });
+	assert(disabledPing.status === 403, "停用机器人不能发送测试消息");
 	const rejected = await sendCallback({
 		botId,
 		msgId: "msg-smoke-disabled",
