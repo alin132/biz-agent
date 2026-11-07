@@ -42,6 +42,16 @@ export interface IngestResult {
 	warning?: string;
 }
 
+/** 对话附件解析结果：纯文本 + 类型与页数，够前端提示用。 */
+export interface ExtractTextResult {
+	/** 解析出的纯文本（已按附件上限截断） */
+	text: string;
+	/** 原始字符数（截断前），前端据此提示「已截断」 */
+	totalChars: number;
+	kind: string;
+	pages?: number;
+}
+
 export interface ReembedResult {
 	/** 本次重新向量化的块数 */
 	chunks: number;
@@ -51,6 +61,12 @@ export interface ReembedResult {
 
 export interface SkillBindingsView {
 	skillId: string;
+	kbIds: string[];
+	knowledgeBases: KnowledgeBaseView[];
+}
+
+/** 「对话默认检索」的库：不走技能，问答时直接兜底检索这几个库。 */
+export interface DefaultBindingsView {
 	kbIds: string[];
 	knowledgeBases: KnowledgeBaseView[];
 }
@@ -69,14 +85,34 @@ export interface KbService {
 	removeKnowledgeBase(id: string): RemoveKnowledgeBaseResult;
 
 	ingestDocument(input: IngestDocumentInput): Promise<IngestResult>;
+	/**
+	 * 只解析、不落库：把上传的文档转成纯文本，供「对话附件」使用。
+	 * 复用知识库的解析器（PDF/DOCX/MD/CSV），不建库、不分块、不向量化。
+	 */
+	extractText(input: { filename: string; data: Uint8Array | Buffer }): Promise<ExtractTextResult>;
 	listDocuments(kbId: string): KbDocumentRow[];
 	removeDocument(docId: string): RemoveDocumentResult;
 
 	search(kbId: string, query: string, options?: SearchOptions): Promise<SearchResponse>;
 	searchForSkill(skillId: string, query: string, topK?: number): Promise<SkillSearchResponse>;
+	/** 按给定库列表跨库检索（技能绑定与对话默认库共用这一条合并逻辑）。 */
+	searchInBases(kbIds: string[], query: string, topK?: number): Promise<SkillSearchResponse>;
+	/**
+	 * 对话侧检索：技能绑定 > Agent 绑定 > 对话默认。
+	 * `agentKbIds` 是绑定 Agent 声明的知识库（不传或空数组 = 没有 Agent 绑定）。
+	 */
+	searchForContext(
+		skillId: string | null,
+		query: string,
+		topK?: number,
+		agentKbIds?: string[],
+	): Promise<SkillSearchResponse>;
 
 	getSkillBindings(skillId: string): SkillBindingsView;
 	setSkillBindings(skillId: string, kbIds: string[]): SkillBindingsView;
+
+	getDefaultBindings(): DefaultBindingsView;
+	setDefaultBindings(kbIds: string[]): DefaultBindingsView;
 
 	/**
 	 * 用当前 embedding 配置把整个知识库的块重算一遍向量（补 `EMBEDDING_API_KEY` 后让旧文档也能语义检索）。
@@ -118,6 +154,12 @@ export function mimeOf(filename: string): string | null {
 	return table[ext] ?? null;
 }
 
+/**
+ * 对话附件最多送进模型的字符数。
+ * 比知识库分块宽：附件是"一次性读全文"，但也要挡住超长 PDF 把上下文撑爆。
+ */
+export const ATTACHMENT_MAX_CHARS = 60_000;
+
 export interface CreateKbServiceOptions {
 	store: KbStore;
 	/** 不传则读环境变量建默认客户端（单测可注入假的，避免打网络） */
@@ -127,6 +169,45 @@ export interface CreateKbServiceOptions {
 export function createKbService(options: CreateKbServiceOptions): KbService {
 	const store = options.store;
 	const embedding = options.embedding ?? createEmbeddingClient();
+
+	/**
+	 * 跨库检索并合并：技能绑定与「对话默认检索」共用同一条合并逻辑
+	 * （按分数降序、同分按块 id、取前 topK），避免两条路径各写一份排序规则。
+	 */
+	async function searchAcrossBases(
+		kbIds: string[],
+		query: string,
+		topK: number | undefined,
+	): Promise<SkillSearchResponse> {
+		const unique = [...new Set(kbIds)];
+		if (unique.length === 0) {
+			// 没绑定知识库不是错误（新技能都这样），返回空结果让上层照常回答
+			return { mode: "keyword", results: [], kbIds: [] };
+		}
+		const limit = clampTopK(topK);
+		const responses = await Promise.all(
+			unique.map((kbId) => searchInKnowledgeBase({ store, embedding, kbId, query, options: { topK: limit } })),
+		);
+		const results = responses
+			.flatMap((response) => response.results)
+			.sort((left, right) => {
+				if (right.score !== left.score) {
+					return right.score - left.score;
+				}
+				return left.chunkId - right.chunkId;
+			})
+			.slice(0, limit);
+		const allVector = responses.every((response) => response.mode === "vector");
+		const fallbackReasons = responses
+			.map((response) => response.fallbackReason)
+			.filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
+		return {
+			mode: allVector ? "vector" : "keyword",
+			results,
+			kbIds: unique,
+			...(fallbackReasons.length > 0 ? { fallbackReason: fallbackReasons.join("；") } : {}),
+		};
+	}
 
 	/** 向量化一批块：成功就写回 embedding 列，返回是否全部成功。 */
 	async function embedChunks(chunkIds: number[], texts: string[]): Promise<boolean> {
@@ -218,6 +299,19 @@ export function createKbService(options: CreateKbServiceOptions): KbService {
 			return { document: saved, chunkCount: chunks.length, embedded, ...(warning ? { warning } : {}) };
 		},
 
+		async extractText(input) {
+			// 走与知识库完全相同的解析器：支持的格式、大小上限、中文错误文案都复用一份，
+			// 别为对话附件再写一套 PDF/DOCX 解析（两份实现必然漂移）
+			const parsed = await parseDocument({ filename: input.filename, data: input.data });
+			const totalChars = parsed.text.length;
+			return {
+				text: parsed.text.slice(0, ATTACHMENT_MAX_CHARS),
+				totalChars,
+				kind: parsed.meta.kind,
+				...(typeof parsed.meta.pages === "number" ? { pages: parsed.meta.pages } : {}),
+			};
+		},
+
 		listDocuments(kbId) {
 			if (!store.getKnowledgeBase(kbId)) {
 				throw notFound(`知识库不存在：${kbId}`);
@@ -262,35 +356,38 @@ export function createKbService(options: CreateKbServiceOptions): KbService {
 			return searchInKnowledgeBase({ store, embedding, kbId, query, options: searchOptions });
 		},
 
-		async searchForSkill(skillId, query, topK) {
-			const kbIds = store.getSkillKbIds(skillId);
-			if (kbIds.length === 0) {
-				// 没绑定知识库不是错误（新技能都这样），返回空结果让上层照常回答
-				return { mode: "keyword", results: [], kbIds: [] };
-			}
-			const limit = clampTopK(topK);
-			const responses = await Promise.all(
-				kbIds.map((kbId) => searchInKnowledgeBase({ store, embedding, kbId, query, options: { topK: limit } })),
-			);
-			const results = responses
-				.flatMap((response) => response.results)
-				.sort((left, right) => {
-					if (right.score !== left.score) {
-						return right.score - left.score;
-					}
-					return left.chunkId - right.chunkId;
-				})
-				.slice(0, limit);
-			const allVector = responses.every((response) => response.mode === "vector");
-			const fallbackReasons = responses
-				.map((response) => response.fallbackReason)
-				.filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
-			return {
-				mode: allVector ? "vector" : "keyword",
-				results,
-				kbIds,
-				...(fallbackReasons.length > 0 ? { fallbackReason: fallbackReasons.join("；") } : {}),
-			};
+		searchInBases(kbIds, query, topK) {
+			return searchAcrossBases(kbIds, query, topK);
+		},
+
+		searchForSkill(skillId, query, topK) {
+			return searchAcrossBases(store.getSkillKbIds(skillId), query, topK);
+		},
+
+		searchForContext(skillId, query, topK, agentKbIds) {
+			// 三层优先级，越具体越优先（与"绑定 Agent = 收窄能力范围"的直觉一致）：
+			//   ① 当前技能绑的库   —— 会话里显式加载了技能，它的绑定最具体；
+			//   ② 当前 Agent 绑的库 —— 整段对话的能力范围，技能没绑时生效；
+			//   ③ 「对话默认检索」   —— 什么都没绑时的兜底，保证不加载技能也能查资料。
+			// 空数组一律视为"没绑"，继续往下落——否则一个空绑定会把默认库挡掉。
+			const fromSkill = (skillId ?? "").trim().length > 0 ? store.getSkillKbIds((skillId ?? "").trim()) : [];
+			// Agent 声明的是**存下来的 id**，库可能早被删了：和 getDefaultKbIds 一样要先剔除，
+			// 否则一次陈旧绑定会让每一次检索都报「知识库不存在」。
+			// 先 listKnowledgeBasesByIds 再取 id，等于用"库还在不在"过一遍。
+			const agentRaw = (agentKbIds ?? []).map((id) => id.trim()).filter((id) => id.length > 0);
+			const fromAgent = store.listKnowledgeBasesByIds(agentRaw).map((kb) => kb.id);
+			const kbIds = fromSkill.length > 0 ? fromSkill : fromAgent.length > 0 ? fromAgent : store.getDefaultKbIds();
+			return searchAcrossBases(kbIds, query, topK);
+		},
+
+		getDefaultBindings() {
+			const kbIds = store.getDefaultKbIds();
+			return { kbIds, knowledgeBases: store.listKnowledgeBasesByIds(kbIds).map(toKnowledgeBaseView) };
+		},
+
+		setDefaultBindings(kbIds) {
+			store.setDefaultKbIds(kbIds);
+			return service.getDefaultBindings();
 		},
 
 		getSkillBindings(skillId) {

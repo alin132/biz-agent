@@ -26,6 +26,7 @@ const els = {
 	permissionChip: document.getElementById("permission-chip"),
 	permissionLabel: document.getElementById("permission-label"),
 	modelSelect: document.getElementById("model-select"),
+	slash: document.getElementById("slash"),
 	attachBtn: document.getElementById("btn-attach"),
 	fileInput: document.getElementById("file-input"),
 	attachments: document.getElementById("attachments"),
@@ -96,6 +97,8 @@ const state = {
 	es: null,
 	runEl: null,
 	answerEl: null,
+	// 思考过程容器（reasoning 模型才有）：折起显示，正文开始时改标题
+	thinkingEl: null,
 	busy: false,
 	pinned: new Set(JSON.parse(localStorage.getItem(PIN_KEY) ?? "[]")),
 	searchQuery: "",
@@ -103,6 +106,7 @@ const state = {
 	archivedOpen: false,
 	attachments: [],
 	menuAnchor: null,
+	// 斜杠命令面板的元素（index.html 里挂在输入框表单内，贴着输入框上方展开）
 	titleEditor: null,
 	// 当前加载的技能 { id, name }；null = 跑会话自己的流程
 	activeSkill: null,
@@ -118,12 +122,25 @@ const state = {
 	loginVisible: false,
 	loginBusy: false,
 	// 知识库（P5）：status = unknown 还没问 | ready 有接口 | unavailable 404/连不上 → 回落「未接入」空态
-	kb: { status: "unknown", libraries: [], selectedId: null, documents: [], embedding: null, search: null, uploading: false },
+	kb: {
+		status: "unknown",
+		libraries: [],
+		selectedId: null,
+		documents: [],
+		embedding: null,
+		search: null,
+		uploading: false,
+		// 「设为对话默认」开关失败时的页面内提示（不往对话区塞，也不 alert）
+		notice: null,
+		savingDefaults: false,
+	},
 	// 成员 / 审计（P4）：同样的三态 + forbidden（403 说清"角色不够"，不混进「未接入」）
 	members: { status: "unknown", items: [], notice: null },
 	audit: { status: "unknown", items: [], total: 0, action: "", actor: "", loading: false },
 	// MCP（P7）：三态 + 服务列表；expanded 记住哪几张卡展开了工具表（重画后不折叠）
 	mcp: { status: "unknown", servers: [], expanded: new Set() },
+	// 插件（UI 首版）：列表由 /api/plugins 提供，页面不解析或执行插件代码。
+	plugins: { status: "unknown", items: [], notice: null },
 	// IM 机器人（P8）：三态 + 机器人列表 + fake 传输下的 outbox（拿不到就 null，整块隐藏）
 	im: { status: "unknown", bots: [], outbox: null },
 	// 审批中心：三态 + 跨会话待办；auto = 10 秒轮询开关（默认开，切走模块就停）
@@ -145,6 +162,9 @@ const state = {
 	flowDraft: null,
 	flowReadonly: false,
 	flowDirty: false,
+	// 斜杠命令面板（输入框里敲 / 弹出的那个）：open + 当前高亮的项下标；
+	// query 是 / 后面已经输入的过滤词，只匹配命令名与拼音首词，不匹配整句话
+	slash: { open: false, index: 0, query: "" },
 };
 
 // markdown 渲染搬到了 web/markdown.js（经典脚本，先于本文件加载；node 侧由 scripts/ui-check.mjs 单测）
@@ -1067,6 +1087,7 @@ const MODULES = [
 		icon: '<path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H19v16H5.5A1.5 1.5 0 0 1 4 18.5z" /><path d="M8 4v16" />',
 	},
 	{ id: "skills", label: "技能", icon: '<path d="M12 3.2 14 9l5.8 2-5.8 2-2 5.8-2-5.8L4.2 11 10 9z" />' },
+	{ id: "plugins", label: "插件", icon: '<path d="M9 4.5a2.5 2.5 0 1 1 5 0V7h2.5A1.5 1.5 0 0 1 18 8.5V11h2.5a2.5 2.5 0 1 1 0 5H18v2.5a1.5 1.5 0 0 1-1.5 1.5H14v-2.5a2.5 2.5 0 1 0-5 0V20H6.5A1.5 1.5 0 0 1 5 18.5V16H2.5a2.5 2.5 0 1 1 0-5H5V8.5A1.5 1.5 0 0 1 6.5 7H9z" />' },
 	{
 		id: "models",
 		label: "模型",
@@ -1110,6 +1131,7 @@ const MODULES = [
 ];
 
 const MODULE_IDS = new Set(MODULES.map((module) => module.id));
+
 
 /**
  * 模块页的兜底规格：真接口没接上（404 / 连不上）时，用这里的说明 + 「未接入」徽标 + 接口清单。
@@ -1174,6 +1196,17 @@ const MODULE_SPECS = {
 			["POST", "/api/auth/users", "新建成员并分配角色"],
 		],
 		next: "接口没连上时回到这里：确认后端在跑，并且当前角色能管理成员。",
+	},
+	plugins: {
+		title: "插件",
+		summary: "管理扩展包。插件清单可包含技能和外部工具；导入前请检查来源及声明内容。",
+		apis: [
+			["GET", "/api/plugins", "插件列表"],
+			["POST", "/api/plugins/import", "导入插件清单 { manifest }"],
+			["PATCH", "/api/plugins/:id", "启用或停用 { enabled }"],
+			["DELETE", "/api/plugins/:id", "卸载插件"],
+		],
+		next: "插件清单以 JSON 文件导入；当前页面不会执行清单中的代码。",
 	},
 	models: {
 		title: "模型",
@@ -1242,6 +1275,8 @@ async function ensureModuleData(moduleId) {
 		return;
 	}
 	if (moduleId === "knowledge") {
+		// 每次进来重拉：上一次的"已设为对话默认"提示不该跨次留着
+		state.kb.notice = null;
 		await refreshKb();
 		return;
 	}
@@ -1271,6 +1306,10 @@ async function ensureModuleData(moduleId) {
 	if (moduleId === "mcp") {
 		// MCP 页每次进来都重拉：别的标签页可能刚注册/删了服务，状态也可能变了
 		await refreshMcp();
+		return;
+	}
+	if (moduleId === "plugins") {
+		await refreshPlugins();
 		return;
 	}
 	if (moduleId === "im") {
@@ -1352,6 +1391,23 @@ function modulePageNode(moduleId) {
 		}
 		head.appendChild(add);
 	}
+	if (moduleId === "plugins") {
+		const actions = make("div", "module-page__actions");
+		const file = make("input", "plugin-import-input");
+		file.type = "file";
+		file.accept = "application/json,.json";
+		file.hidden = true;
+		file.setAttribute("aria-label", "选择插件 JSON 清单");
+		file.addEventListener("change", () => void importPluginFile(file));
+		const add = guardPluginWrite(make("button", "btn-ghost mini plugin-import", "＋ 导入插件"));
+		add.setAttribute("type", "button");
+		add.addEventListener("click", () => {
+			if (!add.disabled) file.click();
+		});
+		actions.appendChild(file);
+		actions.appendChild(add);
+		head.appendChild(actions);
+	}
 	if (moduleId === "mcp" && state.mcp.status !== "forbidden") {
 		// 403 是"角色不够"，整页已经在说权限，不摆一个点了也白点的按钮
 		const add = make("button", "btn-ghost mini mcp-add", "＋ 注册 MCP 服务");
@@ -1424,6 +1480,7 @@ function modulePageNode(moduleId) {
 	else if (moduleId === "audit") renderAuditModule(body, spec);
 	else if (moduleId === "models") renderModelsModule(body, spec);
 	else if (moduleId === "mcp") renderMcpModule(body, spec);
+	else if (moduleId === "plugins") renderPluginsModule(body, spec);
 	else if (moduleId === "im") renderImModule(body, spec);
 	else if (moduleId === "approvals") renderApprovalsModule(body, spec);
 	else if (moduleId === "monitor") renderMonitorModule(body, spec);
@@ -1770,12 +1827,12 @@ function modelStatusNode() {
 	line.appendChild(main);
 	const switchBtn = make("button", "btn-ghost mini model-switch", "切换当前模型");
 	switchBtn.setAttribute("type", "button");
-	switchBtn.title = "只影响新会话；重启后回落到第一条启用的对话模型";
+	switchBtn.title = "选择会保存；只影响新建会话";
 	switchBtn.addEventListener("click", () => openSwitchModelDialog());
 	line.appendChild(guardModelWrite(switchBtn));
-	// 「当前模型只存内存」是设计如此（见 AGENTS 坑 27）：不写清楚，用户重启后发现模型变回去会以为是 bug
+	// 当前模型选择会持久化；运行中的会话仍使用创建时确定的模型。
 	line.appendChild(
-		make("p", "model-status__note", "当前模型只在这个进程里生效，重启后回落到第一条启用的对话模型；运行中的会话不会换。"),
+		make("p", "model-status__note", "当前模型选择会保存；运行中的会话不会切换。"),
 	);
 	return line;
 }
@@ -1789,14 +1846,14 @@ function modelKeyWarnNode(provider) {
 		make(
 			"p",
 			"model-key-warn__text",
-			`供应商「${provider.name ?? provider.id}」保存的 API Key 解不开：通常是本机没配置固定的 SECRET_KEY（每次重启都会换一个随机密钥），或者换过密钥。`,
+			`供应商「${provider.name ?? provider.id}」的 API Key 无法解密，请重新填写。`,
 		),
 	);
 	body.appendChild(
 		make(
 			"p",
 			"model-key-warn__hint",
-			"重新填写一次 Key 即可恢复；也可以在 .env 里设置固定的 SECRET_KEY 后重启，让已存的密文一直可解。",
+			"配置固定的 SECRET_KEY，避免重启后密钥失效。",
 		),
 	);
 	const fix = make("button", "btn-ghost mini model-key-warn__fix", "重新填写 Key");
@@ -2294,23 +2351,23 @@ function renderModelAdmin(body) {
 	if (brokenKey) body.appendChild(modelKeyWarnNode(brokenKey));
 	body.appendChild(make("div", "module-section-title", `供应商（${providers.length}）`));
 	if (providers.length === 0) {
-		body.appendChild(make("div", "placeholder", "还没有供应商，点右上角「＋ 新建供应商」开始。"));
+		body.appendChild(make("div", "model-admin-empty", "还没有供应商，先添加服务来源。"));
 	} else {
 		body.appendChild(providerTableNode(providers));
 	}
-	body.appendChild(modelEmbeddingSectionNode());
 	const models = modelAdminModels();
 	body.appendChild(make("div", "module-section-title", `模型（${models.length}）`));
 	if (models.length === 0) {
-		body.appendChild(make("div", "placeholder", "还没有模型，点右上角「＋ 新建模型」开始。"));
+		body.appendChild(make("div", "model-admin-empty", "还没有模型，使用右上角「新建模型」添加。"));
 	} else {
 		body.appendChild(modelTableNode(models));
 	}
+	body.appendChild(modelEmbeddingSectionNode());
 	body.appendChild(
 		make(
 			"p",
-			"module-page__hint",
-			"API Key 只在保存时加密落库、列表只回显掩码；连通性检测会向供应商端点发一条极短请求，失败文案直接来自服务端。",
+			"module-page__hint model-admin-footer",
+			"API Key 仅加密保存，列表只显示掩码；连通性检测会向供应商发送一次短请求。",
 		),
 	);
 }
@@ -2364,8 +2421,8 @@ function modelEmbeddingSectionNode() {
 			"p",
 			"model-embedding__hint",
 			noOptions
-				? "还没有「向量」类型的模型。先「＋ 新建供应商」（OpenAI、本地 Ollama，或任意带 /v1 的 OpenAI 兼容网关），再在这里新建一条类型为「向量」的模型；DeepSeek / Anthropic 没有向量接口。"
-				: "在下面「模型」表格里，对类型为「向量」的那一行点「设为向量模型」即可切换（和「设为当前」同一套操作）。",
+				? "先添加支持 embeddings 的供应商，再新建「向量」类型模型；DeepSeek / Anthropic 没有向量接口。"
+				: "在模型列表对应行点「设为向量模型」即可切换。",
 		),
 	);
 	return wrap;
@@ -2887,6 +2944,89 @@ function renderMcpModule(body, spec) {
 	);
 }
 
+/** 插件列表按 API 真值渲染；未知后端只显示接口说明，不构造示例插件。 */
+async function refreshPlugins() {
+	let response = null;
+	try { response = await api("/api/plugins"); } catch { response = null; }
+	if (!response) { state.plugins.status = "unavailable"; state.plugins.items = []; return; }
+	if (response.status === 403) { state.plugins.status = "forbidden"; state.plugins.items = []; return; }
+	if (!response.ok) { state.plugins.status = "unavailable"; state.plugins.items = []; return; }
+	const data = await response.json().catch(() => null);
+	const items = Array.isArray(data) ? data : data?.items;
+	if (!Array.isArray(items)) { state.plugins.status = "unavailable"; state.plugins.items = []; return; }
+	state.plugins.status = "ready"; state.plugins.items = items;
+}
+
+function guardPluginWrite(button) {
+	if (canWriteWorkflow()) return button;
+	button.disabled = true;
+	button.title = "当前角色不能修改插件（需要 workflow.write）";
+	return button;
+}
+
+async function importPluginFile(input) {
+	const file = input.files?.[0];
+	if (!file) return;
+	state.plugins.notice = null;
+	try {
+		const manifest = JSON.parse(await file.text());
+		if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error("插件清单必须是 JSON 对象");
+		const result = await requestJson("/api/plugins/import", "POST", { manifest });
+		if (!result.ok) throw new Error(requestError(result, "导入插件失败"));
+		state.plugins.notice = "插件已导入。";
+		await refreshPlugins();
+	} catch (error) { state.plugins.notice = error instanceof Error ? error.message : String(error); }
+	input.value = "";
+	if (state.module === "plugins") renderModuleView();
+}
+
+async function setPluginEnabled(plugin, enabled) {
+	const result = await requestJson("/api/plugins/" + encodeURIComponent(plugin.id), "PATCH", { enabled });
+	if (!result.ok) state.plugins.notice = requestError(result, enabled ? "启用插件失败" : "停用插件失败");
+	else { state.plugins.notice = enabled ? "插件已启用。" : "插件已停用。"; await refreshPlugins(); }
+	if (state.module === "plugins") renderModuleView();
+}
+
+async function uninstallPlugin(plugin) {
+	const name = String(plugin.name ?? plugin.id ?? "此插件");
+	if (!window.confirm("确定卸载插件「" + name + "」？")) return;
+	const result = await requestJson("/api/plugins/" + encodeURIComponent(plugin.id), "DELETE");
+	if (!result.ok) state.plugins.notice = requestError(result, "卸载插件失败");
+	else { state.plugins.notice = "插件已卸载。"; await refreshPlugins(); }
+	if (state.module === "plugins") renderModuleView();
+}
+
+function renderPluginsModule(body, spec) {
+	if (state.plugins.status === "forbidden") { body.appendChild(moduleDeniedNode("当前角色不能查看插件", "插件配置需要 workflow.read 权限。")); return; }
+	if (state.plugins.status !== "ready") { renderNotConnectedModule(body, spec); return; }
+	body.appendChild(make("p", "module-page__lead", "插件可包含技能与外部工具。请先核对清单来源和权限声明；导入时不会执行插件代码。"));
+	if (!canWriteWorkflow()) body.appendChild(make("p", "plugin-perm-hint", "当前角色不能修改插件（需要 workflow.write），这一页只能查看。"));
+	if (state.plugins.notice) body.appendChild(make("p", "plugin-notice", state.plugins.notice));
+	const items = state.plugins.items;
+	if (!items.length) { body.appendChild(make("div", "plugin-empty", "还没有插件。选择 JSON 清单导入一个插件。")); return; }
+	body.appendChild(make("div", "module-section-title", "插件（" + items.length + "）"));
+	const list = make("div", "plugin-list");
+	for (const plugin of items) {
+		const row = make("article", "plugin-row"); row.dataset.pluginId = String(plugin.id ?? "");
+		const main = make("div", "plugin-row__main");
+		main.appendChild(make("strong", "plugin-row__name", plugin.name ?? plugin.id ?? "未命名插件"));
+		if (plugin.version) main.appendChild(make("span", "plugin-row__version", String(plugin.version)));
+		if (plugin.description) main.appendChild(make("p", "plugin-row__description", String(plugin.description)));
+		const contents = [];
+		if (Array.isArray(plugin.skills)) contents.push(plugin.skills.length + " 个技能");
+		if (Array.isArray(plugin.tools)) contents.push(plugin.tools.length + " 个工具");
+		if (contents.length) main.appendChild(make("span", "plugin-row__contents", contents.join(" · ")));
+		row.appendChild(main);
+		const actions = make("div", "plugin-row__actions"); const enabled = plugin.enabled !== false;
+		const toggle = guardPluginWrite(make("button", "link-btn plugin-toggle", enabled ? "停用" : "启用"));
+		toggle.setAttribute("type", "button"); toggle.setAttribute("aria-label", (enabled ? "停用" : "启用") + "插件 " + (plugin.name ?? plugin.id));
+		toggle.addEventListener("click", () => void setPluginEnabled(plugin, !enabled)); actions.appendChild(toggle);
+		const remove = guardPluginWrite(make("button", "link-btn plugin-uninstall", "卸载"));
+		remove.setAttribute("type", "button"); remove.addEventListener("click", () => void uninstallPlugin(plugin)); actions.appendChild(remove);
+		row.appendChild(actions); list.appendChild(row);
+	}
+	body.appendChild(list);
+}
 function mcpServerCard(server) {
 	const card = make("section", "mcp-server-card");
 	card.dataset.serverId = String(server.id ?? "");
@@ -5420,6 +5560,9 @@ function renderMonitorModule(body, spec) {
 
 /* ---------------- 知识库（P5）：库列表 / 文档 / 检索试跑 ---------------- */
 
+// 「设为对话默认」是写操作：没有 workflow.write 时置灰，真正拦截在后端（PUT 回 403）
+const KB_DEFAULT_WRITE_TITLE = "当前角色不能修改知识库（需要 workflow.write）";
+
 /**
  * 拉库列表。后端还没上线时这里会 404 —— 那时整页回落到「未接入」空态，
  * 不弹错误、也不摆假表格（用户会把假数据当成能用的功能）。
@@ -5473,6 +5616,8 @@ function renderKnowledgeModule(body, spec) {
 		return;
 	}
 	body.appendChild(kbEmbeddingNode());
+	const notice = kbNoticeNode();
+	if (notice) body.appendChild(notice);
 	// 一个库都没有时，两栏布局里全是占位符，看着像坏了；直接给一张能动手的空态卡
 	if (state.kb.libraries.length === 0) {
 		body.appendChild(kbEmptyState());
@@ -5505,7 +5650,8 @@ function kbEmptyState() {
 	return box;
 }
 
-/** 顶部状态：语义检索有没有配好，直接决定检索走向量还是关键词。 */
+/** 顶部状态：语义检索有没有配好，直接决定检索走向量还是关键词。
+ *  第二行单独说「对话检索」——那是"对话不加载技能时查哪几个库"，跟向量检索不是一回事，别混成一句。 */
 function kbEmbeddingNode() {
 	const embedding = state.kb.embedding;
 	const enabled = Boolean(embedding?.available);
@@ -5521,7 +5667,61 @@ function kbEmbeddingNode() {
 				: "语义检索未启用：按字面词匹配（到「模型」页选一条「向量」模型就能开启语义检索）",
 		),
 	);
+
+	const defaultCount = defaultKbLibraries().length;
+	const defaults = make("span", "kb-status__text kb-status__defaults");
+	defaults.classList.toggle("on", defaultCount > 0);
+	// 数据来自 /api/kb 每行的 isDefault；开关就在下面每个库一行的「设为对话默认」上
+	const summary =
+		defaultCount > 0
+			? `对话检索：已启用 ${defaultCount} 个库——不加载技能时，对话会直接在这几个库里检索`
+			: "对话检索：未启用——不加载技能时对话不会查知识库（在下面勾选「设为对话默认」即可开启）";
+	defaults.textContent = summary;
+	defaults.title = defaultCount > 0
+		? `${defaultKbLibraries().map((lib) => lib.name ?? lib.id).join("、")}`
+		: "勾选任一知识库的「设为对话默认」，对话就能直接用它的内容回答";
+	line.appendChild(defaults);
 	return line;
+}
+
+/** 「对话默认检索」的库：GET /api/kb 每行的 isDefault 是唯一真相，前端不另存一份。 */
+function defaultKbLibraries() {
+	return state.kb.libraries.filter((lib) => lib.isDefault === true);
+}
+
+/** 知识库页的操作提示（对话框外那句）：成功绿、失败红，只画在页面里。 */
+function setKbNotice(text, isError) {
+	state.kb.notice = text ? { text, error: Boolean(isError) } : null;
+}
+
+function kbNoticeNode() {
+	const notice = state.kb.notice;
+	if (!notice) return null;
+	return make("div", notice.error ? "module-notice err kb-defaults-notice" : "module-notice kb-defaults-notice", notice.text);
+}
+
+/** PUT /api/kb/defaults 是覆盖式：每次都把"当前所有勾选的库"整体提交，而不是只提被点的那一个。 */
+async function saveKbDefaults(kbIds) {
+	if (state.kb.savingDefaults) return;
+	state.kb.savingDefaults = true;
+	const result = await requestJson("/api/kb/defaults", "PUT", { kbIds });
+	state.kb.savingDefaults = false;
+	if (!result.ok) {
+		// 后端 { error } 中文原样给用户；重画一遍让开关退回服务端的真实状态（别留下"看起来已开"的错觉）
+		setKbNotice(requestError(result, "保存对话默认检索失败"), true);
+		if (state.module === "knowledge") renderModuleView();
+		return;
+	}
+	const saved = Array.isArray(result.data?.kbIds) ? result.data.kbIds : kbIds;
+	const count = saved.length;
+	setKbNotice(
+		count > 0
+			? `已设为对话默认检索：${count} 个知识库（不加载技能时对话会直接查它们）。`
+			: "已关闭对话默认检索：不加载技能时对话不会再查知识库。",
+		false,
+	);
+	await refreshKb();
+	if (state.module === "knowledge") renderModuleView();
 }
 
 function kbListColumn() {
@@ -5549,6 +5749,7 @@ function kbListColumn() {
 		nameNode.title = lib.name ?? lib.id;
 		row.appendChild(nameNode);
 		row.appendChild(make("span", "kb-item-meta", `${lib.docCount ?? 0} 文档 · ${lib.chunkCount ?? 0} 块`));
+		row.appendChild(kbDefaultToggle(lib));
 		row.addEventListener("click", () => void selectKbLibrary(lib.id));
 		row.addEventListener("keydown", (event) => {
 			if (event.key !== "Enter" && event.key !== " ") return;
@@ -5558,6 +5759,42 @@ function kbListColumn() {
 		col.appendChild(row);
 	}
 	return col;
+}
+
+/** 每个库一行的「设为对话默认」开关：数据只信 GET /api/kb 的 isDefault，勾选状态不在前端缓存。 */
+function kbDefaultToggle(lib) {
+	const label = make("label", "kb-default");
+	label.title = `对话不加载技能时也查这个库：勾上后，会话里问到的相关内容会直接从「${lib.name ?? lib.id}」里找。`;
+	const box = make("input", "kb-default__box");
+	box.type = "checkbox";
+	box.value = lib.id;
+	box.checked = lib.isDefault === true;
+	box.setAttribute("aria-label", `把「${lib.name ?? lib.id}」设为对话默认检索`);
+	// 只读的角色也能看状态：置灰 + title 说明原因，真正的拦截在后端（PUT 回 403）
+	if (!canWriteWorkflow()) {
+		box.disabled = true;
+		box.title = KB_DEFAULT_WRITE_TITLE;
+		label.title = KB_DEFAULT_WRITE_TITLE;
+	}
+	box.addEventListener("change", () => {
+		if (!canWriteWorkflow()) return;
+		// 覆盖式接口：以"勾选后的完整集合"为准，而不是被测库的布尔值
+		const kbIds = [];
+		for (const item of state.kb.libraries) {
+			if (item.id === lib.id) {
+				if (box.checked) kbIds.push(item.id);
+			} else if (item.isDefault === true) {
+				kbIds.push(item.id);
+			}
+		}
+		void saveKbDefaults(kbIds);
+	});
+	// 行本身是"选中这个库"的按钮：点开关（含文字）不该顺带切换右边详情，也不该触发行的键盘处理
+	label.addEventListener("click", (event) => event.stopPropagation());
+	label.addEventListener("keydown", (event) => event.stopPropagation());
+	label.appendChild(box);
+	label.appendChild(make("span", "kb-default__text", "设为对话默认"));
+	return label;
 }
 
 function currentKbLibrary() {
@@ -6554,10 +6791,37 @@ function addUserMessage(text) {
 	els.threadInner.appendChild(wrap);
 	state.runEl = null;
 	state.answerEl = null;
+	state.thinkingEl = null;
 	scrollToBottom(true);
 }
 
+/**
+ * 思考过程：推理模型（reasoning）会先吐思考再吐正文。
+ * 单独一块、默认折起——它不该挤占回答的视觉位置，但想看的人点一下就能看。
+ */
+function appendThinking(delta) {
+	ensureRun();
+	if (!state.thinkingEl) {
+		const box = make("details", "thinking");
+		const summary = make("summary", "thinking__toggle", "思考中…");
+		state.thinkingEl = make("div", "thinking__body");
+		box.appendChild(summary);
+		box.appendChild(state.thinkingEl);
+		state.runEl.appendChild(box);
+	}
+	state.thinkingEl.textContent += delta;
+	scrollToBottom();
+}
+
+/** 正文一开始就把「思考中…」改成「思考过程」：模型已经想完在写回答了。 */
+function settleThinking() {
+	const box = state.thinkingEl?.parentNode;
+	const toggle = box?.querySelector?.(".thinking__toggle");
+	if (toggle && toggle.textContent === "思考中…") toggle.textContent = "思考过程";
+}
+
 function appendText(delta) {
+	settleThinking();
 	ensureRun();
 	if (!state.answerEl) {
 		state.answerEl = make("div", "answer");
@@ -6755,6 +7019,7 @@ async function openSession(id) {
 	els.threadInner.innerHTML = "";
 	state.runEl = null;
 	state.answerEl = null;
+	state.thinkingEl = null;
 	for (const turn of view.transcript) {
 		if (turn.role === "user") {
 			addUserMessage(turn.text);
@@ -6814,6 +7079,9 @@ function handle(event) {
 		case "text":
 			appendText(event.delta);
 			break;
+		case "thinking":
+			appendThinking(event.delta);
+			break;
 		case "tool_start":
 			addToolStart(event);
 			break;
@@ -6837,6 +7105,7 @@ function handle(event) {
 			finalizeAnswer(event.text);
 			state.runEl = null;
 			state.answerEl = null;
+			state.thinkingEl = null;
 			void refreshSessions();
 			break;
 		case "error":
@@ -6886,15 +7155,69 @@ els.attachBtn.addEventListener("click", () => els.fileInput.click());
 els.fileInput.addEventListener("change", async () => {
 	const file = els.fileInput.files?.[0];
 	if (!file) return;
-	if (file.size > 400_000) {
-		alert("文件太大（上限 400KB）");
+	// 文本类小文件本地直读（省一次往返）；PDF/Word 必须送服务端解析
+	const isPlain = /\.(txt|md|json|csv|log|ya?ml)$/i.test(file.name);
+	if (isPlain && file.size <= 400_000) {
+		const content = await file.text();
+		state.attachments.push({ name: file.name, content: content.slice(0, 60_000) });
+		renderAttachments();
+		els.fileInput.value = "";
 		return;
 	}
-	const content = await file.text();
-	state.attachments.push({ name: file.name, content: content.slice(0, 60_000) });
-	renderAttachments();
+	await addAttachmentFromBytes(file);
 	els.fileInput.value = "";
 });
+
+/**
+ * PDF / Word 等二进制附件：交给服务端的解析器（与知识库同一套 unpdf / mammoth），
+ * 浏览器里没有 PDF 解析能力，也不该为此引一个几百 KB 的库。
+ */
+async function addAttachmentFromBytes(file) {
+	try {
+		setAttachBusy(true);
+		const buffer = await file.arrayBuffer();
+		const response = await api("/api/kb/extract", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ filename: file.name, contentBase64: bytesToBase64(buffer) }),
+		});
+		const data = await response.json().catch(() => ({}));
+		if (!response.ok) {
+			addNotice(data.error ?? `解析「${file.name}」失败（HTTP ${response.status}）`, true);
+			return;
+		}
+		state.attachments.push({ name: file.name, content: data.text });
+		renderAttachments();
+		// 截断要如实说：用户以为全文都进去了，回答却漏了后半段，比报错还糟
+		if (data.totalChars > data.text.length) {
+			addNotice(
+				`「${file.name}」共 ${data.totalChars} 字，附件最多送 ${data.text.length} 字（已截断）`,
+				false,
+			);
+		}
+	} catch {
+		addNotice(`解析「${file.name}」失败：无法连接服务，请稍后重试。`, true);
+	} finally {
+		setAttachBusy(false);
+	}
+}
+
+/** ArrayBuffer → base64（浏览器 FileReader 也行，但这里是纯同步、无回调）。 */
+function bytesToBase64(buffer) {
+	const bytes = new Uint8Array(buffer);
+	let binary = "";
+	// 分片拼接：一次性 apply 十万级参数会爆栈
+	const step = 0x8000;
+	for (let i = 0; i < bytes.length; i += step) {
+		binary += String.fromCharCode(...bytes.subarray(i, i + step));
+	}
+	return btoa(binary);
+}
+
+function setAttachBusy(busy) {
+	els.attachBtn.disabled = busy;
+	els.attachBtn.title = busy ? "正在解析附件…" : "附加文件（文本 / PDF / Word）";
+}
 
 function buildOutgoingText(value) {
 	if (state.attachments.length === 0) return value;
@@ -6944,12 +7267,285 @@ if (!SpeechRecognitionCtor) {
 
 /* ---------------- 交互绑定 ---------------- */
 
+/* ---------------- 斜杠命令面板 ---------------- */
+
+/**
+ * 输入框里敲 `/` 弹出的命令面板。
+ *
+ * 两个约定：
+ * 1. **命令表是数据，不是 if-else**：加一条命令只改 SLASH_COMMANDS，别去改 keydown 分支；
+ * 2. **命令直接调既有函数**（setSkill / setSessionArchived / toggleDrawer / newChat），
+ *    不要在这里另写一遍请求——一份逻辑两个入口最容易漂移。
+ */
+const SLASH_COMMANDS = [
+	{
+		id: "compact",
+		label: "压缩",
+		hint: "把这段对话的上下文压缩成摘要，腾出空间继续聊",
+		aliases: ["yasuo", "compact"],
+		run: () => void compactContext(),
+	},
+	{
+		id: "plan",
+		label: "计划模式",
+		hint: "先只做分析、出方案，不动数据（只读模式：中高风险工具会被拦截）",
+		aliases: ["jihua", "plan"],
+		run: () => void switchToPlanMode(),
+	},
+	{
+		id: "skill",
+		label: "加载技能",
+		hint: "把一条技能装进当前会话（等于在「技能」页点那一条）",
+		aliases: ["jineng", "skill"],
+		run: () => openSkillPickerFromSlash(),
+	},
+	{
+		id: "skills",
+		label: "退出技能",
+		hint: "回到会话原本的流程，不再用技能",
+		aliases: ["tuichu", "exit"],
+		run: () => void setSkill(null),
+	},
+	{
+		id: "goal",
+		label: "设定目标",
+		hint: "告诉模型这一轮到底要达成什么，它会在回答前先对齐目标",
+		aliases: ["mubiao", "goal"],
+		run: () => void startGoalPrompt(),
+	},
+	{
+		id: "drawer",
+		label: "运行详情",
+		hint: "打开右侧抽屉：当前进度 + 审计流水",
+		aliases: ["xiangqing", "detail"],
+		run: () => toggleDrawer(true),
+	},
+	{
+		id: "archive",
+		label: "归档当前对话",
+		hint: "收进左栏「已归档」，需要时能取消归档",
+		aliases: ["guidang", "archive"],
+		run: () => void archiveCurrentFromSlash(),
+	},
+	{
+		id: "new",
+		label: "新建对话",
+		hint: "开一个新的「自动编排」会话",
+		aliases: ["xinjian", "new"],
+		run: () => void newChat(),
+	},
+];
+
+/** 面板里实际展示的项：有技能目录时把每条技能也列出来（敲 / 就能直接换技能）。 */
+function slashItems() {
+	const items = SLASH_COMMANDS.slice();
+	for (const skill of state.skillCatalog) {
+		// 自动编排是默认模式，加载它等于什么都没换（和服务端面板过滤一致）
+		if (skill.id === "auto-flow") continue;
+		items.push({
+			id: `skill:${skill.id}`,
+			label: skill.name,
+			hint: "技能 · 直接装进当前会话",
+			aliases: [skill.id],
+			run: () => void setSkill(skill.id),
+		});
+	}
+	return items;
+}
+
+function slashMatches(query) {
+	const q = query.trim().toLowerCase();
+	if (!q) return slashItems();
+	return slashItems().filter((item) =>
+		[item.label, ...(item.aliases ?? [])].some((word) => String(word).toLowerCase().includes(q)),
+	);
+}
+
+function closeSlash() {
+	if (!state.slash.open) return;
+	state.slash.open = false;
+	state.slash.index = 0;
+	state.slash.query = "";
+	els.slash.hidden = true;
+	els.slash.innerHTML = "";
+}
+
+function renderSlash() {
+	const items = slashMatches(state.slash.query);
+	els.slash.innerHTML = "";
+	if (items.length === 0) {
+		els.slash.appendChild(make("div", "slash-empty", "没有匹配的命令，按 Esc 关闭"));
+		els.slash.hidden = false;
+		return;
+	}
+	// 高亮可能因为过滤变短而越界，先夹回合法范围
+	state.slash.index = Math.max(0, Math.min(state.slash.index, items.length - 1));
+	items.forEach((item, index) => {
+		const row = make("button", "slash-item", null);
+		row.type = "button";
+		row.dataset.slashId = item.id;
+		row.classList.toggle("active", index === state.slash.index);
+		row.appendChild(make("span", "slash-item__slash", "/"));
+		row.appendChild(make("span", "slash-item__label", item.label));
+		row.appendChild(make("span", "slash-item__hint", item.hint ?? ""));
+		// mousedown 里就执行：blur 会先于 click 把面板关掉
+		row.addEventListener("mousedown", (event) => {
+			event.preventDefault();
+			runSlashItem(item);
+		});
+		els.slash.appendChild(row);
+	});
+	els.slash.hidden = false;
+}
+
+/**
+ * 技能目录平时只在「技能」页才拉；命令面板不该逼用户先去那页一趟，
+ * 所以第一次打开时补一次（拿不到就只显示内置命令，不影响用）。
+ * 每次只发一个请求：并发敲键时用 inFlight 挡住重复拉取。
+ */
+let slashSkillsInFlight = false;
+function ensureSlashSkills() {
+	if (state.skillCatalog.length > 0 || slashSkillsInFlight) return;
+	slashSkillsInFlight = true;
+	void refreshSkillCatalog()
+		.then(() => {
+			slashSkillsInFlight = false;
+			if (state.slash.open) renderSlash();
+		})
+		.catch(() => {
+			slashSkillsInFlight = false;
+		});
+}
+
+function openSlash() {
+	state.slash.open = true;
+	state.slash.index = 0;
+	state.slash.query = "";
+	renderSlash();
+	ensureSlashSkills();
+}
+
+/** 输入框内容以 "/" 开头时，把后面的部分当作过滤词；不在开头就关掉面板。 */
+function syncSlashFromInput() {
+	const value = els.input.value;
+	if (!value.startsWith("/")) {
+		closeSlash();
+		return;
+	}
+	// 已经敲了空格 = 在写正文，不是在挑命令
+	const rest = value.slice(1);
+	if (rest.includes(" ")) {
+		closeSlash();
+		return;
+	}
+	state.slash.open = true;
+	state.slash.query = rest;
+	renderSlash();
+	ensureSlashSkills();
+}
+
+function runSlashItem(item) {
+	// 先清空输入框：命令是"动作"，不是要发出去的消息
+	els.input.value = "";
+	els.input.style.height = "auto";
+	closeSlash();
+	els.input.focus();
+	item.run();
+}
+
+function runHighlightedSlash() {
+	const items = slashMatches(state.slash.query);
+	const item = items[state.slash.index];
+	if (!item) return false;
+	runSlashItem(item);
+	return true;
+}
+
+async function archiveCurrentFromSlash() {
+	if (!state.currentId) {
+		addNotice("先打开一个对话，再归档。", true);
+		return;
+	}
+	await setSessionArchived(state.currentId, true);
+}
+
+/**
+ * 「计划模式」：平台没有单独的 plan 档位，落到已有的只读权限上——
+ * 只读 = 只放行低风险工具，恰好就是"只分析不动数据"。
+ * 已经在只读时再执行一次就切回完全访问（命令是开关，不是单向）。
+ */
+async function switchToPlanMode() {
+	if (!state.currentId) {
+		addNotice("先打开一个对话，再切换计划模式。", true);
+		return;
+	}
+	const current = state.currentView?.permissionMode ?? "full";
+	await setPermission(current === "readonly" ? "full" : "readonly");
+}
+
+/** 「设定目标」：不编造一个 goal 系统，先把目标框进输入框让用户补充。 */
+async function startGoalPrompt() {
+	els.input.value = "本轮目标：";
+	els.input.style.height = "auto";
+	els.input.style.height = `${Math.min(els.input.scrollHeight, 180)}px`;
+	els.input.focus();
+	// 光标放末尾，用户接着写
+	els.input.setSelectionRange(els.input.value.length, els.input.value.length);
+}
+
+/** 「加载技能」：技能多的时候一层菜单放不下，直接弹既有菜单让用户挑。 */
+function openSkillPickerFromSlash() {
+	const skills = state.skillCatalog.filter((skill) => skill.id !== "auto-flow");
+	if (skills.length === 0) {
+		addNotice("还没有可用技能，先去「技能」页新建一条。", true);
+		return;
+	}
+	openMenu(els.input, skills.map((skill) => ({
+		label: skill.name,
+		hint: skill.builtin ? "内置技能" : "自定义技能",
+		checked: state.currentView?.activeSkillId === skill.id,
+		onClick: () => void setSkill(skill.id),
+	})));
+}
+
+/** 「压缩」：平台还没有真的摘要压缩，别假装做到了——说清现状并给出可行做法。 */
+async function compactContext() {
+	addNotice(
+		"当前平台还没有「压缩上下文」功能：会话历史会按窗口自动截断（保留系统提示 + 最近若干条）。想立刻腾出空间，最稳的做法是开一个新对话，把必要的背景贴进去。",
+		false,
+	);
+}
+
 els.input.addEventListener("input", () => {
 	els.input.style.height = "auto";
 	els.input.style.height = `${Math.min(els.input.scrollHeight, 180)}px`;
+	syncSlashFromInput();
 });
 
 els.input.addEventListener("keydown", (event) => {
+	// 命令面板打开时吞掉上下键 / 回车 / Tab：回车是"选中命令"，不是"发送消息"
+	if (state.slash.open) {
+		if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+			event.preventDefault();
+			const count = slashMatches(state.slash.query).length;
+			if (count > 0) {
+				const step = event.key === "ArrowDown" ? 1 : -1;
+				state.slash.index = (state.slash.index + step + count) % count;
+				renderSlash();
+			}
+			return;
+		}
+		if (event.key === "Enter" || event.key === "Tab") {
+			event.preventDefault();
+			runHighlightedSlash();
+			return;
+		}
+		if (event.key === "Escape") {
+			event.preventDefault();
+			closeSlash();
+			return;
+		}
+	}
 	if (event.key === "Enter" && !event.shiftKey) {
 		event.preventDefault();
 		els.composer.requestSubmit();
@@ -7091,8 +7687,10 @@ async function setPermission(mode) {
 }
 
 els.modelSelect.addEventListener("click", async (event) => {
-	const data = await (await api("/api/models")).json();
+	// 必须在第一个 await 之前取：事件派发结束后浏览器会把 currentTarget 置空，
+	// 等到 await 回来再读就是 null，菜单会定位失败（曾经表现为弹到左上角）
 	const anchor = event.currentTarget;
+	const data = await (await api("/api/models")).json();
 
 	if (data.mode === "simulated") {
 		openMenu(anchor, [

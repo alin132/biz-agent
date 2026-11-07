@@ -44,8 +44,12 @@
  *   POST   /api/sessions/:id/approve    审批决定 { requestId, approved }
  *   GET    /api/approvals               审批中心：全局挂起中的审批 { items, total }
  *   POST   /api/approvals/:sessionId    在审批中心处理某条审批 { requestId, approved }
+ *   POST   /api/sessions/:id/model       会话级换模型 { modelId }（不动全局当前模型）
  *   POST   /api/sessions/:id/permissions 权限模式 { mode }
  *   POST   /api/sessions/:id/skills      加载/退出技能 { skillId: string | null }
+ *   POST   /api/sessions/:id/model       会话级换模型 { modelId }
+ *   POST   /api/sessions/:id/plan        计划模式开关 { enabled }
+ *   POST   /api/sessions/:id/compact     压缩上下文（旧消息总结成摘要）
  *   GET    /api/skills                  技能目录（内置流程 + 自定义流程都能当技能）
  *   POST   /api/auth/login              登录 { email, password } → { token, user }
  *   POST   /api/auth/logout             退出（无状态 JWT，仅语义端点）→ { ok: true }
@@ -60,6 +64,7 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,7 +79,10 @@ import { handleKb, initKb } from "./kb/index.js";
 import { supportedKeyEnvs } from "./llm.js";
 import { initMcp } from "./mcp/index.js";
 import { handleModelsRoute } from "./models/routes.js";
+import { handleAgents } from "./agents/routes.js";
+import { AgentService } from "./agents/service.js";
 import { initModels } from "./models/service.js";
+import { PluginService, handlePluginRoute } from "./plugins/service.js";
 import { createObservability, handleMonitorRoute } from "./observability/index.js";
 import { handleOpenApiRoute } from "./openapi/routes.js";
 import { SessionHub } from "./session.js";
@@ -82,7 +90,16 @@ import { WorkflowHttpError, WorkflowRepo } from "./workflows.js";
 
 loadEnvFile();
 
-const WEB_DIR = resolve(fileURLToPath(new URL("../web/", import.meta.url)));
+/**
+ * 静态资源根：优先用 Vite 构建产物（client/dist），没有就回落到旧的原生控制台（web/）。
+ *
+ * 为什么这样做：前端正在从「原生 JS 零构建」迁到 Vue + Naive UI，
+ * 两种形态要能长期共存——构建产物不在（没跑 build、或回退排查）时服务照样能开，
+ * 不会因为缺一个 dist 就把整个控制台变 404。
+ */
+const WEB_LEGACY_DIR = resolve(fileURLToPath(new URL("../web/", import.meta.url)));
+const WEB_DIST_DIR = resolve(fileURLToPath(new URL("../client/dist/", import.meta.url)));
+const WEB_DIR = existsSync(join(WEB_DIST_DIR, "index.html")) ? WEB_DIST_DIR : WEB_LEGACY_DIR;
 const PORT = Number(process.env.PORT ?? 4317);
 const DATA_DIR = resolve(fileURLToPath(new URL("../data/", import.meta.url)));
 const DB_PATH = process.env.DB_PATH ? resolve(process.env.DB_PATH) : join(DATA_DIR, "biz-agent.db");
@@ -111,6 +128,9 @@ const repo = new WorkflowRepo(db);
 const models = initModels({ storage: db });
 // 开放 API 的 API Key（P4）：库 + 令牌桶
 const apiKeys = createApiKeyService(db);
+// Agent 实体（P10）：六维配置 + 状态机。只依赖存储层，不碰会话——Agent 是"配置"，
+// 会话是"运行实例"，两者解耦，别把会话搬进来。
+const agents = new AgentService({ storage: db });
 // 监控与可观测（P9）：每轮消息一条调用链 + 批量落 trace_events；不传存储以外的东西，
 // MCP 服务名解析通过注册表查（可观测模块本身不依赖 MCP）。
 const observability = createObservability({
@@ -126,7 +146,16 @@ const observability = createObservability({
 		return undefined;
 	},
 });
-const hub = new SessionHub(db, repo, (modelId) => models.resolveRuntime(modelId), observability);
+// 会话级模型：resolveRuntime 决定这一轮到底用哪个真实模型，resolveModelKey 决定会话记的是哪一行。
+// 两者都交给 models 模块，会话层不自己去认模型表。
+const hub = new SessionHub(
+	db,
+	repo,
+	(modelId) => models.resolveRuntime(modelId),
+	observability,
+	(modelId) => models.modelKeyOf(modelId),
+);
+const plugins = new PluginService(db, repo, mcp.registry, hub);
 const storage = db.info();
 // 鉴权：AUTH_MODE 未设置时是 off（全部放行，行为与 P2 一致）；required 时验 Bearer 令牌 + 四角色矩阵
 const auth = initAuth(db);
@@ -278,6 +307,11 @@ const server = createServer((req, res) => {
 			return;
 		}
 
+		// ---- Agent 实体（/api/agents*）：六维配置 CRUD + 状态机动作 ----
+		if (await handleAgents(req, res, agents)) {
+			return;
+		}
+
 		// ---- 开放 API 的 Key 管理（/api/api-keys*） ----
 		if (await handleApiKeysRoute(req, res, url, apiKeys)) {
 			return;
@@ -285,6 +319,9 @@ const server = createServer((req, res) => {
 
 		// ---- MCP 集成（/api/mcp*）：注册 / 发现 / 调用 / 工具启停 ----
 		if (await mcp.handle(req, res, url, auth)) {
+			return;
+		}
+		if (await handlePluginRoute(req, res, url, plugins, auth)) {
 			return;
 		}
 
@@ -326,6 +363,7 @@ const server = createServer((req, res) => {
 					steps: skill.steps.length,
 					tools: skill.tools,
 					builtin: repo.isBuiltin(skill.id),
+					readonly: repo.isReadOnly(skill.id),
 				})),
 			);
 			return;
@@ -358,8 +396,8 @@ const server = createServer((req, res) => {
 			if (method === "DELETE") {
 				// 删流程 = 连它的会话一起删（否则这些会话找不到流程，会从列表里凭空消失）；
 				// 再清掉别的会话里"正挂着这条技能"的引用，让它们退回自己的流程
-				const sessionsRemoved = hub.removeByWorkflow(workflowId);
 				repo.remove(workflowId);
+				const sessionsRemoved = hub.removeByWorkflow(workflowId);
 				const skillsCleared = hub.detachSkill(workflowId);
 				json(res, 200, { removed: true, sessionsRemoved, skillsCleared });
 				return;
@@ -375,11 +413,49 @@ const server = createServer((req, res) => {
 			const body = await readBody(req);
 			const workflowId = String(body.workflowId ?? "");
 			// 不指定就用"当前模型"（P6）；指定时既可以是库里的模型行 id，也可以是供应商的 modelId
-			const modelId =
+			let modelId =
 				typeof body.modelId === "string" && body.modelId.trim() ? body.modelId.trim() : models.currentModelKey();
+			// 跟某个 Agent 对话：六维配置在这里落地成一次真实会话（模型 / 人格 / 能力绑定）
+			const agentId = typeof body.agentId === "string" && body.agentId.trim() ? body.agentId.trim() : "";
+			let agent: import("./session.js").SessionAgent | undefined;
+			if (agentId) {
+				const record = db.getAgent(agentId);
+				if (!record) {
+					json(res, 404, { error: `未知 Agent: ${agentId}` });
+					return;
+				}
+				// 状态机硬规则：停用的 Agent 不能对话（与 service.assertChattable 同一语义，不重复实现）
+				try {
+					agents.assertChattable(record.id);
+				} catch (error) {
+					json(res, 409, {
+						error: error instanceof Error ? error.message : String(error),
+						code: "stopped_not_chattable",
+					});
+					return;
+				}
+				agent = {
+					id: record.id,
+					name: record.name,
+					prompt: record.agentsMd,
+					skillIds: record.skillIds,
+					kbIds: record.kbIds,
+					modelConfig: record.modelConfig,
+					memoryConfig: record.memoryConfig,
+					advancedConfig: record.advancedConfig,
+				};
+				// 未显式指定模型时，用 Agent 自己的模型策略（这就是"配置生效"的地方）
+				if (!(typeof body.modelId === "string" && body.modelId.trim()) && record.modelConfig.chatModelId) {
+					modelId = record.modelConfig.chatModelId;
+				}
+			}
 			try {
 				// ownerId 落进会话 payload：developer 在监控页只能看到自己创建的会话调用链
-				const session = hub.create(workflowId, { modelId, ownerId: auth.userOf(req)?.id ?? null });
+				const session = hub.create(workflowId, {
+					modelId,
+					ownerId: auth.userOf(req)?.id ?? null,
+					agent,
+				});
 				json(res, 201, session.view());
 			} catch (error) {
 				json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -443,6 +519,10 @@ const server = createServer((req, res) => {
 			}
 
 			if (action === "/messages" && method === "POST") {
+				try { session.assertChattable(); } catch (error) {
+					json(res, 409, { error: error instanceof Error ? error.message : String(error), code: "stopped_not_chattable" });
+					return;
+				}
 				const body = await readBody(req);
 				const text = String(body.text ?? "").trim();
 				if (text.length === 0) {
@@ -455,6 +535,11 @@ const server = createServer((req, res) => {
 				return;
 			}
 
+			if (action === "/stop" && method === "POST") {
+				json(res, 200, { stopped: session.stop() });
+				return;
+			}
+
 			if (action === "/approve" && method === "POST") {
 				const body = await readBody(req);
 				const requestId = String(body.requestId ?? "");
@@ -464,10 +549,63 @@ const server = createServer((req, res) => {
 				return;
 			}
 
+			// 会话级换模型：只影响这一条会话。全局「当前模型」（POST /api/models/current）管的是
+			// 「之后新建的会话用哪条模型」，拿它当会话内切换会把别的会话一起换掉，是另一件事。
+			if (action === "/model" && method === "POST") {
+				const body = await readBody(req);
+				const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+				if (modelId.length === 0) {
+					json(res, 400, { error: "modelId 必须是非空字符串" });
+					return;
+				}
+				try {
+					const view = session.setModel(modelId);
+					json(res, 200, {
+						session: view,
+						modelId: view.modelId,
+						modelKey: view.modelKey ?? null,
+						mode: view.mode,
+						modeLabel: view.modeLabel,
+						// 列表一起回：页面切完模型正好用它重画下拉，省一次往返
+						models: models.options(),
+					});
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					// 这一轮还在跑（换模型会让同一轮前后两次请求用不同模型）：409，让界面提示稍后再试
+					json(res, message.includes("正在执行中") ? 409 : 400, { error: message });
+				}
+				return;
+			}
+
 			if (action === "/permissions" && method === "POST") {
 				const body = await readBody(req);
 				const mode = body.mode === "readonly" ? "readonly" : "full";
 				json(res, 200, { permissionMode: session.setPermissionMode(mode) });
+				return;
+			}
+
+			if (action === "/plan" && method === "POST") {
+				// 计划模式：会话级开关，落进 payload 才能跨重启保持
+				const body = await readBody(req);
+				if (typeof body.enabled !== "boolean") {
+					json(res, 400, { error: "enabled 必须是布尔值" });
+					return;
+				}
+				try {
+					json(res, 200, session.setPlanMode(body.enabled));
+				} catch (error) {
+					json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+				}
+				return;
+			}
+
+			if (action === "/compact" && method === "POST") {
+				// 压缩上下文：把旧消息总结成一段，历史换成「摘要 + 最近 N 条」
+				try {
+					json(res, 200, await session.compact());
+				} catch (error) {
+					json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+				}
 				return;
 			}
 

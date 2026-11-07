@@ -12,6 +12,10 @@ import { DatabaseSync } from "node:sqlite";
 import type { WorkflowSkillText, WorkflowStep } from "../../src/core/types.js";
 import { DEFAULT_WORKSPACE_ID } from "./types.js";
 import type {
+	AgentInput,
+	AgentPatch,
+	AgentRecord,
+	AgentStatus,
 	ApiKeyInput,
 	ApiKeyPatch,
 	ApiKeyRecord,
@@ -44,6 +48,7 @@ import type {
 	McpToolRecord,
 	McpTransport,
 	PersistedSession,
+	PluginRecord,
 	RemoveProviderResult,
 	Role,
 	Storage,
@@ -65,6 +70,7 @@ import type {
 /** workflows 表的行（列名是下划线风格，只在这一层做映射）。 */
 interface WorkflowDbRow {
 	id: string;
+	plugin_id?: string | null;
 	name: string;
 	system_prompt: string;
 	steps: string;
@@ -87,8 +93,20 @@ const SCHEMA_DDL = `
 		payload     TEXT NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions (updated_at DESC);
+	CREATE TABLE IF NOT EXISTS plugins (
+		id TEXT PRIMARY KEY,
+		workspace_id TEXT NOT NULL DEFAULT 'default',
+		name TEXT NOT NULL,
+		version TEXT NOT NULL,
+		description TEXT NOT NULL,
+		manifest TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS workflows (
 		id            TEXT PRIMARY KEY,
+		plugin_id     TEXT,
 		name          TEXT NOT NULL,
 		system_prompt TEXT NOT NULL,
 		steps         TEXT NOT NULL,
@@ -144,6 +162,11 @@ const SCHEMA_DDL = `
 		updated_at     INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_models_provider ON models (provider_id, kind);
+	CREATE TABLE IF NOT EXISTS model_settings (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id                 TEXT PRIMARY KEY,
 		workspace_id       TEXT NOT NULL DEFAULT 'default',
@@ -245,6 +268,26 @@ const SCHEMA_DDL = `
 		UNIQUE (bot_id, conversation_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_im_sessions_bot ON im_sessions (bot_id, updated_at DESC);
+	CREATE TABLE IF NOT EXISTS agents (
+		id                TEXT PRIMARY KEY,
+		workspace_id      TEXT NOT NULL DEFAULT 'default',
+		name              TEXT NOT NULL,
+		description       TEXT NOT NULL DEFAULT '',
+		category          TEXT NOT NULL DEFAULT '',
+		icon              TEXT NOT NULL DEFAULT '',
+		agents_md         TEXT NOT NULL DEFAULT '',
+		model_config      TEXT NOT NULL DEFAULT '{}',
+		memory_config     TEXT NOT NULL DEFAULT '{}',
+		advanced_config   TEXT NOT NULL DEFAULT '{}',
+		skill_ids         TEXT NOT NULL DEFAULT '[]',
+		kb_ids            TEXT NOT NULL DEFAULT '[]',
+		status            TEXT NOT NULL DEFAULT 'draft',
+		created_by        TEXT,
+		created_at        INTEGER NOT NULL,
+		updated_at        INTEGER NOT NULL,
+		status_changed_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_agents_status ON agents (status, updated_at DESC);
 `;
 
 /**
@@ -253,6 +296,7 @@ const SCHEMA_DDL = `
  */
 const EXTRA_COLUMNS: { table: string; name: string; ddl: string }[] = [
 	{ table: "workflows", name: "skill", ddl: "ALTER TABLE workflows ADD COLUMN skill TEXT" },
+	{ table: "workflows", name: "plugin_id", ddl: "ALTER TABLE workflows ADD COLUMN plugin_id TEXT" },
 	// P7 MCP：老库可能只建了 0001 那版（没有 env / 最近一次发现状态），启动时补齐
 	{ table: "mcp_servers", name: "env", ddl: "ALTER TABLE mcp_servers ADD COLUMN env TEXT" },
 	{
@@ -349,17 +393,13 @@ export class SqliteStorage implements Storage {
 	saveWorkflow(row: WorkflowRow): void {
 		this.db
 			.prepare(
-				`INSERT INTO workflows (id, name, system_prompt, steps, skill, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)
-				 ON CONFLICT(id) DO UPDATE SET
-					name          = excluded.name,
-					system_prompt = excluded.system_prompt,
-					steps         = excluded.steps,
-					skill         = excluded.skill,
-					updated_at    = excluded.updated_at`,
+				`INSERT INTO workflows (id, plugin_id, name, system_prompt, steps, skill, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(id) DO UPDATE SET plugin_id=excluded.plugin_id, name=excluded.name, system_prompt=excluded.system_prompt, steps=excluded.steps, skill=excluded.skill, updated_at=excluded.updated_at`,
 			)
 			.run(
 				row.id,
+				row.pluginId ?? null,
 				row.name,
 				row.systemPrompt,
 				JSON.stringify(row.steps),
@@ -371,7 +411,7 @@ export class SqliteStorage implements Storage {
 
 	getWorkflow(id: string): WorkflowRow | undefined {
 		const row = this.db
-			.prepare("SELECT id, name, system_prompt, steps, skill, created_at, updated_at FROM workflows WHERE id = ?")
+			.prepare("SELECT id, plugin_id, name, system_prompt, steps, skill, created_at, updated_at FROM workflows WHERE id = ?")
 			.get(id) as WorkflowDbRow | undefined;
 		return row ? this.toWorkflowRow(row) : undefined;
 	}
@@ -379,7 +419,7 @@ export class SqliteStorage implements Storage {
 	listWorkflows(): WorkflowRow[] {
 		const rows = this.db
 			.prepare(
-				"SELECT id, name, system_prompt, steps, skill, created_at, updated_at FROM workflows ORDER BY created_at ASC",
+				"SELECT id, plugin_id, name, system_prompt, steps, skill, created_at, updated_at FROM workflows ORDER BY created_at ASC",
 			)
 			.all() as unknown as WorkflowDbRow[];
 		return rows.map((row) => this.toWorkflowRow(row));
@@ -393,6 +433,7 @@ export class SqliteStorage implements Storage {
 	private toWorkflowRow(row: WorkflowDbRow): WorkflowRow {
 		return {
 			id: row.id,
+			...(row.plugin_id ? { pluginId: row.plugin_id } : {}),
 			name: row.name,
 			systemPrompt: row.system_prompt,
 			steps: JSON.parse(row.steps) as WorkflowStep[],
@@ -585,7 +626,55 @@ export class SqliteStorage implements Storage {
 		return Number(row.total);
 	}
 
+	/* ---------------- 插件包 ---------------- */
+
+	listPlugins(): PluginRecord[] {
+		return (this.db.prepare("SELECT * FROM plugins WHERE workspace_id = 'default' ORDER BY created_at ASC").all() as Record<string, unknown>[]).map((row) => ({
+			id: String(row.id), name: String(row.name), version: String(row.version), description: String(row.description),
+			manifest: JSON.parse(String(row.manifest)) as Record<string, unknown>, enabled: Number(row.enabled) !== 0,
+			createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+		}));
+	}
+
+	getPlugin(id: string): PluginRecord | undefined {
+		return this.listPlugins().find((plugin) => plugin.id === id);
+	}
+
+	createPlugin(plugin: PluginRecord): PluginRecord {
+		this.db.prepare("INSERT INTO plugins (id,workspace_id,name,version,description,manifest,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+			.run(plugin.id, "default", plugin.name, plugin.version, plugin.description, JSON.stringify(plugin.manifest), plugin.enabled ? 1 : 0, plugin.createdAt, plugin.updatedAt);
+		return plugin;
+	}
+
+	updatePlugin(id: string, patch: Partial<Pick<PluginRecord, "enabled" | "manifest" | "updatedAt">>): PluginRecord | undefined {
+		const current = this.getPlugin(id);
+		if (!current) return undefined;
+		const next = { ...current, ...patch };
+		this.db.prepare("UPDATE plugins SET manifest=?, enabled=?, updated_at=? WHERE id=? AND workspace_id = 'default'")
+			.run(JSON.stringify(next.manifest), next.enabled ? 1 : 0, next.updatedAt, id);
+		return next;
+	}
+
+	removePlugin(id: string): boolean {
+		return Number(this.db.prepare("DELETE FROM plugins WHERE id=? AND workspace_id = 'default'").run(id).changes) > 0;
+	}
+
 	/* ---------------- 多模型管理（P6） ---------------- */
+
+	getModelSetting(key: string): string | undefined {
+		const row = this.db.prepare("SELECT value FROM model_settings WHERE key = ?").get(key) as { value: string } | undefined;
+		return row?.value;
+	}
+
+	setModelSetting(key: string, value: string | null): void {
+		if (value === null) {
+			this.db.prepare("DELETE FROM model_settings WHERE key = ?").run(key);
+			return;
+		}
+		this.db.prepare(
+			"INSERT INTO model_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+		).run(key, value, Date.now());
+	}
 
 	private static readonly PROVIDER_COLUMNS =
 		"id, name, kind, base_url, api_key_encrypted, enabled, created_at, updated_at";
@@ -1333,9 +1422,174 @@ export class SqliteStorage implements Storage {
 		};
 	}
 
+	/* ---------------- Agent 实体（P10） ---------------- */
+
+	private static readonly AGENT_COLUMNS =
+		"id, workspace_id, name, description, category, icon, agents_md, model_config, memory_config, advanced_config, skill_ids, kb_ids, status, created_by, created_at, updated_at, status_changed_at";
+
+	listAgents(): AgentRecord[] {
+		const rows = this.db
+			.prepare(`SELECT ${SqliteStorage.AGENT_COLUMNS} FROM agents ORDER BY updated_at DESC`)
+			.all() as unknown as AgentDbRow[];
+		return rows.map(toAgentRecord);
+	}
+
+	getAgent(id: string): AgentRecord | undefined {
+		const row = this.db.prepare(`SELECT ${SqliteStorage.AGENT_COLUMNS} FROM agents WHERE id = ?`).get(id) as
+			| AgentDbRow
+			| undefined;
+		return row ? toAgentRecord(row) : undefined;
+	}
+
+	createAgent(input: AgentInput): AgentRecord {
+		this.db
+			.prepare(
+				`INSERT INTO agents (id, workspace_id, name, description, category, icon, agents_md, model_config, memory_config, advanced_config, skill_ids, kb_ids, status, created_by, created_at, updated_at, status_changed_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				input.id,
+				DEFAULT_WORKSPACE_ID,
+				input.name,
+				input.description ?? "",
+				input.category ?? "",
+				input.icon ?? "",
+				input.agentsMd ?? "",
+				JSON.stringify(input.modelConfig ?? {}),
+				JSON.stringify(input.memoryConfig ?? {}),
+				JSON.stringify(input.advancedConfig ?? {}),
+				JSON.stringify(input.skillIds ?? []),
+				JSON.stringify(input.kbIds ?? []),
+				input.status,
+				input.createdBy ?? null,
+				input.createdAt,
+				input.updatedAt,
+				input.statusChangedAt,
+			);
+		return this.getAgent(input.id)!;
+	}
+
+	updateAgent(id: string, patch: AgentPatch): AgentRecord | undefined {
+		if (this.getAgent(id) === undefined) return undefined;
+		const sets = ["updated_at = ?"];
+		const values: (string | number | null)[] = [patch.updatedAt ?? Date.now()];
+		if (patch.name !== undefined) {
+			sets.push("name = ?");
+			values.push(patch.name);
+		}
+		if (patch.description !== undefined) {
+			sets.push("description = ?");
+			values.push(patch.description);
+		}
+		if (patch.category !== undefined) {
+			sets.push("category = ?");
+			values.push(patch.category);
+		}
+		if (patch.icon !== undefined) {
+			sets.push("icon = ?");
+			values.push(patch.icon);
+		}
+		if (patch.agentsMd !== undefined) {
+			sets.push("agents_md = ?");
+			values.push(patch.agentsMd);
+		}
+		if (patch.modelConfig !== undefined) {
+			sets.push("model_config = ?");
+			values.push(JSON.stringify(patch.modelConfig));
+		}
+		if (patch.memoryConfig !== undefined) {
+			sets.push("memory_config = ?");
+			values.push(JSON.stringify(patch.memoryConfig));
+		}
+		if (patch.advancedConfig !== undefined) {
+			sets.push("advanced_config = ?");
+			values.push(JSON.stringify(patch.advancedConfig));
+		}
+		if (patch.skillIds !== undefined) {
+			sets.push("skill_ids = ?");
+			values.push(JSON.stringify(patch.skillIds));
+		}
+		if (patch.kbIds !== undefined) {
+			sets.push("kb_ids = ?");
+			values.push(JSON.stringify(patch.kbIds));
+		}
+		this.db.prepare(`UPDATE agents SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+		return this.getAgent(id);
+	}
+
+	setAgentStatus(id: string, status: AgentStatus, at: number): AgentRecord | undefined {
+		this.db
+			.prepare("UPDATE agents SET status = ?, status_changed_at = ?, updated_at = ? WHERE id = ?")
+			.run(status, at, at, id);
+		return this.getAgent(id);
+	}
+
+	removeAgent(id: string): boolean {
+		return Number(this.db.prepare("DELETE FROM agents WHERE id = ?").run(id).changes) > 0;
+	}
+
+	countAgents(): number {
+		const row = this.db.prepare("SELECT COUNT(*) AS total FROM agents").get() as { total: number };
+		return Number(row.total);
+	}
+
 	close(): void {
 		this.db.close();
 	}
+}
+
+/** Agent 表的行（列名下划线，只在这一层映射）。 */
+interface AgentDbRow {
+	id: string;
+	workspace_id: string;
+	name: string;
+	description: string;
+	category: string;
+	icon: string;
+	agents_md: string;
+	model_config: string;
+	memory_config: string;
+	advanced_config: string;
+	skill_ids: string;
+	kb_ids: string;
+	status: string;
+	created_by: string | null;
+	created_at: number;
+	updated_at: number;
+	status_changed_at: number;
+}
+
+/** JSON 列读回：库里的坏数据不该让整页崩，读不出来就当空对象/空数组 */
+function parseJson<T>(text: string | null, fallback: T): T {
+	if (!text) return fallback;
+	try {
+		const parsed = JSON.parse(text) as T;
+		return parsed ?? fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+function toAgentRecord(row: AgentDbRow): AgentRecord {
+	return {
+		id: row.id,
+		workspaceId: row.workspace_id,
+		name: row.name,
+		description: row.description ?? "",
+		category: row.category ?? "",
+		icon: row.icon ?? "",
+		agentsMd: row.agents_md ?? "",
+		modelConfig: parseJson(row.model_config, {}),
+		memoryConfig: parseJson(row.memory_config, {}),
+		advancedConfig: parseJson(row.advanced_config, {}),
+		skillIds: parseJson(row.skill_ids, [] as string[]),
+		kbIds: parseJson(row.kb_ids, [] as string[]),
+		status: (row.status as AgentStatus) ?? "draft",
+		createdBy: row.created_by,
+		createdAt: Number(row.created_at),
+		updatedAt: Number(row.updated_at),
+		statusChangedAt: Number(row.status_changed_at),
+	};
 }
 
 /** IM 机器人表的行（列名下划线，只在这一层映射）。 */

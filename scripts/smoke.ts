@@ -5,7 +5,7 @@
  *       `LLM_DISABLE=1` 起服务（强制模拟模型），否则断言会随模型输出漂移。
  * 跑法：npm run smoke
  *
- * 覆盖八条主链路：
+ * 覆盖九条主链路：
  *   A. 工单流程 —— 四个工具依次执行，流程走完
  *   B. 审批流程 —— 高风险工具触发审批事件，人工同意后继续并归档
  *   C. 健康检查与会话重命名 —— /api/health 探针（含模型与存储后端）+ PATCH 标题的各类边界
@@ -17,6 +17,8 @@
  *      技能绑定（含非法 id 与清空）、删文档/删库的级联计数
  *   H. 审批中心 —— 跨会话的全局待办：GET 列表字段、在中心里放行、放行后待办清空，
  *      以及 409（已处理）/404（会话不存在）/400（参数非法）
+ *   J. 会话级模型 —— POST /api/sessions/:id/model 只换这一条会话（全局当前模型一动不动）、
+ *      选中的模型行 id 落库并在重建会话后仍解析回同一个模型、异常入参；模拟实例如实拒绝
  */
 
 import { flowToolName } from "../src/core/flowTools.js";
@@ -783,6 +785,8 @@ interface KnowledgeBaseView {
 	embeddedChunkCount: number;
 	/** 库里有向量才算 true（没配 EMBEDDING_API_KEY 时恒为 false） */
 	embedding: boolean;
+	/** 是否设为「对话默认检索」的库（问答不走技能时查它） */
+	isDefault?: boolean;
 }
 
 interface KbDocumentView {
@@ -980,6 +984,46 @@ async function scenarioKnowledgeBase(): Promise<void> {
 	assert(
 		listAfterDelete.status === 200 && !listAfterDelete.data.some((kb) => kb.id === kbId),
 		"删库后 GET /api/kb 列表里没有它",
+	);
+
+	// --- 对话默认检索：不加载技能，问答也能查到资料（RAG 主路径） ---
+	const defaultsBefore = await api<{ kbIds: string[] }>("GET", "/api/kb/defaults");
+	const pausedDefaults = defaultsBefore.data.kbIds ?? [];
+	const ragKb = await api<KnowledgeBaseView>("POST", "/api/kb", { name: `冒烟对话检索库-${Date.now().toString(36)}` });
+	assert(ragKb.status === 201, `建「对话检索」用库返回 201（HTTP ${ragKb.status}）`);
+	await api("POST", `/api/kb/${ragKb.data.id}/documents`, {
+		filename: "差旅报销规则.md",
+		contentBase64: Buffer.from("# 差旅报销规则\n\n住宿费上限每晚 600 元，超出的部分需要总经理审批。", "utf8").toString("base64"),
+	});
+	const setDefaults = await api<{ kbIds: string[] }>("PUT", "/api/kb/defaults", { kbIds: [ragKb.data.id] });
+	assert(
+		setDefaults.status === 200 && setDefaults.data.kbIds.length === 1,
+		`PUT /api/kb/defaults 设为对话默认检索（HTTP ${setDefaults.status}）`,
+	);
+	const listWithDefault = await api<KnowledgeBaseView[]>("GET", "/api/kb");
+	assert(
+		listWithDefault.data.find((item) => item.id === ragKb.data.id)?.isDefault === true,
+		"GET /api/kb 的行带 isDefault（页面开关据此回显）",
+	);
+
+	// 不加载技能 → 直接在 auto-flow 会话里问；模拟模型会按 example 调 kb_search，
+	// 会话视角断言工具集里带着 kb_search（真正的检索逻辑由 kb:selftest 覆盖）
+	const ragSession = await createSession("auto-flow");
+	const ragDetail = await api<{ tools: string[]; activeSkillId: string | null }>("GET", `/api/sessions/${ragSession.id}`);
+	assert(
+		ragDetail.status === 200 &&
+			ragDetail.data.activeSkillId === null &&
+			ragDetail.data.tools.includes("kb_search"),
+		`没有加载技能的新会话也带着 kb_search（技能 ${String(ragDetail.data.activeSkillId)}）`,
+	);
+
+	// 收尾：恢复场景开始前的默认库设置，再删掉临时库
+	await api("PUT", "/api/kb/defaults", { kbIds: pausedDefaults });
+	await api("DELETE", `/api/kb/${ragKb.data.id}`);
+	const defaultsAfter = await api<{ kbIds: string[] }>("GET", "/api/kb/defaults");
+	assert(
+		defaultsAfter.data.kbIds.length === pausedDefaults.length,
+		`收尾恢复默认库设置（${defaultsAfter.data.kbIds.length} 个）`,
 	);
 }
 
@@ -1273,6 +1317,199 @@ async function scenarioApprovalCenter(): Promise<void> {
 	assert(badApproved.status === 400, `approved 非布尔返回 400（HTTP ${badApproved.status}）`);
 }
 
+/* ---------------- 场景 J：会话级模型（与全局当前模型隔离） ---------------- */
+
+/** GET /api/models 的形状：`current` 是 modelId 字符串，`models` 是模型行（有内部 id）。 */
+interface ModelsView {
+	mode: "live" | "simulated";
+	current: string;
+	label: string;
+	options: { id: string; label: string }[];
+	providers: ProviderView[];
+	models: ModelView[];
+}
+
+/** SessionView 里与模型有关的那几个字段（断言只用这几项，免得跟着别的字段一起改）。 */
+interface SessionModelView {
+	id: string;
+	mode: "live" | "simulated";
+	modeLabel: string;
+	modelId: string | null;
+	modelKey?: string | null;
+}
+
+interface ModelSwitchView {
+	session: SessionModelView;
+	modelId: string | null;
+	modelKey: string | null;
+	mode: "live" | "simulated";
+	modeLabel: string;
+	models: { id: string; label: string }[];
+}
+
+/**
+ * 会话级换模型：`POST /api/sessions/:id/model`。
+ *
+ * 这个场景要守住的核心事实只有一条：**换的是这一条会话，不是全局当前模型**。
+ * 全局那个（POST /api/models/current）管的是「之后新建的会话用哪条模型」，
+ * 拿它当会话内切换用，会让别的会话下一轮也跟着换——所以这里专门断言
+ * 「切换前后 GET /api/models 的 current 一点没变」。
+ *
+ * 模拟实例（LLM_DISABLE=1）走的是另一条分支：没有真实模型可切，接口必须如实拒绝，
+ * 不能回一个 200 让人以为切成功了。两条分支都断言，公共 smoke 实例是哪一种都能跑。
+ */
+async function scenarioSessionModel(): Promise<void> {
+	console.log("\n[J] 会话级模型（与全局当前模型隔离）");
+
+	const models = await api<ModelsView>("GET", "/api/models");
+	assert(models.status === 200 && (models.data.mode === "live" || models.data.mode === "simulated"),
+		`GET /api/models 返回 200 且带 mode（${String(models.data.mode)}）`);
+
+	// 上一轮跑崩可能留下「冒烟对话模型-xxx」：先清掉，否则第二次跑会因模型名重复而校验失败
+	for (const leftover of models.data.models.filter((row) => row.name.startsWith("冒烟对话模型-"))) {
+		await api("DELETE", `/api/models/${leftover.id}`);
+	}
+
+	// 全局当前模型在整段场景里必须一动不动：它就是「别的会话有没有被串台」的观测点
+	const globalBefore = await api<{ current?: string }>("GET", "/api/models/current");
+
+	const session = await createSession("auto-flow");
+	const created = await api<SessionModelView>("GET", `/api/sessions/${session.id}`);
+	assert(created.status === 200,
+		`新建会话可读（HTTP ${created.status}）`);
+	assert(created.data.mode === models.data.mode,
+		`会话的 mode 与实例一致（${String(created.data.mode)} / ${String(models.data.mode)}）`);
+
+	if (models.data.mode === "simulated") {
+		// 模拟实例：没有真实模型可切，接口要如实拒绝（这正是「如实标注模拟模型」的后端一半）
+		const refused = await api<{ error?: string }>("POST", `/api/sessions/${session.id}/model`, {
+			modelId: "whatever-model",
+		});
+		assert(refused.status === 400,
+			`模拟实例上换模型返回 400 而不是假装成功（HTTP ${refused.status}）`);
+		assert(String(refused.data.error ?? "").includes("模拟模型"),
+			`拒绝文案点明是模拟模型（${String(refused.data.error)}）`);
+	} else {
+		// 真实实例：临时建两条独立的对话模型（不复用用户已有模型，也不改它们的启用状态）
+		const provider = models.data.providers.find((item) => item.enabled !== false);
+		assert(provider !== undefined, "有可用的供应商用来建临时模型");
+		const stamp = Date.now().toString(36);
+		const providers = await api<{ items: ProviderView[] }>("GET", "/api/models/providers");
+		const owner = providers.data.items.find((item) => item.id === provider?.id);
+		const madeA = await api<ModelView>("POST", "/api/models", {
+			providerId: owner?.id,
+			modelId: owner?.kind === "deepseek" ? "deepseek-v4-pro" : "smoke-chat-a",
+			name: `冒烟对话模型-A-${stamp}`,
+			kind: "chat",
+			enabled: true,
+		});
+		const madeB = await api<ModelView>("POST", "/api/models", {
+			providerId: owner?.id,
+			modelId: owner?.kind === "deepseek" ? "deepseek-chat" : "smoke-chat-b",
+			name: `冒烟对话模型-B-${stamp}`,
+			kind: "chat",
+			enabled: true,
+		});
+		assert(madeA.status === 201 && madeB.status === 201,
+			`临时建出两条对话模型（HTTP ${madeA.status} / ${madeB.status}）`);
+
+		// --- 切到 A：会话记住的是模型行 id（重启后才能按它重新解析） ---
+		const toA = await api<ModelSwitchView>("POST", `/api/sessions/${session.id}/model`, {
+			modelId: madeA.data.id,
+		});
+		assert(toA.status === 200 && toA.data.session.modelKey === madeA.data.id,
+			`切换后会话记的是模型行 id（${String(toA.data.session.modelKey)}）`);
+		assert(toA.data.session.modelId === madeA.data.modelId,
+			`切换后会话用的是该模型的 modelId（${String(toA.data.session.modelId)}）`);
+		assert(Array.isArray(toA.data.models) && toA.data.models.length > 0,
+			`返回体带可选模型列表，页面不用再请求一次（${toA.data.models?.length ?? 0} 条）`);
+
+		// --- 核心：全局当前模型没被动过 ---
+		const globalAfter = await api<{ current?: string }>("GET", "/api/models/current");
+		assert(globalAfter.data.current === globalBefore.data.current,
+			`会话级换模型不动全局当前模型（${String(globalBefore.data.current)} → ${String(globalAfter.data.current)}）`);
+
+		// --- 落库：重新 GET 回来的还是 A（这就是「重启后仍是这个模型」的那一半） ---
+		const reget = await api<SessionModelView>("GET", `/api/sessions/${session.id}`);
+		assert(reget.data.modelKey === madeA.data.id && reget.data.modelId === madeA.data.modelId,
+			`重新读取会话仍是切换后的模型（${String(reget.data.modelKey)}）`);
+
+		// --- 隔离：另一条会话不受影响 ---
+		const other = await createSession("auto-flow");
+		const otherView = await api<SessionModelView>("GET", `/api/sessions/${other.id}`);
+		assert(otherView.data.modelKey !== madeA.data.id,
+			`别的会话没有被一起换掉（另一条记的是 ${String(otherView.data.modelKey)}）`);
+
+		// --- 核心：重建会话后仍是切后的模型（= 重启服务后重进对话的口径） ---
+		//
+		// 为什么单独钉这一条：会话从前是拿 payload 里的 `modelId`(显示名快照) 当解析依据的，
+		// 那是个显示用的字符串，重启后会解析回旧模型——「换完重启又变回去」就是这么来的。
+		// 走 DELETE 接口的会话级重建会从库里重新 load 会话，正是这条路径的回归口。
+		const rebuilt = await api<SessionModelView>("POST", "/api/sessions", {
+			workflowId: "auto-flow",
+			modelId: madeA.data.id,
+		});
+		assert(rebuilt.status === 201 && rebuilt.data.modelKey === madeA.data.id,
+			`带 modelId 建会话时记的是模型行 id（${String(rebuilt.data.modelKey)}）`);
+		const reloaded = await api<SessionModelView>("GET", `/api/sessions/${rebuilt.data.id}`);
+		assert(reloaded.data.modelKey === madeA.data.id && reloaded.data.modelId === madeA.data.modelId,
+			`重建会话后仍解析回同一个模型（key=${String(reloaded.data.modelKey)} / modelId=${String(reloaded.data.modelId)}）`);
+		await api("DELETE", `/api/sessions/${rebuilt.data.id}`);
+
+		// --- 再切到 B：同一条会话可以换第二次，且落库跟上 ---
+		const toB = await api<ModelSwitchView>("POST", `/api/sessions/${session.id}/model`, {
+			modelId: madeB.data.id,
+		});
+		assert(toB.status === 200 && toB.data.session.modelKey === madeB.data.id,
+			`再次切换后记的是新模型行（${String(toB.data.session.modelKey)}）`);
+
+		// --- 入参校验：不存在的模型 / 空 modelId ---
+		const unknownModel = await api<{ error?: string }>("POST", `/api/sessions/${session.id}/model`, {
+			modelId: "model-does-not-exist",
+		});
+		assert(unknownModel.status === 400,
+			`库里没有的模型返回 400（HTTP ${unknownModel.status}）`);
+
+		// 清掉两条临时模型（会话模型会退回模拟/当前模型，用例不依赖它们活着）
+		await api("DELETE", `/api/models/${madeA.data.id}`);
+		await api("DELETE", `/api/models/${madeB.data.id}`);
+	}
+
+	// --- 入参校验（两种实例都要过）：空 modelId 400、未知会话 404 ---
+	const empty = await api<{ error?: string }>("POST", `/api/sessions/${session.id}/model`, {});
+	assert(empty.status === 400, `缺 modelId 返回 400（HTTP ${empty.status}）`);
+
+	const missing = await api<{ error?: string }>("POST", "/api/sessions/no-such-session/model", {
+		modelId: "x",
+	});
+	assert(missing.status === 404, `未知会话返回 404（HTTP ${missing.status}）`);
+
+	await api("DELETE", `/api/sessions/${session.id}`);
+}
+async function scenarioPlugins(): Promise<void> {
+	console.log("\n[I] 插件（清单导入 / 技能注册 / 启停 / 卸载）");
+	const manifest = { schemaVersion: "biz-agent.plugin.v1", id: "smoke-plugin", name: "冒烟插件", version: "1.0.0", description: "隔离 smoke 插件", skills: [{ id: "helper", name: "插件助手", systemPrompt: "按插件说明协助用户。", description: "检查插件技能", instructions: "只处理测试请求。", steps: [] }] };
+	const imported = await api<{ id?: string; skills?: string[] }>("POST", "/api/plugins/import", { manifest });
+	assert(imported.status === 201 && imported.data.id === manifest.id && imported.data.skills?.includes("插件助手") === true, "插件清单导入成功并返回技能名称（HTTP " + imported.status + "）");
+	const skillId = "plugin-smoke-plugin-helper";
+	const skills = await api<{ id: string }[]>("GET", "/api/skills");
+	assert(skills.status === 200 && skills.data.some((skill) => skill.id === skillId), "导入技能进入 /api/skills 技能目录");
+	const listed = await api<{ items?: { id: string; enabled: boolean }[] }>("GET", "/api/plugins");
+	assert(listed.status === 200 && listed.data.items?.some((plugin) => plugin.id === manifest.id && plugin.enabled) === true, "插件列表返回已启用插件");
+	const disabled = await api<{ enabled?: boolean }>("PATCH", "/api/plugins/" + manifest.id, { enabled: false });
+	assert(disabled.status === 200 && disabled.data.enabled === false, "停用插件成功");
+	const afterDisable = await api<{ id: string }[]>("GET", "/api/skills");
+	assert(!afterDisable.data.some((skill) => skill.id === skillId), "停用插件后技能不再出现在目录");
+	const enabled = await api<{ enabled?: boolean }>("PATCH", "/api/plugins/" + manifest.id, { enabled: true });
+	assert(enabled.status === 200 && enabled.data.enabled === true, "重新启用插件成功");
+	const bad = await api<{ error?: string }>("POST", "/api/plugins/import", { manifest: { ...manifest, id: "bad-plugin", mcpServers: [{ name: "unsafe", transport: "stdio", command: "node" }] } });
+	assert(bad.status === 400, "插件清单拒绝本地 stdio 命令");
+	const removed = await api<{ removed?: boolean }>("DELETE", "/api/plugins/" + manifest.id);
+	assert(removed.status === 200 && removed.data.removed === true, "卸载插件成功");
+	const afterRemove = await api<{ id: string }[]>("GET", "/api/skills");
+	assert(!afterRemove.data.some((skill) => skill.id === skillId), "卸载后移除插件技能");
+}
+
 async function main(): Promise<void> {
 	console.log(`冒烟测试目标: ${BASE}`);
 	const summary: string[] = [];
@@ -1291,6 +1528,8 @@ async function main(): Promise<void> {
 	await runScenario("G 知识库 RAG", scenarioKnowledgeBase);
 	await runScenario("G2 向量模型接通知识库", scenarioEmbeddingModelWiring);
 	await runScenario("H 审批中心", scenarioApprovalCenter);
+	await runScenario("I 插件", scenarioPlugins);
+	await runScenario("J 会话级模型", scenarioSessionModel);
 
 	console.log(`\n冒烟测试全部通过：${assertions} 项断言（${summary.join("、")}）`);
 	process.exit(0);

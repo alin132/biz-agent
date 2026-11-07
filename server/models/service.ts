@@ -23,6 +23,8 @@ import type { ModelView } from "./store.js";
 /** `.env` 兜底供应商的名字：`SECRET_KEY` 变了导致解不开时，只有它允许回落 .env。 */
 export const DEFAULT_PROVIDER_NAME = "default";
 const PING_TIMEOUT_MS = 8000;
+const CURRENT_MODEL_SETTING = "current_chat_model";
+const EMBEDDING_MODEL_SETTING = "current_embedding_model";
 
 export interface HealthModel {
 	mode: "live" | "simulated";
@@ -121,13 +123,19 @@ export interface EmbeddingModelConfig {
 export class ModelService {
 	readonly store: ModelStore;
 	private currentKey: string | null;
-	/** 用户选中的「向量模型」：只存内存，与当前对话模型同一套语义（重启按规则重挑） */
+	/** 用户选中的向量模型 ID 从存储层恢复；无效时回退到第一条可用模型。 */
 	private embeddingKey: string | null = null;
 
-	constructor(storage: Storage) {
+	constructor(private readonly storage: Storage) {
 		this.store = new ModelStore(storage);
-		this.currentKey = this.pickInitialCurrent();
-		this.embeddingKey = this.pickInitialEmbedding();
+		this.currentKey = storage.getModelSetting(CURRENT_MODEL_SETTING) ?? null;
+		this.embeddingKey = storage.getModelSetting(EMBEDDING_MODEL_SETTING) ?? null;
+		this.currentRow();
+		this.embeddingRow();
+		if (this.currentKey === null) this.currentKey = this.pickInitialCurrent();
+		if (this.embeddingKey === null) this.embeddingKey = this.pickInitialEmbedding();
+		storage.setModelSetting(CURRENT_MODEL_SETTING, this.currentKey);
+		storage.setModelSetting(EMBEDDING_MODEL_SETTING, this.embeddingKey);
 	}
 
 	/** 首次启动：没配 key 就不建；已经建过任何供应商就完全不动（幂等）。 */
@@ -156,6 +164,7 @@ export class ModelService {
 			});
 			if (this.currentKey === null) {
 				this.currentKey = model.id;
+				this.storage.setModelSetting(CURRENT_MODEL_SETTING, model.id);
 			}
 			console.log(`模型管理: 已用 .env 的 key 建出 default 供应商（${env.label} · ${env.modelId}）`);
 		} catch (error) {
@@ -187,11 +196,26 @@ export class ModelService {
 			.modelRows()
 			.find((model) => model.kind === "chat" && model.enabled && this.providerEnabled(model.providerId));
 		this.currentKey = fallback?.id ?? null;
+		this.storage.setModelSetting(CURRENT_MODEL_SETTING, this.currentKey);
 		return fallback ?? null;
 	}
 
 	currentModelKey(): string | undefined {
 		return this.currentRow()?.id;
+	}
+
+	/**
+	 * 把「模型行 id 或供应商那边的模型名」归一成模型行 id。
+	 *
+	 * 会话级换模型要落库记「用户选的是哪一行」——重启后按它对上同一条模型行重新解析。
+	 * 库里没有就返回 null：会话照记不误（下次启动仍按它解析），只是当下解析不出真实模型；
+	 * 传空值则回落到「当前模型」，与建会话时不传 modelId 的行为一致。
+	 */
+	modelKeyOf(modelId?: string): string | null {
+		if (typeof modelId === "string" && modelId.trim().length > 0) {
+			return this.store.findModelByKey(modelId.trim())?.id ?? null;
+		}
+		return this.currentRow()?.id ?? null;
 	}
 
 	/** 挑一条可用的向量模型：用户选过的优先，否则第一条启用且供应商启用的。 */
@@ -211,6 +235,7 @@ export class ModelService {
 			.modelRows()
 			.find((row) => row.kind === "embedding" && row.enabled && this.providerEnabled(row.providerId));
 		this.embeddingKey = fallback?.id ?? null;
+		this.storage.setModelSetting(EMBEDDING_MODEL_SETTING, this.embeddingKey);
 		return fallback ?? null;
 	}
 
@@ -301,6 +326,7 @@ export class ModelService {
 			throw new ModelError(400, "供应商已停用，不能把它的模型设为向量模型");
 		}
 		this.embeddingKey = row.id;
+		this.storage.setModelSetting(EMBEDDING_MODEL_SETTING, row.id);
 		return this.embeddingView();
 	}
 
@@ -340,6 +366,7 @@ export class ModelService {
 			throw new ModelError(400, "供应商已停用，不能把它的模型设为当前模型");
 		}
 		this.currentKey = row.id;
+		this.storage.setModelSetting(CURRENT_MODEL_SETTING, row.id);
 		return this.currentView();
 	}
 

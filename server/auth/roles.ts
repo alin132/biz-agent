@@ -91,6 +91,9 @@ export function denyMessage(role: Role, permission: Permission): string {
  */
 export function permissionFor(method: string, pathname: string): Permission | null {
 	const write = method === "POST" || method === "PATCH" || method === "PUT" || method === "DELETE";
+	if (pathname === "/api/agents" || pathname.startsWith("/api/agents/")) {
+		return write ? "workflow.write" : "workflow.read";
+	}
 
 	if (pathname === "/api/audit") {
 		return "audit.read";
@@ -151,7 +154,7 @@ export function permissionFor(method: string, pathname: string): Permission | nu
 			return "session.read";
 		}
 		// 让模型干活的几个子接口算"运行"，其余算"增删改会话"
-		if (/^\/api\/sessions\/[^/]+\/(messages|skills|approve|permissions)$/.test(pathname)) {
+		if (/^\/api\/sessions\/[^/]+\/(messages|skills|approve|permissions|stop)$/.test(pathname)) {
 			return "session.run";
 		}
 		return "session.write";

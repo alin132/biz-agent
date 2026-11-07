@@ -271,6 +271,20 @@ async function main(): Promise<void> {
 		expectModelError(() => service.setCurrent(""), 400, "不能为空");
 	});
 
+	await check("当前对话与向量模型选择在重建服务后仍保留", () => {
+		const secondChat = store.createModel({ providerId: provider.id, name: "另一个对话模型", modelId: "second-chat" });
+		const service = new ModelService(storage);
+		service.setCurrent(secondChat.id);
+		service.setEmbeddingModel(embeddingModel.id);
+		const restarted = new ModelService(storage);
+		assert.equal(restarted.currentModelKey(), secondChat.id);
+		assert.equal(restarted.embeddingView().modelKey, embeddingModel.id);
+		storage.removeModel(secondChat.id);
+		const recovered = new ModelService(storage);
+		assert.equal(recovered.currentModelKey(), chatModel.id, "所选模型删除后回退到第一条可用 chat 模型");
+		assert.equal(storage.getModelSetting("current_chat_model"), chatModel.id);
+	});
+
 	await check("运行时解析：库里的当前模型 → LlmRuntime；LLM_DISABLE=1 → 交回 .env（undefined）", () => {
 		const service = new ModelService(storage);
 		service.setCurrent(chatModel.id);

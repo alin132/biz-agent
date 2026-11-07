@@ -69,6 +69,7 @@ export class WorkflowRepo {
 	private readonly builtinDefs: WorkflowDef[];
 	private defs: Record<string, WorkflowDef>;
 	private custom: WorkflowRow[] = [];
+	private plugins: import("./db/types.js").PluginRecord[] = [];
 	private broken = new Map<string, string>();
 
 	constructor(private readonly db: Storage) {
@@ -86,7 +87,7 @@ export class WorkflowRepo {
 
 	/** 全部可用流程定义（内置在前，自定义在后）。 */
 	all(): WorkflowDef[] {
-		return [...this.builtinDefs, ...this.custom.map((row) => this.defs[row.id]).filter((def): def is WorkflowDef => Boolean(def))];
+		return [...this.builtinDefs, ...this.custom.filter((row) => !row.pluginId || this.plugins.some((plugin) => plugin.id === row.pluginId && plugin.enabled)).map((row) => this.defs[row.id]).filter((def): def is WorkflowDef => Boolean(def))];
 	}
 
 	list(): WorkflowSummary[] {
@@ -96,7 +97,7 @@ export class WorkflowRepo {
 			builtin: true,
 			steps: workflow.steps.map((step) => ({ id: step.id, title: step.title, via: [...step.via] })),
 		}));
-		const custom: WorkflowSummary[] = this.custom.map((row) => ({
+		const custom: WorkflowSummary[] = this.custom.filter((row) => !row.pluginId || this.plugins.some((plugin) => plugin.id === row.pluginId && plugin.enabled)).map((row) => ({
 			id: row.id,
 			name: row.name,
 			builtin: false,
@@ -109,6 +110,7 @@ export class WorkflowRepo {
 	detail(id: string): WorkflowDetail {
 		const row = this.custom.find((item) => item.id === id);
 		if (row) {
+			if (row.pluginId && !this.plugins.some((plugin) => plugin.id === row.pluginId && plugin.enabled)) throw new WorkflowHttpError(`技能不存在: ${id}`, 404);
 			return { ...this.detailFromRow(row) };
 		}
 		const workflow = this.builtinDefs.find((item) => item.id === id);
@@ -152,6 +154,10 @@ export class WorkflowRepo {
 
 	isBuiltin(id: string): boolean {
 		return this.builtinIds.has(id);
+	}
+
+	isReadOnly(id: string): boolean {
+		return this.isBuiltin(id) || Boolean(this.custom.find((row) => row.id === id)?.pluginId);
 	}
 
 	/* ---------------- 变更 ---------------- */
@@ -223,6 +229,7 @@ export class WorkflowRepo {
 
 	private inputOf(id: string): WorkflowInput {
 		const row = this.custom.find((item) => item.id === id);
+		if (row?.pluginId) throw new WorkflowHttpError("插件管理的技能请通过插件启停和卸载", 403);
 		if (!row) {
 			throw new WorkflowHttpError(`流程不存在: ${id}`, 404);
 		}
@@ -238,7 +245,9 @@ export class WorkflowRepo {
 		if (this.builtinIds.has(id)) {
 			throw new WorkflowHttpError(`「${id}」是内置流程，不能修改或删除`, 403);
 		}
-		if (!this.custom.some((row) => row.id === id)) {
+		const row = this.custom.find((item) => item.id === id);
+		if (row?.pluginId) throw new WorkflowHttpError("插件管理的技能请通过插件启停和卸载", 403);
+		if (!row) {
 			throw new WorkflowHttpError(`流程不存在: ${id}`, 404);
 		}
 	}
@@ -272,10 +281,12 @@ export class WorkflowRepo {
 	 */
 	private reload(): void {
 		this.custom = this.db.listWorkflows();
+		this.plugins = this.db.listPlugins();
 		const next: Record<string, WorkflowDef> = indexWorkflows(this.builtinDefs);
 		this.broken = new Map();
 
 		for (const row of this.custom) {
+			if (row.pluginId && !this.plugins.some((plugin) => plugin.id === row.pluginId && plugin.enabled)) continue;
 			const viaNames = [...new Set(row.steps.flatMap((step) => step.via))];
 			try {
 				this.catalog.pick(createStore(), viaNames);
@@ -297,6 +308,8 @@ export class WorkflowRepo {
 	}
 
 	/** 供路由层判断"这条流程是否可用"（broken 的流程不允许建会话）。 */
+	refresh(): void { this.reload(); }
+
 	errorOf(id: string): string | undefined {
 		return this.broken.get(id);
 	}

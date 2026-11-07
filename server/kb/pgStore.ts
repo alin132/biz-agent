@@ -386,6 +386,30 @@ export function createKbPgStore(options: CreateKbPgStoreOptions): KbStore {
 			return rows.map((row) => String(row.kb_id));
 		},
 
+		setDefaultKbIds(kbIds) {
+			const unique = [...new Set(kbIds.map((id) => id.trim()).filter((id) => id.length > 0))];
+			const missing: string[] = [];
+			for (const kbId of unique) {
+				if (!findKnowledgeBase(kbId)) {
+					missing.push(kbId);
+				}
+			}
+			if (missing.length > 0) {
+				throw badRequest(`这些知识库不存在：${missing.join("、")}`);
+			}
+			const steps: { sql: string; params?: unknown[] }[] = [{ sql: "DELETE FROM kb_default_bindings" }];
+			for (const kbId of unique) {
+				steps.push({ sql: "INSERT INTO kb_default_bindings (kb_id) VALUES ($1)", params: [kbId] });
+			}
+			bridge.transaction(steps);
+		},
+
+		getDefaultKbIds() {
+			const rows = rowsOf(query("SELECT kb_id FROM kb_default_bindings ORDER BY kb_id"));
+			// 库被删后残留的绑定要跳过，否则检索会 404
+			return rows.map((row) => String(row.kb_id)).filter((kbId) => Boolean(findKnowledgeBase(kbId)));
+		},
+
 		listKnowledgeBasesByIds(ids) {
 			const unique = [...new Set(ids)];
 			if (unique.length === 0) {

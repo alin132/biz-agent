@@ -15,11 +15,22 @@ export interface TranscriptEntry {
 	role: "user" | "assistant";
 	text: string;
 	at: number;
+	/** 用户轮次的整轮耗时和工具记录。 */
+	durationMs?: number;
+	tools?: Array<{
+		id: string;
+		name: string;
+		args: unknown;
+		ok?: boolean;
+		result?: string;
+		durationMs?: number;
+	}>;
 }
 
 /** 自定义流程（运行时配置的那部分流程定义）。 */
 export interface WorkflowRow {
 	id: string;
+	pluginId?: string;
 	name: string;
 	systemPrompt: string;
 	steps: WorkflowStep[];
@@ -32,10 +43,29 @@ export interface WorkflowRow {
 	updatedAt: number;
 }
 
+export interface PluginRecord {
+	id: string;
+	name: string;
+	version: string;
+	description: string;
+	manifest: Record<string, unknown>;
+	enabled: boolean;
+	createdAt: number;
+	updatedAt: number;
+}
+
 export interface PersistedSession {
 	id: string;
 	workflowId: string;
 	modelId: string | null;
+	/**
+	 * 这条会话选中的模型记录 id（model-xxx）；缺省 = 没单独选过。
+	 *
+	 * 与全局「当前模型」不是一回事：全局那个只决定新建会话用哪条模型，
+	 * 会话级换模型（`POST /api/sessions/:id/model`）改的是这里，重启后按它重新解析，
+	 * 所以「换模型」不会串台到别的会话。老记录没有这个字段，按 null 处理。
+	 */
+	modelKey?: string | null;
 	mode: "live" | "simulated";
 	modeLabel: string;
 	permissionMode: "full" | "readonly";
@@ -54,10 +84,31 @@ export interface PersistedSession {
 	agentMessages: unknown[];
 	/** 当前加载的技能 id（= 流程 id）；老记录没有这个字段，视为没加载技能 */
 	activeSkillId?: string | null;
+	baseWorkflowState?: WorkflowState;
 	/** 建会话的用户 id（P9 监控据此把 developer 限制在自己的会话上；老记录没有就是 null） */
 	createdBy?: string | null;
 	/** 最近 20 条调用链 id（倒序）；老记录没有这个字段 */
 	traceIds?: string[];
+	/** 这条对话是跟哪个已发布的 Agent 聊的；null / 缺省 = 没用 Agent 的普通对话 */
+	agentId?: string | null;
+	/** 绑定的 Agent 名字（冗余存一份：展示用，且 Agent 被删后历史会话仍能显示当时的名字）。 */
+	agentName?: string | null;
+	/** 会话创建时的执行策略快照；旧记录回落到绑定 Agent。 */
+	agentConfig?: {
+		modelConfig: AgentModelConfig;
+		memoryConfig: AgentMemoryConfig;
+		advancedConfig: AgentAdvancedConfig;
+	};
+	/** 计划模式：会话级开关，落进 payload 才能跨重启保持（见 planModePromptOf） */
+	planMode?: boolean;
+	/** 最近一次上下文压缩的时间戳；null / 缺省 = 还没压缩过 */
+	compactedAt?: number | null;
+	/** 最近一次压缩生成的摘要原文（重开会话时前端要能显示回消息列表） */
+	summary?: string | null;
+	/** 最近一次模型请求的输入上下文 token 数。 */
+	contextTokens?: number;
+	/** true 表示该值由本地文本估算得出。 */
+	contextTokensEstimated?: boolean;
 }
 
 export type StorageKind = "sqlite" | "postgres";
@@ -612,6 +663,13 @@ export interface Storage {
 	clear(): number;
 	count(): number;
 
+	/* ---------------- 插件包 ---------------- */
+	listPlugins(): PluginRecord[];
+	getPlugin(id: string): PluginRecord | undefined;
+	createPlugin(plugin: PluginRecord): PluginRecord;
+	updatePlugin(id: string, patch: Partial<Pick<PluginRecord, "enabled" | "manifest" | "updatedAt">>): PluginRecord | undefined;
+	removePlugin(id: string): boolean;
+
 	/* ---------------- 自定义流程（内置流程在代码里，不落库） ---------------- */
 	saveWorkflow(row: WorkflowRow): void;
 	getWorkflow(id: string): WorkflowRow | undefined;
@@ -637,6 +695,8 @@ export interface Storage {
 	countAudit(filter?: Omit<AuditFilter, "limit" | "offset">): number;
 
 	/* ---------------- 多模型管理（P6） ---------------- */
+	getModelSetting(key: string): string | undefined;
+	setModelSetting(key: string, value: string | null): void;
 	listModelProviders(): ModelProviderRecord[];
 	getModelProvider(id: string): ModelProviderRecord | undefined;
 	createModelProvider(provider: ModelProviderInput): ModelProviderRecord;
@@ -706,7 +766,119 @@ export interface Storage {
 	 */
 	purgeTracesBefore(cutoffMs: number): { traces: number; events: number };
 
+	/* ---------------- Agent 实体（P10，同步契约） ---------------- */
+	listAgents(): AgentRecord[];
+	getAgent(id: string): AgentRecord | undefined;
+	createAgent(input: AgentInput): AgentRecord;
+	/** 只写传了的字段；id 不存在返回 undefined */
+	updateAgent(id: string, patch: AgentPatch): AgentRecord | undefined;
+	/** 只改状态与状态时间（状态机专用，避免和配置更新混在一起） */
+	setAgentStatus(id: string, status: AgentStatus, at: number): AgentRecord | undefined;
+	removeAgent(id: string): boolean;
+	countAgents(): number;
+
 	close(): void;
+}
+
+/* ---------------- Agent 实体（P10：六维配置 + 状态机） ---------------- */
+
+/**
+ * Agent 状态机：draft → testing → published → stopped，任意态可 revert 回 draft。
+ *
+ * 语义照搬 AgentOne，别自己发明：
+ *  - 仅 draft / testing / published 可对话，stopped 一律拒绝；
+ *  - 已发布（published）不可直接改配置，必须先 revert 回草稿。
+ */
+export type AgentStatus = "draft" | "testing" | "published" | "stopped";
+
+export type AgentAction = "test" | "publish" | "stop" | "revert";
+
+/** 模型策略：对应 AgentOne 的 modelConfig */
+export interface AgentModelConfig {
+	/** 模型记录的 id（model-xxx）；空 = 用当前模型 */
+	chatModelId?: string | null;
+	temperature?: number;
+	topP?: number;
+	maxTokens?: number;
+	stream?: boolean;
+}
+
+/** 记忆策略：对应 AgentOne 的 memoryConfig */
+export interface AgentMemoryConfig {
+	/** 短期记忆保留几轮 */
+	shortTermRounds?: number;
+	/** 溢出策略 */
+	overflowStrategy?: "sliding_window" | "summarize";
+}
+
+/** 高级配置：对应 AgentOne 的 advancedConfig，留给未来扩展 */
+export interface AgentAdvancedConfig {
+	/** 最大推理轮数 */
+	maxIters?: number;
+	/** 是否把思考过程透传给前端 */
+	showThinking?: boolean;
+	[key: string]: unknown;
+}
+
+export interface AgentRecord {
+	/** agent_xxx */
+	id: string;
+	workspaceId: string;
+	/** 基础信息（六维第一维） */
+	name: string;
+	description: string;
+	category: string;
+	icon: string;
+	/** 人格与指令：Markdown 源码，相当于 AGENTS.md */
+	agentsMd: string;
+	/** 模型策略 / 记忆 / 高级 */
+	modelConfig: AgentModelConfig;
+	memoryConfig: AgentMemoryConfig;
+	advancedConfig: AgentAdvancedConfig;
+	/** 能力绑定：技能 id 列表 + 知识库 id 列表 */
+	skillIds: string[];
+	kbIds: string[];
+	status: AgentStatus;
+	createdBy: string | null;
+	createdAt: number;
+	updatedAt: number;
+	/** 最近一次状态变更时间 */
+	statusChangedAt: number;
+}
+
+export interface AgentInput {
+	id: string;
+	name: string;
+	status: AgentStatus;
+	createdAt: number;
+	updatedAt: number;
+	statusChangedAt: number;
+	description?: string;
+	category?: string;
+	icon?: string;
+	agentsMd?: string;
+	modelConfig?: AgentModelConfig;
+	memoryConfig?: AgentMemoryConfig;
+	advancedConfig?: AgentAdvancedConfig;
+	skillIds?: string[];
+	kbIds?: string[];
+	createdBy?: string | null;
+}
+
+/** PATCH 语义与流程/模型一致：字段不传 = 不改 */
+export interface AgentPatch {
+	/** 由服务层填；直接调 DAO 时要自己给 */
+	updatedAt?: number;
+	name?: string;
+	description?: string;
+	category?: string;
+	icon?: string;
+	agentsMd?: string;
+	modelConfig?: AgentModelConfig;
+	memoryConfig?: AgentMemoryConfig;
+	advancedConfig?: AgentAdvancedConfig;
+	skillIds?: string[];
+	kbIds?: string[];
 }
 
 /**

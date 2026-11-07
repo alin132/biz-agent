@@ -52,3 +52,16 @@ export function searchForSkill(
 ): Promise<SkillSearchResponse> {
 	return getKb().searchForSkill(skillId, query, topK);
 }
+
+/**
+ * 对话视角的检索（`kb_search` 工具用这条）：技能绑定 > Agent 绑定 > 对话默认。
+ * 三层都空则返回空结果（不是错误），模型照常回答并如实说明。
+ */
+export function searchForContext(
+	skillId: string | null,
+	query: string,
+	topK?: number,
+	agentKbIds?: string[],
+): Promise<SkillSearchResponse> {
+	return getKb().searchForContext(skillId, query, topK, agentKbIds);
+}

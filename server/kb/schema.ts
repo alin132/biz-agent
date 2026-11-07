@@ -102,6 +102,11 @@ const KB_SCHEMA_DDL = `
 		kb_id    TEXT NOT NULL,
 		PRIMARY KEY (skill_id, kb_id)
 	);
+	-- 「对话默认检索」的库：一条记录代表一个库参与问答检索，不需要先加载技能。
+	-- 用独立表而不是复用 skill_kb_bindings（那里 skill_id 是技能 id，混进去会让技能绑定查出错）。
+	CREATE TABLE IF NOT EXISTS kb_default_bindings (
+		kb_id TEXT PRIMARY KEY
+	);
 	CREATE INDEX IF NOT EXISTS idx_kb_documents_kb ON kb_documents (kb_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_kb_chunks_kb ON kb_chunks (kb_id, doc_id, seq);
 	CREATE INDEX IF NOT EXISTS idx_skill_kb_bindings_kb ON skill_kb_bindings (kb_id);

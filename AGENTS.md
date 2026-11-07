@@ -36,15 +36,22 @@ npm run dev                  # Web 控制台 http://127.0.0.1:4317（tsx 直跑 
 npm run typecheck            # tsc --noEmit，改完必跑
 npm run verify               # 核心层边界自检，不需要起服务（55 项）
 npm run ui-check             # 前端渲染单测（node:vm 沙盒加载 web/markdown.js，跑的就是浏览器那份文件，14 项）
-npm run ui-dom-check         # 控制台接线自检（自造迷你 DOM、零依赖，真跑 web/app.js + markdown.js，248 项）
-npm run kb:selftest          # 知识库自检（解析/分块/检索/绑定/kb_search/重新向量化/模型页向量模型，55 项，SQLite 本地、不需要起服务）
+npm run ui-dom-check         # 旧前端接线自检（自造迷你 DOM、零依赖，真跑 web/app.js + markdown.js，268 项）
+npm run web:build            # 新前端（client/，Vue3 + Naive UI）构建到 client/dist
+npm run web:dev              # 新前端开发服务器 5173（/api 与 /v1 代理到 4317）
+npm run ui:e2e               # 新前端端到端自检（Playwright 真实浏览器，51 项；要有服务在跑 + 已 web:build）
+npm run kb:selftest          # 知识库自检（解析/分块/检索/绑定/kb_search/对话默认检索/Agent 绑定优先级/重新向量化/模型页向量模型/附件解析，66 项，SQLite 本地、不需要起服务）
 npm run kb:pg:selftest       # 知识库 Postgres/pgvector 自检（16 项，要 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest        # 安全自检（scrypt/JWT/RBAC/限流/审计/成员保护，41 项，不需要起服务）
 npm run models:selftest      # 多模型自检（AES-256-GCM/掩码/密文解不开/首启 default/ping，23 项，不需要起服务）
 npm run mcp:selftest         # MCP 自检（stdio/HTTP/SSE 传输、命名、超时/关闭，30 项，不需要起服务）
+npm run agents:selftest      # Agent 实体自检（六维配置/状态机全路径/已发布锁定/人格指令/技能与知识库绑定/会话恢复，29 项，不起服务）
+npm run smoke:agents         # Agent 端到端 HTTP（建号→状态机→锁定→删除→绑定与恢复，25 项，必须先有服务在跑）
+npm run code                 # 编码 Agent CLI：cd 到仓库用，读写文件/跑命令/提交，高风险逐次审批
+npm run code:selftest        # 编码 Agent 自检（工具/路径越界/审批钩子/装配，25 项，不起服务）
 npm run obs:selftest         # 可观测自检（trace_id/内存队列/批量落库/聚合/保留期清理，24 项，不需要起服务）
 npm run ui-shot              # 观感核对：本机 Edge/Chrome 无头截图到 data/shot.png（不联网、不装依赖；没服务就没图）
-npm run smoke                # 端到端 HTTP+SSE 冒烟，必须先有服务在跑（182 项）
+npm run smoke                # 端到端 HTTP+SSE 冒烟，必须先有服务在跑（196 项）
 npm run smoke:auth           # 鉴权端到端，必须先有 AUTH_MODE=required 实例（51 项）
 npm run smoke:openapi        # 开放 API + 多模型端到端，必须先有 AUTH_MODE=required 实例（53 项）
 npm run smoke:mcp            # MCP 端到端，模拟模型实例即可，脚本自己起假 MCP Server（45 项）
@@ -90,12 +97,15 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 | `src/core/flowTools.ts` | 流程即工具：`flow_<id>` 命名、参数、描述 | 命名规则是唯一真相（`-` → `_`），server 与测试都引用它，别手拼前缀 |
 | `src/core/subFlow.ts` | 子流程执行：`flow_xxx` 内部起子 agent | 内层只装目标流程自己的工具，**不要装流程工具**（否则递归） |
 | `src/core/skill.ts` | 技能：`skillFromWorkflow()` 流程 → 作业指导书（正文 + tools 去重）、`skillCatalogPrompt()` 渐进式披露的目录、`use_skill` 的参数/描述 | 技能不另立定义，步骤仍走 `WorkflowEngine`；正文只在该技能加载后才进上下文，别把 `instructions` 塞进系统提示（见坑 17） |
+| `src/tools/coding.ts` | 编码 Agent 的工具集：`fs_read` / `fs_write` / `fs_list` / `fs_grep` / `fs_glob` / `shell_run` / `git_status` / `git_diff` / `git_commit` | **路径锁在工作目录内**（`resolveInside`，`..` 与外部绝对路径直接拒绝），写文件/跑命令/提交是 `high` 风险走审批；`text.split("\n")` 这种双重转义会把换行当字面量，改这块用 `code:selftest` 验 |
+| `src/coding/workflow.ts` | 编码 Agent 的工作流定义：`steps: []` + 编码专用系统提示 | **不注册进 `workflows/index.ts` 的 `workflowList`**——那是业务技能目录，把读写磁盘的工具挂进去等于让业务会话也能改用户仓库；`steps` 为空意味着 runtime 默认**不装任何工具**，调用方必须显式传 `toolNames` |
+| `src/cli/code.ts` | 编码 Agent 的 TUI（`npm run code`）：REPL、流式输出、工具调用渲染、高风险逐次审批、`/clear` `/help` `/exit` | 审批走 `ctx.requestApproval`，输入通道关闭时**按未批准处理**；`.env` 按包目录读而不是按 `--cwd` 读；管道输入的 EOF 必须能退出（否则 REPL 死循环） |
 | `src/tools/*` | 业务工具（含 risk / JSON Schema / execute / example） | 有必填参数的工具必须给 `example`，否则模拟模型演不下去（`verify` 有检查） |
 | `src/workflows/*` | 内置流程定义（steps + 该步可用的 via 工具 + `createTools`） | 新增内置流程改这里 + 下面两个清单，别去 `server/` 加 case；自定义流程是运行时数据，不走这里 |
 | `src/workflows/index.ts` | `workflowList` + `builtinToolFactories`：内置流程与工具目录的唯一真相 | 列表里加一项 = 右栏技能面板多一条技能；id 重复启动即抛错；新增工具工厂必须同时进 `builtinToolFactories` |
 | `src/store/memory.ts` | 内存业务数据（真实项目换 DB/内部 API） | 数据是种子假数据 |
 | `server/index.ts` | 路由 + 静态资源（`node:http`，零框架）。挂载顺序：**`/v1/*`（开放 API，自带 API Key 鉴权，必须在静态分支之前）→ 静态资源 → `auth.guard()`（`AUTH_MODE=off` 挂演示所有者，`required` 验 Bearer + 角色矩阵）→ `/api/im*` → `/api/auth/*` → `/api/monitor*` → `/api/kb*`（`handleKb`，模块自包含）→ `/api/models*` → `/api/api-keys*` → `/api/mcp*` → 其余 API（含 `/api/approvals*`）**；P8 的钉钉回调是 `/api/im/dingtalk/callback`，走 im 路由内部放行、**不走 JWT guard** | 新增接口在这里加分支，统一走 `json()`；**审批中心** `GET /api/approvals` 与 `POST /api/approvals/:sessionId` 在会话路由之后、404 之前，判定顺序是 404（会话不存在）→ 400（入参）→ 409（已处理）；`/api/workflows` 的 400/403/404 由 `WorkflowHttpError.status` 映射，别手写状态码；`DELETE /api/workflows/:id` 返回 `{ removed, sessionsRemoved, skillsCleared }`（连带删会话 + 让别的会话退出该技能），改它要同步 smoke 场景 F；`/api/health` 的 `storage: { kind, detail }` 来自存储层 `info()`、`auth: "off" \| "required"` 来自鉴权运行时（smoke 场景 C / smoke:auth 有断言）；`/api/sessions` 的 POST 不传 `modelId` 时取**当前模型**（P6），并把 `createdBy` 落进会话 payload（P9 的 developer 只看自己） |
-| `server/session.ts` | 会话对象、SSE `WireEvent` 协议、审批挂起、落库、`flow_xxx` 装配、技能加载（`use_skill` 工具、`skill` 事件）、会话级 `kb_search` 工具注册与换技能保留、MCP 工具并入初始工具集（`isMcpToolName`）、P9 的 trace 打点（`begin/finish`、`traceIds` 最近 20 条、`createdBy`、llm/tool/skill/mcp/approval 事件） | 前端事件协议的唯一真相来源；`SessionView.tools` 是「流程即工具」的观测字段，`SessionView.archived` 是归档的观测字段，`SessionView.skills/activeSkillId` 是技能的观测字段（`activeSkillId` 同时进持久化 payload），`SessionView.traceIds` 是调用链的观测字段，改动要同步 smoke（场景 D / E / F）与 `smoke:monitor`；**审批**：`approvalMeta` 存 `{ requestId, toolName, risk, args, askedAt }`，`pendingApprovalViews()` 给单个会话的挂起列表，`SessionHub.pendingApprovals()` 合并成全局面板（只遍历内存会话、按 `askedAt` 升序、已归档不过滤只标注），改它要同步 smoke 场景 H；`done` / `error` 事件带 `traceId`，别在别处再生成 trace；`kb_search` 不在 `/api/tools` 里，绑定按"当前技能 id（没加载技能时回落到会话自己的流程）"在调用那一刻取；MCP 工具是**会话创建/加载技能时的快照**，新注册的服务不会自动进已开着的会话 |
+| `server/session.ts` | 会话对象、SSE `WireEvent` 协议、审批挂起、落库、`flow_xxx` 装配、技能加载（`use_skill` 工具、`skill` 事件）、会话级 `kb_search` 工具注册与换技能保留、MCP 工具并入初始工具集（`isMcpToolName`）、P9 的 trace 打点（`begin/finish`、`traceIds` 最近 20 条、`createdBy`、llm/tool/skill/mcp/approval 事件） | 前端事件协议的唯一真相来源；`SessionView.tools` 是「流程即工具」的观测字段，`SessionView.archived` 是归档的观测字段，`SessionView.skills/activeSkillId` 是技能的观测字段（`activeSkillId` 同时进持久化 payload），`SessionView.traceIds` 是调用链的观测字段，改动要同步 smoke（场景 D / E / F）与 `smoke:monitor`；**审批**：`approvalMeta` 存 `{ requestId, toolName, risk, args, askedAt }`，`pendingApprovalViews()` 给单个会话的挂起列表，`SessionHub.pendingApprovals()` 合并成全局面板（只遍历内存会话、按 `askedAt` 升序、已归档不过滤只标注），改它要同步 smoke 场景 H；`done` / `error` 事件带 `traceId`，别在别处再生成 trace；`kb_search` 不在 `/api/tools` 里，绑定按"当前技能 id（没加载技能时回落到「对话默认检索」的库）"在调用那一刻取；会话构造时把默认库名字渲染成 `systemPromptExtras`（`kbDefaultHintOf()`）写进系统提示，否则模型不知道自己能查资料；MCP 工具是**会话创建/加载技能时的快照**，新注册的服务不会自动进已开着的会话 |
 | `server/workflows.ts` | 运行时流程仓库：内置（代码）+ 自定义（存储层）合并成一份索引；`detail/create/update` 带技能文案 `skill` | 单条定义失效（引用的工具被删）要进 `broken` 并拒绝建会话，别让启动崩掉；`update` 里 `skill` 要显式覆盖（可能是"清空"），不能靠展开旧值 |
 | `server/auth/**` | 企业安全（P3）：`roles.ts` 权限矩阵（唯一真相，P4~P9 的方法+路径映射也在这里：models / api-keys / mcp / kb / skills 绑定 / monitor / im / approvals / 成员写接口）、`password.ts` scrypt、`jwt.ts` HS256、`rateLimit.ts` 登录限流、`service.ts` 运行时（`AUTH_MODE` / 建初始账号 / 守卫 / 写审计 / `updateMember` / `removeMember`）、`routes.ts` 的 `/api/auth/*`（含成员 PATCH/DELETE，DAO 走 `updateUser` / `deleteUser`）与 `/api/audit`（P9 起支持 `actorType` / `targetType` / `from` / `to` / `q`） | 矩阵与「方法+路径→权限点」只在 `roles.ts` 维护，别在 `server/index.ts` / 前端 / 各模块 routes 里再抄一份；`AUTH_MODE=off` 必须保持"全部放行 + 演示所有者"（`smoke` 默认跑的就是它）；令牌每次按 `sub` 回表，停用/改角色立刻生效（这是"停用后旧令牌立即 401"的实现方式）；**成员保护规则在 service 层**：不能改自己 / 必须保留一个启用 owner（见坑 32）；403 文案中文上界面；`smoke:auth` 是这块的回归入口（要 `AUTH_MODE=required` 实例）；`audit_logs.actor_type` 现在有 `user` / `anonymous` / `api_key` 三种，写审计的调用方要显式传 |
 | `server/kb/**` | 知识库（P5）：`embedding.ts` 的配置来源是**模型页向量模型 > `EMBEDDING_*` 环境变量**（`resolveModelEmbedding` 由宿主注入，见坑 33）、`schema.ts` 建 SQLite 表、`store.ts` SQLite DAO（JSON 向量本地余弦，并导出两后端共用的归一化/映射/列表 SELECT）、`pgStore.ts` Postgres DAO（pgvector `<=>` 检索，经同步桥）、`parse.ts` / `chunk.ts` 解析分块、`embedding.ts` 可插拔向量化、`search.ts` 向量/关键词检索（向量排名交给 store）、`service.ts` 编排（含 `reembedKnowledgeBase` 整库重算）、`routes.ts` 的 `/api/kb*`、`tool.ts` 会话级 `kb_search` | 两种后端跟着 `DATABASE_URL` 走（见坑 24）：SQLite 表与会话同 `DB_PATH` 文件、PG 表靠 `0001`+`0007` 迁移；向量化失败要回退关键词、绝不阻断上传；`kb_search` 是**会话级工具**，不进 `/api/tools` / 自定义流程 `via`；改检索/绑定/重新向量化要跑 `kb:selftest` + `kb:pg:selftest`（有 PG 实例时）+ `smoke` 场景 G |
@@ -105,13 +115,16 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 | `server/mcp/**` | MCP 集成（P7）：`client.ts`（手写 JSON-RPC 2.0，stdio/HTTP/SSE 三种传输）、`registry.ts`（发现/快照/调用/启停）、`names.ts`（工具名唯一真相）、`routes.ts`（`/api/mcp*`）、`index.ts`（挂载 + 把 MCP 工具工厂 push 进 `builtinToolFactories`） | 工具名只用 `mcpToolName()` 生成，slug 后只含 `[a-z0-9_]`；工具默认 `risk:"high"`（见坑 25）；发现失败只落 `last_status/last_error`，不能抛到启动流程；MCP 工具是会话/技能工具集的**快照**；改这块跑 `mcp:selftest` + `smoke:mcp` |
 | `server/observability/**` | 监控与可观测（P9）：`trace.ts`（trace_id/token 估算/p95/range/参数摘要，纯函数）、`collector.ts`（内存队列 + 200ms 批量 flush + 聚合查询 + 保留期清理 `purgeExpired`）、`routes.ts`（`/api/monitor/*` 与 developer 收窄） | 采集绝不能阻塞对话（只入内存队列）；flush 失败重试 1 次后丢弃并计数；保留期清理由 `TRACE_RETENTION_DAYS` 控制（默认 30 天，0 关闭），失败只记日志；查询接口先 flush 再查；`summary` 要 `session.read`、`traces` 要 `audit.read`；改这块跑 `obs:selftest` + `smoke:monitor` |
 | `server/im/**` | IM Bot 网关：钉钉加签/AES 回调解析、企业微信自建应用（`wecom.ts`，GET 验证 + 加密 XML 文本回调，CorpID 复用 appKey、AgentId 复用 robotCode；必填 AES；`npm run wecom:selftest` 验证）、凭证加密、`im_sessions` 会话映射与幂等 LRU、出站（fake/real 传输 + 重试）、`/api/im*` | **钉钉回调是免登录公开路径**（在 guard 之前 / 路由里单独放行），别把整个 `/api/im` 做成公开；凭证只回掩码；同一 `msgId` 必须幂等（内存 LRU + `last_msg_id` 双保险）；`DINGTALK_TRANSPORT=fake` 不进网络、只写 outbox，冒烟靠它；改这块跑 `im:selftest` + `smoke:im` |
+| `server/agents/**` | **Agent 实体（P10）**：`service.ts` 六维配置的增删改 + 状态机（`draft → testing → published → stopped`，任意态可 `revert`），`routes.ts` 的 `/api/agents*`（列表 / 新建 / 详情 / PATCH / 删除 / `POST :id/actions`） 状态机语义照搬 AgentOne，**别自己加状态或放开限制**：`published` 拒绝 `PATCH`（409 `published_locked`，须先召回草稿）、`stopped` 拒绝对话（`stopped_not_chattable`）、非法迁移一律 409 `illegal_transition`；新建**一律 draft**；模型参数越界是**钳制**不是报错；**Agent 是配置，会话是运行实例**，别把会话搬进这个模块；表在 SQLite 内建 + PG `0008_agents.sql`（见坑 23），加字段两边都要改；改完跑 `agents:selftest` + `smoke:agents` + `ui:e2e` |
 | `server/db/**` | 存储层：`openStore()` 工厂（有 `DATABASE_URL` → Postgres，否则 SQLite）+ 两种实现 + 迁移执行器；`types.ts` 的 DAO 签名与旧 `SessionDb` 逐条一致，业务代码只改 import/类型名；P3 的 `users`/`audit_logs`、P4 的 `api_keys`、P6 的 `model_providers`/`models`、P7 的 `mcp_servers`/`mcp_tools`、P9 的 `traces`/`trace_events` 都在这一层；成员写接口新增 `updateUser(id, patch)` / `deleteUser(id)`（SQLite + PG 两套实现） | **DAO 契约是同步的**（见坑 22），别在 storage 里改成 async；`sessions` 仍是单表 `payload` JSON（`createdBy` / `traceIds` 也在 payload 里，不需要迁移）；`workflows` 只存自定义流程，内置流程不落库；**给表加列必须走 PRAGMA 检查 + `ALTER TABLE` 兜底**（见坑 19）；`trace_events` 的 `(trace_id, seq)` 唯一索引是 flush 幂等的关键，别去掉；`updateUser` 只落真正变化的字段（空 patch 不写），`deleteUser` 是物理删除，返回受影响行数 |
 | `db/migrations/**` | Postgres 迁移：`0001_init.sql`（`vector` + `pg_trgm` 扩展、17 张表、`schema_migrations` 记账、单文件一个事务、幂等）+ `0002_auth.sql`（审计平台动作列、放开 `tool_name`/`ok` NOT NULL、`users.email` 小写唯一索引）+ `0003_models.sql`（`model_providers` / `models` 两张表）+ `0004_mcp.sql`（MCP 的 `env` / `last_status` / `last_error` / `last_checked_at` 与索引）+ `0005_observability.sql`（`trace_events.ok/ms`、`(trace_id, seq)` 唯一索引、监控与审计索引）+ `0006_im.sql`（P8：IM 机器人的 `robot_code` / `aes_key_enc` / `last_callback_at` / `last_msg_id` 与索引；后端与控制台页面都已接入）+ `0007_kb_pgvector.sql`（P5 收尾：`kb_chunks.embedding` 由 `vector(1024)` 改成无维度 `vector`、删 HNSW 索引改精确余弦扫描）；执行器是 `server/db/migrations.ts` | **只服务 PG**（SQLite 表结构内建在 `server/db/sqlite.ts` 与 `server/kb/schema.ts`，见坑 23 / 24）；加表要两边都加；改完用 `npm run db:migrate` + `npm run db:check` 验证，别在 SQLite 上跑迁移；PG 侧（含 pgvector）用 PGlite 真内核验证过，但 Docker 镜像本身未实机（见坑 29）；**成员写接口不需要迁移**（`users` 表字段早就齐了，只是 DAO 补了 `updateUser` / `deleteUser`） |
 | `server/demoScripts.ts` | 无 key 时的模拟模型（按流程"演"一遍） | 演示参数取自 `ToolDef.example`，总结语有按步骤自动生成的兜底，新流程可以不写这里 |
-| `web/` | 控制台前端（**左侧图标栏 = 11 个模块导航**（`data-module`，图标下显示中文名称）：对话 / 知识库 / 技能 / 模型 / MCP / IM 机器人 / 审批 / 审计 / 成员 / 监控 / 设置；非对话模块用 `.shell.module-view` 两列 `76px minmax(0,1fr)`，收起 `.sidebar` 与 `#skill-side`、内容区 `#module-main` 整宽，切回对话恢复现场不重拉数据；**11 个模块页全部接真接口，没有空态占位**：`知识库` `/api/kb*`（空态卡 + 库列表/文档表/检索试跑；窄屏表格转卡片）、`模型` `/api/models*`、`MCP` `/api/mcp*`、`IM 机器人` `/api/im*`、`审批` `/api/approvals*`（待办列表 + 批准/拒绝 + 10s 轮询）、`成员` `/api/auth/users`（新建 + 改角色 + 停用/启用 + 删除）、`审计` `/api/audit`、`设置`（含 API Key 管理 `/api/api-keys*`）、`监控` `/api/monitor*`、`技能` `/api/skills`；`AUTH_MODE=required` 时先显示登录页。**对话模块是三列网格** `76px 258px minmax(0,1fr)`：图标栏 + 会话栏 + 对话区；右侧技能栏视觉隐藏，加载/退出入口在「技能」模块页；≤900px 收起会话栏后必须改为两列，不得保留零宽度列。消息和输入框共用 `--chat-width:800px` 并居中对齐。会话栏 = 新聊天 / 置顶（`localStorage`）/ 会话（平铺，不按流程分组；行尾 `.skill-tag` 显示当前技能）/ 已归档折叠区；**没有流程区与新建流程按钮**，新聊天直接开 `auto-flow` 会话；页头技能胶囊是**纯状态**（无下拉）；右栏常驻技能面板 `#skill-side`：当前技能块（名字 + `当前技能 · N 步` + 退出）+ ＋新建技能 + 技能列表（点行加载、⋯ 查看/编辑/删除，自动编排 `auto-flow` 不列）；「运行详情」抽屉只剩当前进度 + 审计流水；技能编辑器（新建/编辑自定义流程 + 技能文案）是唯一的技能编辑入口：主表单 = 名称 + 「什么时候用它」（description，必填引导）+ 指导书正文；步骤与系统提示收进「高级」折叠区（编辑带步骤的技能时自动展开），零步骤 = 引擎的空 steps 分支（模型自己挑工具）；空会话引导页三条示例 chip、回答/代码块/工具输出复制、工具卡片折叠（标题行键盘可达：`role=button` + `tabindex=0` + `aria-expanded`，Enter/Space 折叠）、回到底部浮钮、`Ctrl / ⌘ + K` 搜索、流式方块光标），原生 JS，**无构建步骤** | 改完刷新即生效；不引第三方库；用户输入一律 `textContent`；交互/接线改动要过 `npm run ui-dom-check`；**界面文案里不出现"流程"**（用户视角只有技能），`web/index.html` 去注释后不许出现「流程」二字；模块页的「未接入」页不要摆假数据，只写说明 + 接口清单；**只有后端接口 404 / 连不上时才回落空态**（403 要显示「权限不足」，别混进「未接入」）；**审批页操作成功后从本地列表移除，409 只提示并刷新，不弹错** |
+| `web/` | 控制台前端（**左侧图标栏 = 11 个模块导航**（`data-module`，图标下显示中文名称）：对话 / 知识库 / 技能 / 模型 / MCP / IM 机器人 / 审批 / 审计 / 成员 / 监控 / 设置；非对话模块用 `.shell.module-view` 两列 `76px minmax(0,1fr)`，收起 `.sidebar` 与 `#skill-side`、内容区 `#module-main` 整宽，切回对话恢复现场不重拉数据；**11 个模块页全部接真接口，没有空态占位**：`知识库` `/api/kb*`（空态卡 + 库列表/文档表/检索试跑；窄屏表格转卡片）、`模型` `/api/models*`、`MCP` `/api/mcp*`、`IM 机器人` `/api/im*`、`审批` `/api/approvals*`（待办列表 + 批准/拒绝 + 10s 轮询）、`成员` `/api/auth/users`（新建 + 改角色 + 停用/启用 + 删除）、`审计` `/api/audit`、`设置`（含 API Key 管理 `/api/api-keys*`）、`监控` `/api/monitor*`、`技能` `/api/skills`；`AUTH_MODE=required` 时先显示登录页。**对话模块是三列网格** `76px 258px minmax(0,1fr)`：图标栏 + 会话栏 + 对话区；右侧技能栏视觉隐藏，加载/退出入口在「技能」模块页；≤900px 收起会话栏后必须改为两列，不得保留零宽度列。消息和输入框共用 `--chat-width:800px` 并居中对齐。会话栏 = 新聊天 / 置顶（`localStorage`）/ 会话（平铺，不按流程分组；行尾 `.skill-tag` 显示当前技能）/ 已归档折叠区；**没有流程区与新建流程按钮**，新聊天直接开 `auto-flow` 会话；页头技能胶囊是**纯状态**（无下拉）；右栏常驻技能面板 `#skill-side`：当前技能块（名字 + `当前技能 · N 步` + 退出）+ ＋新建技能 + 技能列表（点行加载、⋯ 查看/编辑/删除，自动编排 `auto-flow` 不列）；「运行详情」抽屉只剩当前进度 + 审计流水；技能编辑器（新建/编辑自定义流程 + 技能文案）是唯一的技能编辑入口：主表单 = 名称 + 「什么时候用它」（description，必填引导）+ 指导书正文；步骤与系统提示收进「高级」折叠区（编辑带步骤的技能时自动展开），零步骤 = 引擎的空 steps 分支（模型自己挑工具）；空会话引导页三条示例 chip、**思考过程折起展示**（`thinking` 事件 → `.thinking` 折叠块，正文开始时标题从「思考中…」改为「思考过程」，思考内容绝不混进正文）、**附件支持 PDF/Word**（文本类本地直读，二进制走 `POST /api/kb/extract` 复用知识库解析器，截断时如实提示原始字数）、**输入框敲 `/` 弹出斜杠命令面板**（`SLASH_COMMANDS` 数据表 + `syncSlashFromInput`；上下键换高亮、回车执行、Esc 收起，命中命令名/拼音 alias 与技能目录；命令只调既有函数，别再写一遍请求）、回答/代码块/工具输出复制、工具卡片折叠（标题行键盘可达：`role=button` + `tabindex=0` + `aria-expanded`，Enter/Space 折叠）、回到底部浮钮、`Ctrl / ⌘ + K` 搜索、流式方块光标），原生 JS，**无构建步骤** | 改完刷新即生效；不引第三方库；用户输入一律 `textContent`；交互/接线改动要过 `npm run ui-dom-check`；**界面文案里不出现"流程"**（用户视角只有技能），`web/index.html` 去注释后不许出现「流程」二字；模块页的「未接入」页不要摆假数据，只写说明 + 接口清单；**只有后端接口 404 / 连不上时才回落空态**（403 要显示「权限不足」，别混进「未接入」）；**审批页操作成功后从本地列表移除，409 只提示并刷新，不弹错** |
+| `client/` | **新前端**（Vue 3 + Naive UI + Vite，构建到 `client/dist`）：`main.js` 入口、`router.js`（hash 路由，避开服务端重写，十一个页面全部惰性加载）、`theme.js`（靛蓝主题 token → Naive themeOverrides + CSS 变量）、`api.js`（统一 fetch / ApiError + 各模块接口封装）、`App.vue`（分组侧边栏壳）、`components/`（`PageShell` 页头+加载/错误态、`Panel` 面板容器）、`views/`（工作台 / **Agent** / **对话** / 知识库 / 技能 / 模型 / MCP / IM / 审批 / 审计 / 监控，**十一页全接真接口，没有占位页**） | **`server/index.ts` 的 `WEB_DIR` 优先用 `client/dist`，没有 dist 才回落 `web/`**——这是两套前端共存与回退的机制，别去掉。产物路径要能相对加载（`base: "./"`）；`n-config-provider` 与 `n-message-provider` / `n-dialog-provider` 必须包在 App.vue 最外层，少一层页面就白屏；改完跑 `web:build` + `ui:e2e`；**接口字段名一律先看真实响应再写**（`/api/skills` 的 `steps` 是数字、`/api/models` 的 `current` 是 modelId 字符串、`/api/monitor/summary` 用 `toolCalls`/`p95Ms`，猜出来的字段会让整块显示 0） |
 | `web/markdown.js` | markdown → HTML 的纯函数（标题/列表/表格/围栏代码块/引用/行内语法；链接白名单；挂 `window.renderMarkdown`） | **先全量转义再套标签**；链接只放行 http/https/mailto 与站内路径（`/` 开头、`#` 锚点，裸相对路径不放行）；新增/改动语法必须同时补 `scripts/ui-check.mjs`；这是经典脚本，**不能写 import/export** |
 | `scripts/ui-check.mjs` | 前端渲染单测（`node:vm` 造沙盒加载 `web/markdown.js`，14 项，`npm run ui-check`） | 只测纯函数、不起服务；断言"模型吐出的 HTML 只会变文本"这条安全底线不要删 |
-| `scripts/ui-dom-check.mjs` | 控制台接线自检（自造迷你 DOM + HTML 解析器，零依赖、不引 jsdom；真跑 `web/app.js` + `web/markdown.js`，248 项，`npm run ui-dom-check`） | 断言的是"接线"不是观感（布局/视觉仍靠人眼）；只看 DOM/事件/class/aria，别在这里断言像素；加交互先在这里补一条；`querySelectorAll` 必须返回 NodeList 形态（`nodeList()`），返回数组会放过真浏览器才炸的 bug（见坑 18） |
+| `scripts/ui-dom-check.mjs` | 控制台接线自检（自造迷你 DOM + HTML 解析器，零依赖、不引 jsdom；真跑 `web/app.js` + `web/markdown.js`，268 项，`npm run ui-dom-check`） | 断言的是"接线"不是观感（布局/视觉仍靠人眼）；只看 DOM/事件/class/aria，别在这里断言像素；加交互先在这里补一条；`querySelectorAll` 必须返回 NodeList 形态（`nodeList()`），返回数组会放过真浏览器才炸的 bug（见坑 18） |
+| `scripts/code-selftest.ts` | 编码 Agent 自检（25 项，`npm run code:selftest`）：工具集/读写/路径越界/grep 行号/shell 退出码/git 全流程/审批钩子阻断与放行/装配工具集 | 临时目录里跑，不碰用户仓库；**不要用管道跑 CLI 来测审批**——stdin 会在 agent 启动前就关闭，测到的是管道行为不是产品行为 |
 | `scripts/models-selftest.ts` | 多模型自检（23 项，`npm run models:selftest`）：AES-256-GCM 加解密/掩码溯源、首启 default 供应商、切换当前模型、ping 成功与失败、API Key 停用/吊销与参数校验 | 纯进程内、临时 SQLite + 假 fetch（`FetchLike` 注入），不起服务；动 `server/models/**` 或 `server/apiKeys/**` 先跑它，再用 `smoke:openapi` 验真实 HTTP |
 | `scripts/mcp-selftest.ts` | MCP 自检（30 项，`npm run mcp:selftest`）：工具名归一、stdio/HTTP/SSE 三种传输握手与调用、中文往返、isError、超时与关闭、子进程退出 | 纯进程内，用 `scripts/fixtures/mcp-stdio-server.mjs` 起假服务；动 `server/mcp/**` 先跑它，再用 `smoke:mcp`；超时阈值是 **1500ms**、慢工具用 `FIXTURE_SLOW_MS` 拉到 6 秒（见坑 30），别再调回贴着实测的阈值 |
 | `scripts/observability-selftest.ts` | 可观测自检（24 项，`npm run obs:selftest`）：trace_id 形状、内存队列与 200ms 批量 flush、失败重试/丢弃计数、summary 聚合与 p95、range 解析、幂等、保留期清理 | 纯进程内、临时 SQLite、手动 flush（`autoStart:false`）；动 `server/observability/**` 或 `session.ts` 的 trace 打点要跑它 |
@@ -120,10 +133,11 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 | `scripts/smoke-monitor.ts` | 监控端到端（61 项，`npm run smoke:monitor`）：要 `AUTH_MODE=required` 实例 | 脚本自己建 operator / auditor / developer 账号；从 `/api/health` 拿 SQLite 路径直接种一条 2 天前的调用链验 range（PG 实例会跳过这组），并覆盖 `/api/audit` 的新过滤 |
 | `scripts/im-selftest.ts` | IM Bot 自检（26 项，`npm run im:selftest`）：加签/AES 回调、文本解析、幂等 LRU、凭证掩码、会话映射、出站重试与 token 缓存、传输选择与权限映射 | 纯进程内、临时 SQLite + 假传输，不起服务；动 `server/im/**` 先跑它，再用 `smoke:im` 验真实 HTTP |
 | `scripts/smoke-im.ts` | IM 端到端（37 项，`npm run smoke:im`）：要 `DINGTALK_TRANSPORT=fake` 实例 | 覆盖建机器人（掩码/明文不回）→ 正确加签回调 → outbox → 同 msgId 幂等 → 错签名/过期 401 → 同 conversationId 只映射一个会话 → ping → 停用 403 → 删除 404 |
-| `scripts/kb-selftest.ts` | 知识库自检（55 项，`npm run kb:selftest`）：解析/分块/关键词打分/向量回退/绑定隔离/`kb_search` 工具/重新向量化/向量配置来源（模型页 > 环境变量） | 纯进程内、用临时 SQLite，不起服务；动 `server/kb/**` 先跑它，再用 `smoke` 场景 G 验真实 HTTP |
+| `scripts/kb-selftest.ts` | 知识库自检（66 项，`npm run kb:selftest`）：解析/分块/关键词打分/向量回退/绑定隔离/Agent 绑定优先级/`kb_search` 工具/**对话默认检索（不加载技能也能查、技能绑定优先）**/重新向量化/向量配置来源（模型页 > 环境变量）/**附件解析（`POST /api/kb/extract`：纯文本/markdown/截断与 totalChars/不支持格式中文报错）** | 纯进程内、用临时 SQLite，不起服务；动 `server/kb/**` 先跑它，再用 `smoke` 场景 G 验真实 HTTP |
 | `scripts/kb-pg-selftest.ts` | 知识库 Postgres/pgvector 自检（16 项，`npm run kb:pg:selftest`）：DAO 全接口、pgvector 余弦排序/阈值/topK、维度不固定、service 假 embedding（上传即向量化 / 失败回退） | 要 `DATABASE_URL` 且已跑 `db:migrate`（没配打印「跳过」并 exit 0）；没有 Docker 时用 PGlite+pgvector 起 socket 服务跑（见坑 29）；动 `server/kb/pgStore.ts` 必跑 |
 | `scripts/auth-selftest.ts` | 安全自检（41 项，`npm run auth:selftest`）：scrypt/JWT 验签过期/RBAC 矩阵/限流/审计 DAO/成员保护（不能改自己、最后 owner、停用后令牌 401） | 纯进程内、临时库；改 `server/auth/**` 或 `roles.ts` 必须让它全绿 |
 | `scripts/smoke-auth.ts` | 鉴权端到端（51 项，`npm run smoke:auth`）：要一个 `AUTH_MODE=required` 实例 | 脚本自己建 operator/auditor 账号；实例必须带 `AUTH_BOOTSTRAP_PASSWORD`；覆盖成员 PATCH/DELETE、保护规则 400、401/403 与 user.update/user.delete 审计；跑完删临时库 |
+| `scripts/ui-e2e.mjs` | 新前端端到端自检（51 项，`npm run ui:e2e`）：Playwright 真实浏览器跑 `client/dist`，断言分组导航、四列统计卡、知识库两栏与拖拽区、**十一个页面全部可达**、技能卡片网格与分类筛选、模型页当前模型标记、监控指标卡是真数据、审计表格有行、审批页如实说明内存态，并**全程收集页面 JS 报错** | 前置：后端在跑 + `web:build` 已出产物；`BASE` 环境变量可换实例。**别写空断言**（`check("x", () => {})` 永远通过，等于没测）——要么查 DOM 节点数，要么断言真实文本 |
 | `scripts/ui-shot.mjs` | 观感核对：本机 Edge/Chrome 无头 + CDP 截图（`npm run ui-shot -- <url> <out> <w> <h> <waitMs> <js>`） | 只管"看一眼对不对"：截图前可执行一段 JS（点开菜单/切技能）再拍；顺手把页面 JS 报错打出来（有报错退出码 2）；找不到浏览器就跳过，不进验证闭环 |
 | `scripts/db-migrate.ts` | `npm run db:migrate`：对当前后端跑 `db/migrations/*.sql` 并打印已应用版本 | PG 专用（SQLite 会直接返回"无需迁移"）；迁移文件本身在 `db/migrations/**` |
 | `scripts/db-check.ts` | `npm run db:check`：打印后端类型 / 位置 / 引擎版本 / 表清单 / 迁移版本 / 数据量 | 换后端或加表后先跑它；它不写数据 |
@@ -137,7 +151,9 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 - **Tab 缩进**，双引号，分号不能省；TS strict + `noUnusedLocals` / `noUnusedParameters`（未使用变量会直接编译失败）。
 - 注释、日志、UI 文案、提交信息全部**中文**。注释解释"为什么"，不解释"是什么"。
 - 业务层类型集中在 `src/core/types.ts`（`WorkflowDef` / `ToolDef` / `BizContext` / `WorkflowState` / `AuditEntry`）。
-- 前端不引框架、不引构建：DOM 用 `make(tag, className, text)` 造，用户输入一律 `textContent`（禁止拼 `innerHTML`）。
+- **旧前端 `web/` 不引框架、不引构建**：DOM 用 `make(tag, className, text)` 造，用户输入一律 `textContent`（禁止拼 `innerHTML`）。
+- **新前端 `client/` 是 Vue 3 + Naive UI + Vite**（用户已明确放开框架与构建限制）。
+  两套并存：新页面写进 `client/src/views/`，迁移完一页切一页；旧的 `web/` 保持可用作回退。
 - 渲染模型输出一律走 `window.renderMarkdown`（`web/markdown.js`）：它**先把 HTML 全量转义再套标签**，
   所以只有这里能产出可信标签；别为了加个样式在 `app.js` 里手拼 HTML——要加语法就改 markdown.js + 补 ui-check。
 - 不为"未来可能用到"抽象；切片式的三个流程就是全部示例。
@@ -150,16 +166,18 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 npm run typecheck                 # 1. 类型
 npm run verify                    # 2. 核心层 / 工具目录 / 流程校验 / 子流程 / 技能 55 项（不起服务）
 npm run ui-check                  # 3. 前端渲染单测 14 项（node:vm 跑 web/markdown.js，不起服务）
-npm run ui-dom-check              # 4. 控制台接线自检 248 项（自造迷你 DOM 跑 web/app.js，不起服务）
-npm run kb:selftest               # 5. 知识库自检 55 项（解析/分块/检索/绑定/kb_search/重新向量化/向量配置来源，SQLite 本地，不起服务）
+npm run ui-dom-check              # 4. 控制台接线自检 268 项（自造迷你 DOM 跑 web/app.js，不起服务）
+npm run kb:selftest               # 5. 知识库自检 66 项（解析/分块/检索/绑定/kb_search/对话默认检索/Agent 绑定优先级/重新向量化/向量配置来源/附件解析，SQLite 本地，不起服务）
 npm run kb:pg:selftest            # 5b. 知识库 Postgres/pgvector 自检 16 项（要 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest             # 6. 安全自检 41 项（scrypt/JWT/RBAC/限流/审计/成员保护，不起服务）
 npm run models:selftest           # 7. 多模型自检 23 项（AES-256-GCM/掩码/default 供应商/ping，不起服务）
 npm run mcp:selftest              # 8. MCP 自检 30 项（三种传输/命名/超时/关闭，不起服务）
 npm run obs:selftest              # 9. 可观测自检 24 项（trace_id/内存队列/flush/聚合/保留期清理，不起服务）
 npm run im:selftest               # 10. IM Bot 自检 26 项（P8：加签/AES/幂等/映射/出站，不起服务）
+npm run agents:selftest           # 10b. Agent 实体自检 29 项（六维配置/状态机全路径/已发布锁定/指令注入/绑定与恢复，不起服务）
+npm run code:selftest             # 10c. 编码 Agent 自检 25 项（工具/路径越界/审批钩子/装配，不起服务）
 npm run dev                       # 11. 另开一个终端：$env:LLM_DISABLE="1"; npm run dev
-npm run smoke                     # 12. 端到端 182 项（默认打 127.0.0.1:4317，可用 SMOKE_BASE 覆盖）
+npm run smoke                     # 12. 端到端 196 项（默认打 127.0.0.1:4317，可用 SMOKE_BASE 覆盖）
 ```
 
 鉴权端到端单独跑（**不要**打在默认实例上，它需要 `AUTH_MODE=required`，且脚本会自己建账号）：
@@ -205,6 +223,8 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
   动 `pgStore.ts` / 迁移 `0007` / 检索下推，还要配 `DATABASE_URL`（+ 已跑 `db:migrate`）跑 `kb:pg:selftest`，
   并起一个 PG 实例跑 `smoke` + `persist-check`（没有 Docker 时用 PGlite+pgvector，见坑 29）。
   本机回归不要配 `EMBEDDING_API_KEY`（会打网络、模式变成 vector），断言默认是 `mode="keyword"`。
+- 动新前端（`client/**`）→ `npm run web:build` 必须成功，再 `npm run ui:e2e` 全绿（Playwright 真实浏览器，51 项）。
+  **新前端是 Vue + Naive UI，过不了 `ui-dom-check` 的 DOM 桩**，那套只覆盖旧前端 `web/`。
 - 动 `web/*` 的观感（布局/截断/层级/颜色）→ 起服务后 `npm run ui-shot -- <url> <out> 1440 980 3500 "<点开菜单的 JS>"`
   拍图看一眼；它同时报页面 JS 错（退出码 2）。UI 接线归 `ui-dom-check`，观感归它，两者不互相替代。
 - 动流程相关（`workflowSpec` / `catalog` / `flowTools` / `server/workflows.ts` / `subFlow`）→
@@ -295,8 +315,7 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
     新库建表，**不会给老库补列**——本机的 `data/biz-agent.db` 是既有库，只在 CREATE 语句里加 `skill TEXT`
     的话，老库读写列时会直接报 `no such column: skill`。`server/db/sqlite.ts` 现在的做法是启动时
     `PRAGMA table_info(workflows)` 查一遍，缺列就 `ALTER TABLE workflows ADD COLUMN skill TEXT`（幂等，跑几次都一样）。
-    同理：`WorkflowRow.skill` 是可选字段，落库要 `row.skill ? JSON.stringify(row.skill) : null`，读回再 `JSON.parse`。
-    **SQLite 的补列逻辑现在在 `server/db/sqlite.ts`**（P2 把 `db.ts` 拆成了 `server/db/**`）。
+    同理 `WorkflowRow.skill` 落库要 `JSON.stringify`、读回 `JSON.parse`；补列逻辑在 `server/db/sqlite.ts`。
 20. **技能目录是快照，新建的技能会"看不见"**：`Session` 构造时把 `repo.skills()` 快照进 `this.skills` 与
     `use_skill` 的工具参数枚举；`runtime.activateSkill(id)` 内部也自己存了一份 map。控制台允许**会话开着时新建技能**，
     所以 `Session.activateSkill()` 会先 `refreshSkills()`（`repo.skills()` 灌回 `this.skills`，并**就地改**
@@ -324,9 +343,7 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
     SQLite 实现也在它里面（表建在 `DB_PATH` 同一库文件，`server/kb/schema.ts` 幂等建表；向量存 JSON 文本、本地算余弦）；
     Postgres 实现在 `server/kb/pgStore.ts`（表由 `db/migrations/0001_init.sql` + `0007_kb_pgvector.sql` 建；
     向量是 pgvector `vector` 列，检索用 `embedding <=> $vec` 下推，经同一套同步桥阻塞调用）。
-    两条约定：① **PG 的 KB 表只由迁移建**，`pgStore` 只查不建，别把 PG DDL 塞进 SQLite 的建表路径；
-    ② **向量列没有固定维度**（0007 把 `vector(1024)` 改成无维度 `vector`，HNSW 索引已删、走精确余弦扫描）——
-    换 embedding 模型（1536/3072 维）不用迁移，但不同维度的旧块会让 pgvector 检索报错，检索层会回退关键词。
+    两条约定：① **PG 的 KB 表只由迁移建**，`pgStore` 只查不建，别把 PG DDL 塞进 SQLite 建表路径；② **向量列没有固定维度**（0007 改无维度 `vector`），换 embedding 模型不用迁移，但不同维度的旧块会让 pgvector 检索报错，检索层会回退关键词。
     另一条：后补 `EMBEDDING_API_KEY` 不会让旧文档自动重嵌入，但可点知识库页「重新向量化」或调
     `POST /api/kb/:id/reindex` 整库重算（`service.reembedKnowledgeBase` → `updateChunkEmbeddings`）；
     上传前先看 `GET /api/kb/embedding` 的 `available`。
@@ -378,9 +395,11 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
     ② 有向量模型但拼不出可用配置（Key 解不开、custom 供应商没填 base_url）时**必须抛出/回 `problem`**，
     让 `available=false` 且页面显示原因——**不要**悄悄改用环境变量那条（那会用错模型还不自知）；
     ③ 配置每次调用现读（`resolve()` 里现算），所以模型页改完立刻生效，不用重启。
-    契约断言在 `kb:selftest`（`resolveModelEmbedding` 三条：模型页优先 / 报错不回落 / 没配回落 env）、
-    `ui-dom-check`（模型表行内选择 + 空状态新建入口 + KB 待补齐横幅）、`smoke` 场景 G2（建供应商 → 建向量模型 → 选中 → `/api/kb/embedding`
-    变 `source=model` → 停用立刻失效 → 清理）。改这条链路就跑这三处，别只跑一个。
+    契约断言在 `kb:selftest`（模型页优先 / 报错不回落 / 没配回落 env）、`ui-dom-check`（行内选择 + 空状态入口）、`smoke` 场景 G2。改这条链路三处都要跑。
+
+34. **会话 payload 只存 `agentId`，人格/技能/知识库得靠回查 Agent 还原**：`PersistedSession` 里没有 `agentsMd`（人格正文属于 Agent 表，不该每条会话各存一份），所以任何「从库里重建会话」的路径（刷新页面 / 重启服务 / 内存未命中时的 `GET /api/sessions/:id`）都必须先回查 Agent 再交给 `Session` 构造；漏了这一步 `agentPrompt` 就是 null、系统提示退回 `auto-flow` 的通用模板——**表现就是「我配好了人格，点对话回的却是业务总管」**。`SessionHub.get()` 用 `agentOf()` 兜住；`SessionHub.drop()` 专为测它而存在：只丢内存那份，逼下一次 `get()` 走真实恢复路径。
+    **断言别只看 `systemPrompt` 里有没有那句话**：恢复出来的会话带历史消息，历史里那条旧 system message 本身就含人格，所以回读完全失效时断言照样通过（假阳性，踩过）。要断言 `agentPrompt` 本身被还原。
+    Agent 被删后老会话仍要能打开：`agentOf()` 返回 `undefined` 降级成默认人格，不抛错。`agentName` 冗余落库一份就是为了这种时候还能显示当时的名字（老 payload 没这字段，回落 id）。
 
 ---
 
@@ -389,15 +408,18 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
 - [ ] `npm run typecheck` 通过
 - [ ] `npm run verify` 全绿（55 项）
 - [ ] 动了前端渲染再 `npm run ui-check` 全绿（14 项）
-- [ ] 动了前端交互再 `npm run ui-dom-check` 全绿（248 项）
-- [ ] 动了知识库再 `npm run kb:selftest` 全绿（55 项）
+- [ ] 动了旧前端交互再 `npm run ui-dom-check` 全绿（268 项）
+- [ ] 动了新前端 `client/**`：`npm run web:build` 成功 + `npm run ui:e2e` 全绿（51 项，需服务在跑）
+- [ ] 动了 Agent 实体（`server/agents/**` / `/api/agents*` / Agent 页）：`npm run agents:selftest` 全绿（29 项）+ `npm run smoke:agents` 全绿（25 项）
+- [ ] 动了知识库再 `npm run kb:selftest` 全绿（66 项）
+- [ ] 动了编码 Agent（`src/tools/coding.ts` / `src/cli/code.ts` / `src/coding/**`）再 `npm run code:selftest` 全绿（25 项）
 - [ ] 动了知识库重新向量化 / 保留期清理再核对对应 selftest 断言
 - [ ] 动了 `server/kb/pgStore.ts` / 迁移 `0007` / 检索下推：配 `DATABASE_URL` 跑 `npm run kb:pg:selftest` 全绿（16 项）
 - [ ] 动了鉴权再 `npm run auth:selftest` 全绿（41 项）
 - [ ] 动了多模型 / API Key 再 `npm run models:selftest` 全绿（23 项）
 - [ ] 动了 MCP 再 `npm run mcp:selftest` 全绿（30 项，超时阈值 1500ms + `FIXTURE_SLOW_MS`，别删用例）
 - [ ] 动了可观测再 `npm run obs:selftest` 全绿（24 项）
-- [ ] 起了模拟模型服务 + `npm run smoke` 全绿（182 项）
+- [ ] 起了模拟模型服务 + `npm run smoke` 全绿（196 项）
 - [ ] 鉴权有变化再起 required 实例 + `npm run smoke:auth` 全绿（51 项）
 - [ ] 动了开放 API / 多模型再起 required 实例 + `npm run smoke:openapi` 全绿（53 项）
 - [ ] 动了 MCP 再起模拟实例 + `npm run smoke:mcp` 全绿（45 项）

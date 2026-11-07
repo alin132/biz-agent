@@ -127,6 +127,10 @@ export interface KbStore {
 	setSkillBindings(skillId: string, kbIds: string[]): void;
 	getSkillKbIds(skillId: string): string[];
 	listKnowledgeBasesByIds(ids: string[]): KnowledgeBaseRow[];
+
+	/** 「对话默认检索」的库（不依赖技能）：问答时按这张表兜底。 */
+	setDefaultKbIds(kbIds: string[]): void;
+	getDefaultKbIds(): string[];
 }
 
 /** 知识库表的原始行（列名与 DDL 一致，只在这一层出现）。 */
@@ -611,6 +615,34 @@ export function createKbStore(options: CreateKbStoreOptions = {}): KbStore {
 				.prepare(`${KB_LIST_SELECT} WHERE kb.id IN (${unique.map(() => "?").join(", ")}) ORDER BY kb.created_at ASC`)
 				.all(...unique) as unknown as KnowledgeBaseDbRow[];
 			return rows.map(mapKnowledgeBaseRow);
+		},
+
+		setDefaultKbIds(kbIds) {
+			const unique = [...new Set(kbIds.map((id) => id.trim()).filter((id) => id.length > 0))];
+			const missing: string[] = [];
+			for (const kbId of unique) {
+				if (!findKnowledgeBase(kbId)) {
+					missing.push(kbId);
+				}
+			}
+			if (missing.length > 0) {
+				throw badRequest(`这些知识库不存在：${missing.join("、")}`);
+			}
+			tx(() => {
+				db.prepare("DELETE FROM kb_default_bindings").run();
+				const statement = db.prepare("INSERT INTO kb_default_bindings (kb_id) VALUES (?)");
+				for (const kbId of unique) {
+					statement.run(kbId);
+				}
+			});
+		},
+
+		getDefaultKbIds() {
+			const rows = db
+				.prepare("SELECT kb_id FROM kb_default_bindings ORDER BY kb_id")
+				.all() as { kb_id: string }[];
+			// 库被删后残留的绑定要跳过，否则检索会 404
+			return rows.map((row) => row.kb_id).filter((kbId) => Boolean(findKnowledgeBase(kbId)));
 		},
 	};
 

@@ -96,7 +96,6 @@ const AUTO_SIMULATED_TEXT = [
 ].join("\n");
 
 export function createSimulatedRuntime(
-	workflow: WorkflowDef,
 	engine: WorkflowEngine,
 	registry: ToolRegistry,
 ): SimulatedRuntime {
@@ -113,7 +112,9 @@ export function createSimulatedRuntime(
 			return fauxAssistantMessage("执行中断：上一步工具调用未成功，这次没走完。右侧审计流水里有失败原因。");
 		}
 
-		// 自动编排没有预设步骤，模拟模型无从"演"，直接说明要真模型
+		const workflow = engine.definition;
+
+		// 技能切换会就地重置引擎，模拟模型必须读取当前定义，而非建会话时的流程快照。
 		if (workflow.steps.length === 0) {
 			return fauxAssistantMessage(AUTO_SIMULATED_TEXT);
 		}

@@ -15,6 +15,11 @@ import type { Migration } from "./migrations.js";
 import { SyncWorkerBridge } from "./syncBridge.js";
 import {
 	DEFAULT_WORKSPACE_ID,
+	type PluginRecord,
+	type AgentInput,
+	type AgentPatch,
+	type AgentRecord,
+	type AgentStatus,
 	type ApiKeyInput,
 	type ApiKeyPatch,
 	type ApiKeyRecord,
@@ -310,14 +315,42 @@ export class PostgresStorage implements Storage {
 		}));
 	}
 
+	/* ---------------- 插件包 ---------------- */
+
+	listPlugins(): PluginRecord[] {
+		return this.rows("SELECT * FROM plugins WHERE workspace_id = $1 ORDER BY created_at ASC", [this.workspaceId]).map((row) => this.toPluginRecord(row));
+	}
+
+	getPlugin(id: string): PluginRecord | undefined {
+		const row = this.rows("SELECT * FROM plugins WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
+		return row ? this.toPluginRecord(row) : undefined;
+	}
+
+	createPlugin(plugin: PluginRecord): PluginRecord {
+		this.exec("INSERT INTO plugins (id,workspace_id,name,version,description,manifest,enabled,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)", [plugin.id,this.workspaceId,plugin.name,plugin.version,plugin.description,JSON.stringify(plugin.manifest),plugin.enabled,plugin.createdAt,plugin.updatedAt]);
+		return plugin;
+	}
+
+	updatePlugin(id: string, patch: Partial<Pick<PluginRecord, "enabled" | "manifest" | "updatedAt">>): PluginRecord | undefined {
+		const current = this.getPlugin(id); if (!current) return undefined; const next = { ...current, ...patch };
+		this.exec("UPDATE plugins SET manifest=$1::jsonb, enabled=$2, updated_at=$3 WHERE id=$4 AND workspace_id=$5", [JSON.stringify(next.manifest),next.enabled,next.updatedAt,id,this.workspaceId]); return next;
+	}
+
+	removePlugin(id: string): boolean { return this.rowCount("DELETE FROM plugins WHERE id=$1 AND workspace_id=$2", [id,this.workspaceId]) > 0; }
+
+	private toPluginRecord(row: Record<string, unknown>): PluginRecord {
+		return { id:String(row.id),name:String(row.name),version:String(row.version),description:String(row.description),manifest:asJson<Record<string, unknown>>(row.manifest),enabled:Boolean(row.enabled),createdAt:asNumber(row.created_at),updatedAt:asNumber(row.updated_at) };
+	}
+
 	/* ---------------- 自定义流程 ---------------- */
 
 	saveWorkflow(row: WorkflowRow): void {
 		const definition: WorkflowDefinition = { systemPrompt: row.systemPrompt, steps: row.steps };
 		this.exec(
-			`INSERT INTO workflows (id, workspace_id, name, definition, skill, created_at, updated_at)
-			 VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+			`INSERT INTO workflows (id, workspace_id, plugin_id, name, definition, skill, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
 			 ON CONFLICT (id) DO UPDATE SET
+				plugin_id  = excluded.plugin_id,
 				name       = excluded.name,
 				definition = excluded.definition,
 				skill      = excluded.skill,
@@ -325,6 +358,7 @@ export class PostgresStorage implements Storage {
 			[
 				row.id,
 				this.workspaceId,
+				row.pluginId ?? null,
 				row.name,
 				JSON.stringify(definition),
 				row.skill ? JSON.stringify(row.skill) : null,
@@ -336,7 +370,7 @@ export class PostgresStorage implements Storage {
 
 	getWorkflow(id: string): WorkflowRow | undefined {
 		const row = this.rows(
-			"SELECT id, name, definition, skill, created_at, updated_at FROM workflows WHERE id = $1",
+			"SELECT id, plugin_id, name, definition, skill, created_at, updated_at FROM workflows WHERE id = $1",
 			[id],
 		)[0];
 		return row ? this.toWorkflowRow(row) : undefined;
@@ -344,7 +378,7 @@ export class PostgresStorage implements Storage {
 
 	listWorkflows(): WorkflowRow[] {
 		return this.rows(
-			"SELECT id, name, definition, skill, created_at, updated_at FROM workflows WHERE workspace_id = $1 ORDER BY created_at ASC",
+			"SELECT id, plugin_id, name, definition, skill, created_at, updated_at FROM workflows WHERE workspace_id = $1 ORDER BY created_at ASC",
 			[this.workspaceId],
 		).map((row) => this.toWorkflowRow(row));
 	}
@@ -358,6 +392,7 @@ export class PostgresStorage implements Storage {
 		const skill = row.skill === null || row.skill === undefined ? undefined : asJson<WorkflowSkillText>(row.skill);
 		return {
 			id: String(row.id),
+			...(row.plugin_id ? { pluginId: String(row.plugin_id) } : {}),
 			name: String(row.name),
 			systemPrompt: definition.systemPrompt,
 			steps: definition.steps,
@@ -566,6 +601,22 @@ export class PostgresStorage implements Storage {
 	}
 
 	/* ---------------- 多模型管理（P6） ---------------- */
+
+	getModelSetting(key: string): string | undefined {
+		const row = this.rows("SELECT value FROM model_settings WHERE workspace_id = $1 AND key = $2", [this.workspaceId, key])[0];
+		return row ? String(row.value) : undefined;
+	}
+
+	setModelSetting(key: string, value: string | null): void {
+		if (value === null) {
+			this.exec("DELETE FROM model_settings WHERE workspace_id = $1 AND key = $2", [this.workspaceId, key]);
+			return;
+		}
+		this.exec(
+			"INSERT INTO model_settings (workspace_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+			[this.workspaceId, key, value, Date.now()],
+		);
+	}
 
 	listModelProviders(): ModelProviderRecord[] {
 		return this.rows(`${PROVIDER_COLUMNS_SQL} WHERE workspace_id = $1 ORDER BY created_at ASC`, [
@@ -1256,6 +1307,95 @@ export class PostgresStorage implements Storage {
 		return this.bridge.query(sql, params).rowCount;
 	}
 
+	/* ---------------- Agent 实体（P10） ---------------- */
+
+	private static readonly AGENT_COLUMNS =
+		"id, workspace_id, name, description, category, icon, agents_md, model_config, memory_config, advanced_config, skill_ids, kb_ids, status, created_by, created_at, updated_at, status_changed_at";
+
+	listAgents(): AgentRecord[] {
+		const rows = this.bridge.query(
+			`SELECT ${PostgresStorage.AGENT_COLUMNS} FROM agents WHERE workspace_id = $1 ORDER BY updated_at DESC`,
+			[this.workspaceId],
+		).rows;
+		return rows.map(toAgentRecord);
+	}
+
+	getAgent(id: string): AgentRecord | undefined {
+		const rows = this.bridge.query(
+			`SELECT ${PostgresStorage.AGENT_COLUMNS} FROM agents WHERE id = $1 AND workspace_id = $2`,
+			[id, this.workspaceId],
+		).rows;
+		return rows.length > 0 ? toAgentRecord(rows[0]!) : undefined;
+	}
+
+	createAgent(input: AgentInput): AgentRecord {
+		this.exec(
+			`INSERT INTO agents (id, workspace_id, name, description, category, icon, agents_md, model_config, memory_config, advanced_config, skill_ids, kb_ids, status, created_by, created_at, updated_at, status_changed_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+			[
+				input.id,
+				this.workspaceId,
+				input.name,
+				input.description ?? "",
+				input.category ?? "",
+				input.icon ?? "",
+				input.agentsMd ?? "",
+				JSON.stringify(input.modelConfig ?? {}),
+				JSON.stringify(input.memoryConfig ?? {}),
+				JSON.stringify(input.advancedConfig ?? {}),
+				JSON.stringify(input.skillIds ?? []),
+				JSON.stringify(input.kbIds ?? []),
+				input.status,
+				input.createdBy ?? null,
+				input.createdAt,
+				input.updatedAt,
+				input.statusChangedAt,
+			],
+		);
+		return this.getAgent(input.id)!;
+	}
+
+	updateAgent(id: string, patch: AgentPatch): AgentRecord | undefined {
+		const sets = ["updated_at = $1"];
+		const params: unknown[] = [patch.updatedAt ?? Date.now()];
+		const push = (column: string, value: unknown): void => {
+			params.push(value);
+			sets.push(`${column} = $${params.length}`);
+		};
+		if (patch.name !== undefined) push("name", patch.name);
+		if (patch.description !== undefined) push("description", patch.description);
+		if (patch.category !== undefined) push("category", patch.category);
+		if (patch.icon !== undefined) push("icon", patch.icon);
+		if (patch.agentsMd !== undefined) push("agents_md", patch.agentsMd);
+		if (patch.modelConfig !== undefined) push("model_config", JSON.stringify(patch.modelConfig));
+		if (patch.memoryConfig !== undefined) push("memory_config", JSON.stringify(patch.memoryConfig));
+		if (patch.advancedConfig !== undefined) push("advanced_config", JSON.stringify(patch.advancedConfig));
+		if (patch.skillIds !== undefined) push("skill_ids", JSON.stringify(patch.skillIds));
+		if (patch.kbIds !== undefined) push("kb_ids", JSON.stringify(patch.kbIds));
+		params.push(id);
+		this.exec(`UPDATE agents SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+		return this.getAgent(id);
+	}
+
+	setAgentStatus(id: string, status: AgentStatus, at: number): AgentRecord | undefined {
+		this.exec("UPDATE agents SET status = $1, status_changed_at = $2, updated_at = $3 WHERE id = $4", [
+			status,
+			at,
+			at,
+			id,
+		]);
+		return this.getAgent(id);
+	}
+
+	removeAgent(id: string): boolean {
+		return this.rowCount("DELETE FROM agents WHERE id = $1", [id]) > 0;
+	}
+
+	countAgents(): number {
+		const rows = this.bridge.query("SELECT count(*)::int AS total FROM agents").rows;
+		return rows.length > 0 ? asNumber(rows[0]!.total) : 0;
+	}
+
 	/** 单个迁移文件 = 一个事务：schema 变更和记账一起提交，失败一起回滚。 */
 	private applyMigration(migration: Migration): void {
 		this.bridge.transaction([
@@ -1266,6 +1406,42 @@ export class PostgresStorage implements Storage {
 			},
 		]);
 	}
+}
+
+/* ---------------- Agent 实体（P10）的行映射 ---------------- */
+
+function toAgentRecord(row: Record<string, unknown>): AgentRecord {
+	const asJson = <T>(value: unknown, fallback: T): T => {
+		if (value === null || value === undefined) return fallback;
+		// pg 会把 jsonb 直接反序列化成对象；TEXT 列才是字符串。两种都吃得下
+		if (typeof value === "string") {
+			try {
+				return (JSON.parse(value) as T) ?? fallback;
+			} catch {
+				return fallback;
+			}
+		}
+		return value as T;
+	};
+	return {
+		id: String(row.id),
+		workspaceId: String(row.workspace_id),
+		name: String(row.name),
+		description: String(row.description ?? ""),
+		category: String(row.category ?? ""),
+		icon: String(row.icon ?? ""),
+		agentsMd: String(row.agents_md ?? ""),
+		modelConfig: asJson(row.model_config, {}),
+		memoryConfig: asJson(row.memory_config, {}),
+		advancedConfig: asJson(row.advanced_config, {}),
+		skillIds: asJson(row.skill_ids, [] as string[]),
+		kbIds: asJson(row.kb_ids, [] as string[]),
+		status: (String(row.status ?? "draft") as AgentStatus) || "draft",
+		createdBy: row.created_by === null || row.created_by === undefined ? null : String(row.created_by),
+		createdAt: asNumber(row.created_at),
+		updatedAt: asNumber(row.updated_at),
+		statusChangedAt: asNumber(row.status_changed_at),
+	};
 }
 
 /* ---------------- 监控与可观测（P9）的行映射 ---------------- */

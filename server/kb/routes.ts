@@ -13,6 +13,8 @@
  *   POST   /api/kb/:id/search                  { query, topK?, threshold? } → { mode, results }
  *   POST   /api/kb/:id/reindex                 用当前 embedding 配置整库重算向量 → { chunks, embedded }
  *   GET    /api/kb/embedding                   { available, model, baseUrl }
+ *   GET    /api/kb/defaults                    { kbIds, knowledgeBases }「对话默认检索」的库
+ *   PUT    /api/kb/defaults                    { kbIds: string[] } 覆盖式设置（问答不走技能时用这几个库）
  *   GET    /api/skills/:skillId/kb             技能绑定的知识库
  *   PUT    /api/skills/:skillId/kb             { kbIds: string[] } 覆盖式设置
  *
@@ -117,7 +119,13 @@ function methodNotAllowed(res: ServerResponse, method: string): void {
 /** 知识库列表：GET /api/kb；建库：POST /api/kb */
 async function handleBases(service: KbService, req: IncomingMessage, res: ServerResponse): Promise<void> {
 	if (req.method === "GET") {
-		json(res, 200, service.listKnowledgeBases());
+		// 每行带 isDefault：页面的「设为对话默认」开关直接读它，不必再拼一次请求
+		const defaults = new Set(service.getDefaultBindings().kbIds);
+		json(
+			res,
+			200,
+			service.listKnowledgeBases().map((kb) => ({ ...kb, isDefault: defaults.has(kb.id) })),
+		);
 		return;
 	}
 	if (req.method === "POST") {
@@ -133,6 +141,31 @@ async function handleBases(service: KbService, req: IncomingMessage, res: Server
 		return;
 	}
 	methodNotAllowed(res, req.method ?? "GET");
+}
+
+/**
+ * 对话附件解析：POST /api/kb/extract { filename, contentBase64 }
+ * 只解析不落库——附件是"这一轮对话要用的原文"，不该污染知识库。
+ */
+async function handleExtract(service: KbService, req: IncomingMessage, res: ServerResponse): Promise<void> {
+	const body = await readJsonBody(req);
+	const filename = (optionalString(body, "filename") ?? "").trim();
+	if (filename.length === 0) {
+		throw badRequest("filename 不能为空（要带扩展名，例如 合同.pdf）");
+	}
+	if (filename.length > 200) {
+		throw badRequest("文件名最多 200 个字符");
+	}
+	let data: Buffer;
+	if (typeof body.contentBase64 === "string") {
+		data = decodeBase64(body.contentBase64);
+	} else if (typeof body.content === "string") {
+		data = Buffer.from(body.content, "utf8");
+	} else {
+		throw badRequest("缺少文件内容：传 contentBase64（推荐，二进制安全）或 content（纯文本）");
+	}
+	const result = await service.extractText({ filename, data });
+	json(res, 200, result);
 }
 
 function respondError(res: ServerResponse, error: unknown): void {
@@ -194,6 +227,37 @@ export async function handleKb(req: IncomingMessage, res: ServerResponse): Promi
 
 		if (pathname === KB_PREFIX) {
 			await handleBases(service, req, res);
+			return true;
+		}
+
+		if (pathname === `${KB_PREFIX}/defaults`) {
+			if (method === "GET") {
+				json(res, 200, service.getDefaultBindings());
+				return true;
+			}
+			if (method === "PUT") {
+				const body = await readJsonBody(req);
+				const raw = body.kbIds;
+				if (!Array.isArray(raw) || raw.some((item) => typeof item !== "string")) {
+					throw badRequest("kbIds 必须是字符串数组（知识库 id 列表）");
+				}
+				if (raw.length > 50) {
+					throw badRequest("对话默认检索最多设置 50 个知识库");
+				}
+				json(res, 200, service.setDefaultBindings(raw as string[]));
+				return true;
+			}
+			methodNotAllowed(res, method);
+			return true;
+		}
+
+		// 必须排在 `/:id` 之前，否则 "extract" 会被当成知识库 id
+		if (pathname === `${KB_PREFIX}/extract`) {
+			if (method !== "POST") {
+				methodNotAllowed(res, method);
+				return true;
+			}
+			await handleExtract(service, req, res);
 			return true;
 		}
 

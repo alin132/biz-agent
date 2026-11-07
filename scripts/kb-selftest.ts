@@ -31,7 +31,7 @@ import { PARSE_LIMITS, parseCsvToText, parseDocument, splitCsvLine } from "../se
 import { ensureKbSchema } from "../server/kb/schema.js";
 import type { KbChunkRow } from "../server/kb/schema.js";
 import { buildSnippet, cosineSimilarity, rankKeywordChunks, tokenizeQuery } from "../server/kb/search.js";
-import { createKbService, createKbServiceForPath } from "../server/kb/service.js";
+import { ATTACHMENT_MAX_CHARS, createKbService, createKbServiceForPath } from "../server/kb/service.js";
 import { createKbStore } from "../server/kb/store.js";
 import { KB_SEARCH_TOOL_NAME, createKbSearchTool } from "../server/kb/tool.js";
 import { DatabaseSync } from "node:sqlite";
@@ -518,6 +518,38 @@ async function main(): Promise<void> {
 			assert.ok(top.heading === "退款流程" || top.heading === "审批规则");
 		});
 
+		await check("附件解析：纯文本直接出文本，并如实给出原始字数", async () => {
+			const result = await service.extractText({
+				filename: "说明.txt",
+				data: Buffer.from("退款一般三个工作日到账。", "utf8"),
+			});
+			assert.equal(result.text, "退款一般三个工作日到账。");
+			assert.equal(result.totalChars, result.text.length);
+			assert.equal(result.kind, "txt");
+		});
+
+		await check("附件解析：markdown 标题保留、超长文本按上限截断且 totalChars 是截断前的值", async () => {
+			const md = await service.extractText({
+				filename: "手册.md",
+				data: Buffer.from("# 安装\n\n先装依赖。", "utf8"),
+			});
+			assert.ok(md.text.includes("安装"), md.text);
+
+			// 构造一份超过上限的文本，确认截断后 totalChars 仍报原文长度（前端据此提示「已截断」）
+			const long = "字".repeat(ATTACHMENT_MAX_CHARS + 500);
+			const truncated = await service.extractText({ filename: "长文.txt", data: Buffer.from(long, "utf8") });
+			assert.equal(truncated.text.length, ATTACHMENT_MAX_CHARS, "文本要截到上限");
+			assert.equal(truncated.totalChars, long.length, "totalChars 是截断前的原文长度");
+		});
+
+		await check("附件解析：不支持的格式给中文错误（不落库、不建库）", async () => {
+			await expectKbError(
+				() => service.extractText({ filename: "老文档.doc", data: Buffer.from("x", "utf8") }),
+				400,
+				"不支持",
+			);
+		});
+
 		await check("检索：空搜索词 400，库不存在 404", async () => {
 			await expectKbError(() => service.search(kb.id, "   "), 400, "不能为空");
 			await expectKbError(() => service.search("kb_nope", "退款"), 404, "知识库不存在");
@@ -926,6 +958,41 @@ async function main(): Promise<void> {
 			assert.ok(missing.body.error.includes("不存在"), missing.body.error);
 		});
 
+		await check("HTTP：对话默认检索 GET/PUT、列表带 isDefault、非法入参 400", async () => {
+			const empty = await api<{ kbIds: string[] }>(`/api/kb/defaults`);
+			assert.equal(empty.status, 200);
+			assert.deepEqual(empty.body.kbIds, []);
+
+			const put = await api<{ kbIds: string[]; knowledgeBases: { id: string }[] }>(`/api/kb/defaults`, {
+				method: "PUT",
+				body: { kbIds: [httpKbId] },
+			});
+			assert.equal(put.status, 200);
+			assert.deepEqual(put.body.kbIds, [httpKbId]);
+			assert.equal(put.body.knowledgeBases.length, 1);
+
+			// 列表每行带 isDefault：页面开关直接读它
+			const list = await api<{ id: string; isDefault: boolean }[]>(`/api/kb`);
+			assert.equal(list.status, 200);
+			assert.equal(list.body.find((kb) => kb.id === httpKbId)?.isDefault, true);
+
+			const bad = await api<{ error: string }>(`/api/kb/defaults`, { method: "PUT", body: { kbIds: "x" } });
+			assert.equal(bad.status, 400);
+			const missing = await api<{ error: string }>(`/api/kb/defaults`, {
+				method: "PUT",
+				body: { kbIds: ["kb_nope"] },
+			});
+			assert.equal(missing.status, 400);
+			assert.ok(missing.body.error.includes("不存在"), missing.body.error);
+
+			// 清空：库还在，但不再参与对话检索
+			const cleared = await api<{ kbIds: string[] }>(`/api/kb/defaults`, { method: "PUT", body: { kbIds: [] } });
+			assert.equal(cleared.status, 200);
+			assert.equal(cleared.body.kbIds.length, 0);
+			const afterClear = await api<{ id: string; isDefault: boolean }[]>(`/api/kb`);
+			assert.equal(afterClear.body.find((kb) => kb.id === httpKbId)?.isDefault, false);
+		});
+
 		await check("HTTP：未知路径 404、方法不支持 405", async () => {
 			const unknown = await api<{ error: string }>(`/api/kb/a/b/c`);
 			assert.equal(unknown.status, 404);
@@ -1076,17 +1143,103 @@ async function main(): Promise<void> {
 			assert.ok(text.includes("（关键词检索，共 1 条）"), text);
 		});
 
-		await check("工具：未绑定知识库 / 未加载技能都返回中文说明，不抛错", async () => {
+		await check("工具：没有可检索的库时返回中文说明，不抛错", async () => {
 			const unbound = createKbSearchTool({ getActiveSkillId: () => "flow_without_kb" });
 			const unboundText = await runTool(unbound, { query: "退款" });
-			assert.ok(unboundText.includes("还没有绑定知识库"), unboundText);
+			assert.ok(unboundText.includes("没有可检索的知识库"), unboundText);
 			assert.equal(unboundText.includes("[片段"), false);
 
+			// 没加载技能、也没有「对话默认检索」的库：同样只是一句说明
 			const noSkill = createKbSearchTool({ getActiveSkillId: () => null });
 			const noSkillText = await runTool(noSkill, { query: "退款" });
-			assert.ok(noSkillText.includes("还没有加载技能"), noSkillText);
+			assert.ok(noSkillText.includes("没有可检索的知识库"), noSkillText);
 		});
 
+		await check("对话默认检索：不加载技能也能查到资料（RAG）", async () => {
+			toolService.setDefaultBindings([refundKb.id]);
+			const noSkill = createKbSearchTool({ getActiveSkillId: () => null });
+			const text = await runTool(noSkill, { query: "退款" });
+			assert.ok(text.includes("退款流程.md"), text);
+			assert.ok(text.includes("（关键词检索，共 1 条）"), text);
+
+			// 没传技能 id 也要能查：不能因为"没加载技能"就退化
+			const emptySkill = createKbSearchTool({ getActiveSkillId: () => "" });
+			const emptyText = await runTool(emptySkill, { query: "退款" });
+			assert.ok(emptyText.includes("退款流程.md"), emptyText);
+		});
+
+		await check("对话默认检索：技能绑定优先，不被默认库污染", async () => {
+			toolService.setDefaultBindings([refundKb.id]);
+			const attendance = createKbSearchTool({ getActiveSkillId: () => "flow_attendance_tool" });
+			const text = await runTool(attendance, { query: "退款" });
+			assert.equal(text.includes("退款流程.md"), false, "技能绑了考勤库时不应该查默认的退款库");
+			assert.ok(text.includes("没有找到相关内容"), text);
+		});
+
+		await check("对话默认检索：覆盖式设置、校验不存在的库、删除库后自动剔除", () => {
+			const created = toolService.createKnowledgeBase({ name: "临时默认库" });
+			toolService.setDefaultBindings([refundKb.id, created.id]);
+			assert.deepEqual(toolService.getDefaultBindings().kbIds.slice().sort(), [refundKb.id, created.id].sort());
+
+			// 再设一次就是整体覆盖，不是追加
+			toolService.setDefaultBindings([attendanceKb.id]);
+			assert.deepEqual(toolService.getDefaultBindings().kbIds, [attendanceKb.id]);
+			assert.equal(toolService.getDefaultBindings().knowledgeBases[0]?.name, "隔离对照库");
+
+			assert.throws(() => toolService.setDefaultBindings(["kb_not_exists"]), /这些知识库不存在/);
+
+			// 库被删掉后，残留绑定不能让检索 404：getDefaultKbIds 直接过滤掉
+			toolService.setDefaultBindings([refundKb.id, created.id]);
+			toolService.removeKnowledgeBase(created.id);
+			assert.deepEqual(toolService.getDefaultBindings().kbIds, [refundKb.id]);
+			toolService.setDefaultBindings([]);
+			assert.equal(toolService.getDefaultBindings().kbIds.length, 0);
+		});
+
+
+		await check("Agent 绑定：技能没绑时用 Agent 的库（第二优先级）", async () => {
+			toolService.setDefaultBindings([attendanceKb.id]);
+			// 技能没绑库、Agent 绑了退款库：应该查 Agent 的库，而不是落回默认的考勤库
+			const tool = createKbSearchTool({
+				getActiveSkillId: () => "flow_without_kb",
+				getAgentKbIds: () => [refundKb.id],
+			});
+			const text = await runTool(tool, { query: "退款" });
+			assert.ok(text.includes("退款流程.md"), text);
+		});
+
+		await check("Agent 绑定：技能绑定优先于 Agent 绑定（第一优先级）", async () => {
+			// 技能绑了考勤库、Agent 绑了退款库：技能更具体，必须赢
+			const tool = createKbSearchTool({
+				getActiveSkillId: () => "flow_attendance_tool",
+				getAgentKbIds: () => [refundKb.id],
+			});
+			const text = await runTool(tool, { query: "退款" });
+			assert.equal(text.includes("退款流程.md"), false, "技能绑了库时不该被 Agent 的库盖过");
+			assert.ok(text.includes("没有找到相关内容"), text);
+		});
+
+		await check("Agent 绑定：空绑定视为没绑，落回对话默认（不挡掉默认库）", async () => {
+			toolService.setDefaultBindings([refundKb.id]);
+			const empty = createKbSearchTool({ getActiveSkillId: () => null, getAgentKbIds: () => [] });
+			const emptyText = await runTool(empty, { query: "退款" });
+			assert.ok(emptyText.includes("退款流程.md"), "空数组不能让默认库失效");
+
+			// 全是空白串的绑定同样按"没绑"处理
+			const blank = createKbSearchTool({ getActiveSkillId: () => null, getAgentKbIds: () => ["  "] });
+			const blankText = await runTool(blank, { query: "退款" });
+			assert.ok(blankText.includes("退款流程.md"), blankText);
+		});
+
+		await check("Agent 绑定：声明了不存在的库 → 空结果说明，不抛错", async () => {
+			toolService.setDefaultBindings([]);
+			const tool = createKbSearchTool({
+				getActiveSkillId: () => null,
+				getAgentKbIds: () => ["kb_not_exists"],
+			});
+			const text = await runTool(tool, { query: "退款" });
+			assert.ok(text.includes("没有可检索的知识库"), text);
+		});
 		await check("工具：已绑定但没有命中 → 中文说明（空结果不报错）", async () => {
 			const text = await runTool(kbTool, { query: "量子纠缠" });
 			assert.ok(text.includes("没有找到相关内容"), text);

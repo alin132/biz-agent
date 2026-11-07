@@ -116,6 +116,15 @@ export async function handleMonitorRoute(
 		const limit = clampInt(url.searchParams.get("limit"), 50, 1, 200);
 		const offset = clampInt(url.searchParams.get("offset"), 0, 0, Number.MAX_SAFE_INTEGER);
 		const filter: TraceFilter = { limit, offset };
+		if (url.searchParams.has("range")) {
+			const window = parseRange(url.searchParams.get("range"));
+			if (!window) {
+				sendJson(res, 400, { error: "时间范围不合法" });
+				return true;
+			}
+			filter.to = Date.now();
+			filter.from = filter.to - window.ms;
+		}
 		if (sessionId.length > 0) {
 			filter.sessionId = sessionId;
 		} else if (owned) {
@@ -123,6 +132,7 @@ export async function handleMonitorRoute(
 		}
 		const items = ctx.observability.listTraces(filter).map(toTraceItem);
 		const total = ctx.observability.countTraces({
+			...(filter.from !== undefined ? { from: filter.from, to: filter.to } : {}),
 			...(filter.sessionId ? { sessionId: filter.sessionId } : {}),
 			...(filter.sessionIds ? { sessionIds: filter.sessionIds } : {}),
 		});

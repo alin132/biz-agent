@@ -33,8 +33,11 @@ export interface CreateBusinessAgentOptions {
 	maxTurns?: number;
 	/** 上下文滑动窗口大小。 */
 	maxContextMessages?: number;
+	maxContextRounds?: number;
 	/** 可选的流程引擎；不传则内部创建。 */
 	engine?: WorkflowEngine;
+	/** 加载技能前的原会话进度，重建和恢复时沿用。 */
+	baseWorkflowState?: WorkflowState;
 	/** 恢复历史对话时传入已持久化的消息，让模型保留上下文。 */
 	messages?: AgentMessage[];
 	/**
@@ -49,6 +52,11 @@ export interface CreateBusinessAgentOptions {
 	skills?: SkillDef[];
 	/** 换技能时永远保留的工具名（技能加载工具、flow_xxx 流程工具）。 */
 	keepToolNames?: string[];
+	/**
+	 * 额外的系统提示片段（会话层注入）。目前用于「知识库可以直接检索」这类
+	 * 不属于流程定义、但模型必须知道的运行时事实。
+	 */
+	systemPromptExtras?: string[];
 }
 
 export interface BusinessAgent {
@@ -69,11 +77,16 @@ export interface BusinessAgent {
 	clearSkill(): void;
 	/** 当前实际暴露给模型的工具名（会话视图与落库用）。 */
 	toolNames(): string[];
+	limitReached(): boolean;
+	baseWorkflowState(): WorkflowState;
 }
 
 /** 把流程步骤渲染进系统提示词；技能目录（渐进式披露的第一层）附在最后。 */
-function buildSystemPrompt(workflow: WorkflowDef, skills: SkillDef[]): string {
+function buildSystemPrompt(workflow: WorkflowDef, skills: SkillDef[], extras: string[] = []): string {
 	const catalog = skillCatalogPrompt(skills);
+	// 会话层的运行时事实（例如「知识库可以直接检索」）接在技能目录后面，
+	// 不写进流程定义——流程定义是持久的，这类事实可能随库配置变化
+	const extraBlock = extras.length > 0 ? ["", ...extras].join("\n") : "";
 
 	// 没有步骤 = 自动编排：不强制顺序，让模型自己在工具与流程工具之间选
 	if (workflow.steps.length === 0) {
@@ -91,7 +104,7 @@ function buildSystemPrompt(workflow: WorkflowDef, skills: SkillDef[]): string {
 			"- 调用流程工具之后，它返回的就是这条流程的执行结果：把它整理成面向用户的回答（可以提炼要点），",
 			'  不要只回「好的」「收到」「已完成」这类客套话。',
 			"- 做完后用一段话汇报结果；不要停在半路，也不要重复调用同一个工具。",
-			catalog,
+			catalog + extraBlock,
 		].join("\n");
 	}
 
@@ -116,7 +129,7 @@ function buildSystemPrompt(workflow: WorkflowDef, skills: SkillDef[]): string {
 		"  属于别的完整业务流程就先用 `use_skill` 换成那条技能，单步的事直接调业务工具，",
 		"  只是想整条丢出去才用 `flow_xxx` 委托；无论哪种，都要把结果整理成回答。",
 		'- 调用流程工具（flow_xxx）之后，它返回的就是执行结果：整理成面向用户的回答，不要只回「好的」这类客套话。',
-		catalog,
+		catalog + extraBlock,
 	].join("\n");
 }
 
@@ -124,6 +137,7 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 	const { workflow, registry, ctx, model, streamFn } = options;
 	const maxTurns = options.maxTurns ?? 20;
 	const maxContextMessages = options.maxContextMessages ?? 40;
+	const transform = createContextTransformer({ maxMessages: maxContextMessages, maxRounds: options.maxContextRounds });
 
 	// 允许外部传入引擎，便于调用方（如 Web 会话）读取流程状态或给模型脚本注入步骤。
 	const engine = options.engine ?? new WorkflowEngine(workflow);
@@ -132,12 +146,21 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 	const skills = options.skills ?? [];
 	const skillById = new Map(skills.map((skill) => [skill.id, skill]));
 	const keepToolNames = options.keepToolNames ?? [];
-	const systemPrompt = buildSystemPrompt(workflow, skills);
+	const systemPrompt = buildSystemPrompt(workflow, skills, options.systemPromptExtras ?? []);
+
+	// 历史消息里开头那条 system 是"上一次装配时的系统提示"，不是对话内容。
+	// 留着它 Pi 就不会采用本次新拼的 systemPrompt（见下面 initialState 的注释），
+	// 所以这里先剥掉：真正的"对话历史"从第一条非 system 消息开始。
+	const history = options.messages ?? [];
+	// 全 system（或没有历史）= 没有真实对话内容，整份丢掉即可，提示完全由本次装配决定
+	const firstNonSystem = history.findIndex((message) => message.role !== "system");
+	const restored = firstNonSystem >= 0 ? history.slice(firstNonSystem) : [];
 
 	let turns = 0;
 	let lastTurnHadError = false;
+	let limitReached = false;
 	/** 会话原流程的进度：加载技能前存一份，退出技能时恢复回去。 */
-	let savedWorkflowState: WorkflowState | undefined;
+	let savedWorkflowState = options.baseWorkflowState ? structuredClone(options.baseWorkflowState) : undefined;
 	let activeSkill: SkillDef | null = null;
 	let currentToolNames = [...toolNames];
 
@@ -146,11 +169,27 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 			systemPrompt,
 			model,
 			tools,
-			// 有历史消息就恢复上下文；此时系统提示词来自历史里的第一条 system 消息
-			...(options.messages && options.messages.length > 0 ? { messages: options.messages } : {}),
+			// 有历史消息就恢复上下文，但**必须剥掉历史开头那条 system 消息**：
+			// Pi 的 Agent 只在"历史不以 system 开头"时才采用 initialState.systemPrompt，
+			// 否则整份新提示会被丢掉、继续沿用历史里那份旧的。
+			// 后果很隐蔽：换模型 / 切计划模式都会重建 agent，提示明明重新拼过，
+			// 模型收到的却还是老的（表现就是"开了计划模式，模型照旧直接动手"）。
+			// 这里统一让**本次新拼的提示**赢。
+			...(restored.length > 0 ? { messages: restored } : {}),
 		},
 		streamFn,
-		transformContext: createContextTransformer({ maxMessages: maxContextMessages }),
+		transformContext: async (messages) => {
+			const context = await transform(messages);
+			if (!activeSkill) return context;
+			// 临时上下文消息：不写入系统提示和历史，退出技能后立即消失。
+			const instruction: AgentMessage = {
+				role: "user", timestamp: Date.now(),
+				content: `当前技能「${activeSkill.name}」的作业指导书：\n\n${activeSkill.instructions}`,
+			};
+			const first = context.findIndex((message) => message.role !== "system");
+			const index = first < 0 ? context.length : first;
+			return [...context.slice(0, index), instruction, ...context.slice(index)];
+		},
 		beforeToolCall: createPermissionHook(ctx, registry),
 		afterToolCall: createAuditHook(ctx),
 		finishTurn: (turn) => {
@@ -160,6 +199,11 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 
 			const hasToolCalls = turn.toolResults.length > 0;
 			const hadError = turn.toolResults.some((result) => result.isError);
+			turns++;
+			if (hasToolCalls && turns >= maxTurns) {
+				limitReached = true;
+				return { action: "end" };
+			}
 
 			// 这一轮模型没调工具，说明它想收尾了。
 			if (!hasToolCalls) {
@@ -178,8 +222,11 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 			}
 
 			lastTurnHadError = hadError;
-			turns++;
-			return turns >= maxTurns ? { action: "end" } : { action: "continue" };
+			if (turns >= maxTurns) {
+				limitReached = true;
+				return { action: "end" };
+			}
+			return { action: "continue" };
 		},
 		prepareNextTurnWithContext: (): AgentLoopTurnUpdate => {
 			const nudge: SystemMessage = {
@@ -189,6 +236,13 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 			};
 			return { messages: [nudge] };
 		},
+	});
+	agent.subscribe((event) => {
+		if (event.type === "agent_start") {
+			turns = 0;
+			lastTurnHadError = false;
+			limitReached = false;
+		}
 	});
 
 	/**
@@ -210,7 +264,7 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 			throw new Error(`未注册的技能: ${String(target)}`);
 		}
 		// 只在"从无技能到有技能"时快照原流程进度，技能之间来回切不该覆盖它
-		if (activeSkill === null) {
+		if (activeSkill === null && savedWorkflowState === undefined) {
 			savedWorkflowState = structuredClone(engine.state);
 		}
 		activeSkill = skill;
@@ -236,6 +290,8 @@ export function createBusinessAgent(options: CreateBusinessAgentOptions): Busine
 		activateSkill,
 		clearSkill,
 		toolNames: () => currentToolNames,
+		limitReached: () => limitReached,
+		baseWorkflowState: () => structuredClone(savedWorkflowState ?? engine.state),
 	};
 }
 

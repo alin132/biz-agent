@@ -14,6 +14,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 export interface ContextWindowOptions {
 	/** 保留的最近消息条数（不含开头的 system 消息）。 */
 	maxMessages: number;
+	/** 配置时按用户轮次保留，工具调用及其结果跟随所属轮次。 */
+	maxRounds?: number;
 }
 
 /** 生成一个 Pi 兼容的 system 消息（Pi 的 SystemMessage 仅需 role/content/timestamp）。 */
@@ -24,6 +26,14 @@ function systemNotice(text: string): AgentMessage {
 function createContextTransformer(options: ContextWindowOptions) {
 	return async (messages: AgentMessage[]): Promise<AgentMessage[]> => {
 		const { maxMessages } = options;
+		if (options.maxRounds !== undefined) {
+			const starts = messages.flatMap((message, index) => message.role === "user" ? [index] : []);
+			const boundary = starts[starts.length - options.maxRounds];
+			if (starts.length <= options.maxRounds || boundary === undefined) return messages;
+			// 压缩后的首条助手摘要属于背景，随系统消息保留，但不提升为系统指令。
+			const prefix = messages.slice(0, starts[0]);
+			return [...prefix, systemNotice("[上下文压缩] 较早的对话已按记忆轮数省略。"), ...messages.slice(boundary)];
+		}
 		if (messages.length <= maxMessages) {
 			return messages;
 		}

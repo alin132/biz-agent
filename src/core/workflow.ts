@@ -76,21 +76,12 @@ export class WorkflowEngine {
 		const record: ToolCallRecord = { name: toolName, ok };
 		this.state.calls.push(record);
 		const before = this.state.stepIndex;
-		this.advance();
-		this.lastCall = { name: toolName, advanced: this.state.stepIndex > before };
-	}
-
-	/** 连续推进：一个工具可能同时满足多个步骤（理论上），或者上一步已完成但没及时推进。 */
-	private advance(): void {
-		while (!this.done) {
-			const step = this.def.steps[this.state.stepIndex]!;
-			const satisfied = this.state.calls.some((call) => call.ok && step.via.includes(call.name));
-			if (!satisfied) {
-				break;
-			}
+		const step = this.currentStep;
+		if (ok && step?.via.includes(toolName)) {
 			this.state.completed.push(step.id);
 			this.state.stepIndex++;
 		}
+		this.lastCall = { name: toolName, advanced: this.state.stepIndex > before };
 	}
 
 	/** 给模型的下一步指令；全部完成时要求它收尾汇报。 */

@@ -36,10 +36,13 @@ const PROVIDERS: ProviderSpec[] = [
 
 /**
  * 每个 provider 的默认模型。
- * DeepSeek 默认 v4-pro：flash 在高峰期容易 503，且单次响应要 20 秒以上。
+ *
+ * DeepSeek 默认用 flash：便宜、够用，项目阶段的联调与测试都跑它。
+ * 历史记录（别再踩一次）：高峰期 flash 会持续 503「Service is too busy」、单次要 20 秒以上，
+ * v4-pro 约 1~2 秒一次工具调用。做正式演示或批量压测时用 `LLM_MODEL=deepseek-v4-pro` 显式切回去。
  */
 const DEFAULT_MODEL: Record<string, string> = {
-	deepseek: "deepseek-v4-pro",
+	deepseek: "deepseek-flash",
 };
 
 /** 单次请求超时，防止连接挂死。 */

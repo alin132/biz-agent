@@ -33,35 +33,39 @@
   `flow_<id>`，由模型自己判断——简单的事直接调工具，整条的活就调流程工具。实测同一个会话里：
   问「把已支付订单按区域汇总金额」→ 直接调 `data_aggregate`；说「处理 TK-1001 的支付超时工单，
   指派李工并通知用户」→ 自己挑 `flow_ticket_flow` 整条跑完。
-- **D 技能**：上面每条流程还能当**技能**加载进当前会话（正文说明 + 该技能的工具集 + 步骤条切换），
+- **D 插件扩展**：插件页可导入 `biz-agent.plugin.v1` JSON 清单，声明技能与外部 HTTP/SSE MCP 服务；插件技能进入统一技能目录，可启停和卸载。清单只承载数据，不执行脚本；不接受 stdio 命令、凭证或非 HTTPS 远程地址。MCP 凭证在 MCP 页面单独配置。
+- **E 技能**：上面每条流程还能当**技能**加载进当前会话（正文说明 + 该技能的工具集 + 步骤条切换），
   过程可见、中途能插话、能随时换回原流程。和 `flow_*` 委托执行互补，详见下文「技能（Skill）」。
 
-平台化改造按 [docs/ROADMAP.md](docs/ROADMAP.md) 分阶段推进，**P1–P9 全部完成**（P8 的控制台页面也已接上）。
+平台化改造按 [docs/ROADMAP.md](docs/ROADMAP.md) 分阶段推进，**P1–P9 全部完成**（P8 的控制台页面也已接上）；P10 插件包首版已实现。
 每个阶段都留了可重跑的入口（项数是本机实测）：
 
 | 阶段 | 内容 | 验收入口（实测项数） | 状态 |
 |---|---|---|---|
-| P1 | 侧边栏模块导航壳（11 个模块） | `ui-dom-check` 248 项 | 完成 |
+| P1 | 侧边栏模块导航壳（12 个模块） | `ui-dom-check` 268 项 | 完成 |
 | P2 | 存储层 + Postgres/pgvector 路径 | `smoke` / `persist-check` / `db:check` 双后端、`kb:pg:selftest` 16 项 | 完成（PG 用 PGlite 真内核验证；Docker 镜像本身未实机） |
 | P3 | 企业安全（登录 / JWT / 四角色 / 限流 / 审计） | `auth:selftest` 41 项 + `smoke:auth` 51 项 | 完成 |
 | P4 | 开放 API（API Key + `/v1/chat` + `/v1/health`） | `smoke:openapi` 53 项 | 完成 |
-| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`/整库重新向量化） | `kb:selftest` 55 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 24 项 + 场景 G2 13 项 | 完成 |
-| P6 | 多模型管理（供应商 + 模型 + 当前选择 + 连通性探测） | `models:selftest` 22 项 | 完成 |
+| P5 | 知识库 RAG（上传/解析/分块/检索/绑定/`kb_search`/对话默认检索/整库重新向量化） | `kb:selftest` 66 项 + `kb:pg:selftest` 16 项（pgvector）+ `smoke` 场景 G 29 项 + 场景 G2 14 项 | 完成 |
+| P6 | 多模型管理（供应商 + 模型 + 当前选择 + 连通性探测） | `models:selftest` 24 项 | 完成 |
 | P7 | MCP 集成（stdio / HTTP / SSE 三种传输） | `mcp:selftest` 30 项 + `smoke:mcp` 45 项 | 完成 |
 | P8 | IM Bot 网关（钉钉 + 企业微信自建应用、加密回调、测试发送与 fake outbox） | `im:selftest`、`wecom:selftest`、`smoke:im`、`smoke:wecom` | 完成（平台实网待配置凭证联调） |
 | P9 | 监控与可观测（trace_id / 调用链 / 聚合 / 保留期自动清理） | `obs:selftest` 24 项 + `smoke:monitor` 61 项 | 完成 |
+| P10 | 插件包（清单导入、技能贡献、MCP HTTP/SSE 声明、启停 / 卸载） | `smoke` 插件场景 I 9 项 | 首版完成 |
 
 `npm run typecheck` 通过、`npm run verify` 55 项边界检查、`npm run ui-check` 14 项前端渲染单测、
-`npm run ui-dom-check` **248 项**控制台接线自检、`npm run kb:selftest` 55 项知识库自检、
+`npm run ui-dom-check` **268 项**控制台接线自检、`npm run kb:selftest` 66 项知识库自检、
 `npm run kb:pg:selftest` 16 项 Postgres/pgvector 自检、
-`npm run auth:selftest` 41 项安全自检、`npm run models:selftest` 22 项多模型自检、
+`npm run auth:selftest` 41 项安全自检、`npm run models:selftest` 24 项多模型自检、
 `npm run mcp:selftest` 30 项 MCP 自检、`npm run obs:selftest` 24 项可观测自检、
-`npm run smoke` 182 项端到端检查、`npm run smoke:auth` 51 项鉴权端到端、
+`npm run smoke` 204 项端到端检查（含插件生命周期场景 I 与对话默认检索）、`npm run smoke:auth` 51 项鉴权端到端、
 `npm run smoke:openapi` 53 项开放 API / 多模型端到端、`npm run smoke:mcp` 45 项 MCP 端到端、
 `npm run smoke:monitor` 61 项监控端到端、`npm run im:selftest` 26 项 IM 自检、
 `npm run smoke:im` 37 项 IM 端到端（P8，要 `DINGTALK_TRANSPORT=fake` 实例）全部通过；
+新前端另有 `npm run ui:e2e` 18 组 Playwright 真实浏览器回归、`npm run agents:selftest` 40 项 Agent 实体自检、
+`npm run smoke:agents` 25 项 Agent HTTP 冒烟；
 界面观感用 `npm run ui-shot`（本机 Edge/Chrome 无头截图）核对。
-**11 个模块页全部接真接口，没有空态占位**；只有接口 404 / 连不上时页面才回落到说明 + 接口清单
+**12 个模块页全部接真接口，没有空态占位**（新前端另加一个 Agent 页，见下文）；只有接口 404 / 连不上时页面才回落到说明 + 接口清单
 （403 显示「权限不足」，不混进「未接入」）。
 
 ---
@@ -72,24 +76,47 @@
 npm run dev          # 启动后打开 http://127.0.0.1:4317
 ```
 
-**对话**模块是三列网格（模块导航 + 会话栏 + 对话区）；右侧技能栏已隐藏，技能在「技能」页加载、管理与退出。
-消息与输入框统一居中、最大宽度 800px；≤900px 收起会话栏，小屏自动换行。
+**对话**模块是三列网格（模块导航 + 会话栏 + 对话区）；技能在对话工具栏选择，在「技能」页管理。
+助手消息从对话区左侧展开，用户消息靠右并限制宽度；输入框与对话区对齐，不限制消息区高度。≤900px 收起会话栏，小屏自动换行。
 其它模块切成两列（模块导航 + 整宽模块页）：
 
-- **模块导航**（最左 76px 导航栏，11 个图标及中文名称）：`对话` / `知识库` / `技能` / `模型` / `MCP` / `IM 机器人` /
-  `审批` / `审计` / `成员` / `监控` / `设置`。`对话` 就是上面的三列工作台；点其它图标切到模块页
+- **模块导航**（最左 76px 导航栏，12 个图标及中文名称）：`对话` / `知识库` / `技能` / `模型` / `MCP` / `IM 机器人` /
+  `审批` / `审计` / `成员` / `监控` / `插件` / `设置`。`对话` 就是上面的三列工作台；点其它图标切到模块页
   ——`.shell.module-view` 收成两列（导航 + 整宽内容），会话栏与右栏技能面板一起收起，切回 `对话`
-  恢复会话列表 / 当前会话 / 技能高亮（不重拉数据）。旧的「清空全部会话」入口随导航改造下线（暂不补）
+  恢复会话列表 / 当前会话 / 技能状态（不重拉数据）。
 - **会话栏**：`新聊天` → `置顶`（本地收藏，会话行菜单里可置顶/取消，存 `localStorage`）→
   `会话`（平铺，不按流程分组；行尾小徽标显示这条会话当前加载的技能）→ `已归档`（默认收起）。
   **没有"先选流程"这一步**：新聊天直接开一个会话（默认自动编排），模型按你的话自己决定要不要加载技能
-- **中栏**：对话流。Agent 的文字**逐字流式输出**，每次工具调用渲染成一张卡片——
-  工具名、入参、状态（运行中 / 完成 xx ms / 失败）、返回结果，全部可见；页头是**技能胶囊**
-  （纯状态：`技能：无` / `技能：<名字>`，不做下拉入口）、会话标题与步骤条，「运行详情」抽屉里只有
-  **当前进度**与**审计流水**
-- **右栏技能面板**（常驻）：顶部「技能」+ ＋新建技能；**当前技能块**显示名字与 `当前技能 · N 步`、
-  可一键「退出技能」；下面是技能列表（点行装进当前会话，行尾「⋯」查看 / 编辑 / 删除）。
-  **自动编排（`auto-flow`）不在列表里**——它是默认聊天模式，不是"可加载的技能"，点它等于什么都没换
+- **对话区**：普通会话和 Agent 会话都显示当前技能、步骤、任务耗时及工具调用记录；工具记录可展开查看参数、结果、状态和耗时，带 `command` 参数的调用会突出显示命令。
+  工具摘要与每轮任务耗时随会话持久化，重新打开历史会话仍可查看。上下文用量以 `k` 显示，优先采用模型返回的输入 token 数，缺失时按当前上下文估算；悬停可查看来源与 token 数。
+- **技能**：在对话工具栏选择和退出；技能页提供新建、查看、编辑与删除。**自动编排（`auto-flow`）不在技能目录里**，它是默认聊天模式。
+- **Agent 对话**：从 Agent 页单独进入，Agent 会话与普通会话分开显示；创建会话时固定模型、记忆和高级策略快照。
+
+### Agent 实体（新前端的「Agent」页）
+
+新前端（`client/`）在「构建」分组下多了一个 **Agent** 页：把模型、技能、知识库与人格指令打包成一个
+**可发布、可停用**的智能体。它的实体模型照搬 AgentOne 的实体模型，没有再发明一套：
+
+- **六维配置**（编辑抽屉里就是六个 Tab）：基础信息（名称 / 简介 / 分类）/ **人格与指令**（`agentsMd`，
+  AGENTS.md 风格的 Markdown）/ **模型策略**（`modelConfig`：对话模型、温度、Top P、最大 token、流式）/
+  **记忆**（`memoryConfig`：短期保留轮数、溢出策略）/ **能力绑定**（`skillIds` + `kbIds`）/ **高级**（`advancedConfig`）
+- **状态机**：`draft → testing → published → stopped`，任意状态可 `revert` 回草稿。两条硬规则（来自 AgentOne §2）：
+  **已发布不能直接改配置**（`PATCH` 返回 409 + `code: "published_locked"`，必须先召回草稿）；
+  **已停用不能对话**（`code: "stopped_not_chattable"`）。卡片上的动作按钮跟着状态走，已发布态的「配置」按钮直接禁用
+- 后端是自包含模块 `server/agents/**`（`service.ts` 状态机 + `routes.ts` 的 `/api/agents*`），表在 `agents`
+  （SQLite 内建 + PG 迁移 `0008_agents.sql`），**与会话解耦**：Agent 是配置，会话是运行实例
+- 参数越界是**钳制**不是报错（`temperature` 钳到 0–2、`topP` 到 0–1、`maxTokens` 到 1–128000、记忆轮数到 1–100），
+  调参手滑不会丢掉整张表单
+
+执行策略在创建会话时保存快照，之后修改 Agent 不改变已有会话的模型参数、记忆策略和高级设置。
+短期记忆按用户轮次保留完整工具交互；选择「摘要」时，超出轮数先调用模型总结，失败如实报错。
+关闭流式输出会等最终答案生成后一次展示；隐藏思考只影响前端事件，不改变模型内部推理。
+最大推理轮数按每条用户消息重新计数，达到上限明确提示停止。停用 Agent 后，已有会话也拒绝新消息，历史仍可查看。
+
+功能契约回归：`npm run contracts:selftest` 使用临时 SQLite 和假模型验证执行行为；
+`npm run ui:e2e` 运行新前端真实浏览器回归，覆盖 14 个模块、Agent 对话活动记录、按钮与移动端布局，并将截图写到 `data/ui-redesign/`；
+`npm run contracts:e2e` 自动启动隔离实例，验证登录鉴权、SSE、停用限制及 UI / Agent HTTP 回归。
+运行浏览器回归前先执行 `npm run web:build`，并启动服务；测试使用模拟模型，不调用真实模型。
 
 模块页的数据来源，界面上如实区分：
 
@@ -103,8 +130,8 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
   `审计`（`/api/audit`，过滤 + 分页 + traceId 列）、
   `设置`（当前模型、权限模式、**存储后端**、会话数、技能数、运行时长，以及 **API Key 管理**：新建（明文只显示一次）/
   停用 / 吊销，接 `/api/api-keys*`）、
-  `监控`（KPI + 技能 / MCP / 模型的调用分组 + 调用链列表与事件时间轴，接 `/api/monitor*`）；`对话` 就是工作台
-- **11 个模块页全部接真接口，没有空态占位**；只有接口 404 / 连不上时才回落到「未接入」说明 +
+  `监控`（KPI + 技能 / MCP / 模型的调用分组 + 调用链列表与事件时间轴，接 `/api/monitor*`）、`插件`（JSON 清单导入、启停与卸载，接 `/api/plugins*`）；`对话` 就是工作台
+- **12 个模块页全部接真接口，没有空态占位**；只有接口 404 / 连不上时才回落到「未接入」说明 +
   接口清单（403 显示「权限不足」，不混进「未接入」）。
 - 审批页**只列当前挂起中的待办**：进程重启后没有历史审批可查（见「已知限制」）。
 
@@ -198,6 +225,17 @@ npm run dev          # 启动后打开 http://127.0.0.1:4317
 | POST | `/api/models` | 新建模型 `{ providerId, modelId, name?, kind?, enabled?, contextWindow? }` → 201 |
 | GET / PATCH / DELETE | `/api/models/:id` | 详情 / 改 / 删 |
 | POST | `/api/models/:id/ping` | 连通性探测 → **始终 200** `{ id, ok, latencyMs, error? }`（8 秒超时，失败给中文原因） |
+
+**Agent 实体（六维配置 + 状态机）**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/agents` | 列表 `{ items }`（按 `updatedAt` 倒序，每项带中文 `statusLabel`） |
+| POST | `/api/agents` | 新建 → 201。**一律从 `draft` 起步**（不允许直接建出已发布的）；名称为空/超 60 字 → 400 |
+| GET | `/api/agents/:id` | 详情；不存在 → 404 |
+| PATCH | `/api/agents/:id` | 改配置（PATCH 语义：不传不改）。**已发布 → 409 `code:"published_locked"`**，须先召回草稿 |
+| DELETE | `/api/agents/:id` | 物理删除 → `{ removed: true }` |
+| POST | `/api/agents/:id/actions` | 状态机 `{ action: "test" \| "publish" \| "stop" \| "revert" }`；非法迁移 → 409 `code:"illegal_transition"`。合法迁移只有：草稿→试运行/已发布、试运行→已发布/草稿、已发布→已停用/草稿、已停用→草稿 |
 
 **API Key 与开放 API（P4）**：
 
@@ -444,6 +482,19 @@ markdown 渲染单独放在 `web/markdown.js`（经典脚本，挂 `window.rende
 - 绑定关系落 `skill_kb_bindings`；删库会连带清掉绑定。
 - 会话里 `kb_search` 按当前技能 id（没加载技能时回落到会话自己的流程）查绑定并聚合检索（多库按分值合并、取 topK）；
   没绑定 / 没命中 / 知识库模块报错都返回一句中文说明，**不把工具调用打成失败**，模型可以照常回答并说明没查到。
+
+### 对话默认检索（不加载技能也能 RAG）
+
+绑给技能是"按技能查"，但日常问答不该强制先挑技能，所以还有一条**对话默认检索**：
+
+- `GET /api/kb/defaults` → `{ kbIds, knowledgeBases }`；`PUT` 同一路径、body `{ kbIds: string[] }` 覆盖式设置
+  （不存在的库 → 400；最多 50 个）。`GET /api/kb` 每行多一个 `isDefault`，控制台开关直接读它。
+- **解析顺序**：当前技能绑定了库 → 用技能的；没绑定 / 没加载技能 → 用对话默认库。
+  这样"加载了绑定技能"的会话不会被默认库污染，而普通问答又能直接查资料。
+- 有默认库时，会话的系统提示里会多一段「# 知识库」点名这些库该怎么用（先 `kb_search` 再回答、
+  引用要标来源、没查到就说没查到）——模型不知道有这条路就永远不会调工具。
+- 绑定关系落 `kb_default_bindings`（SQLite 在 `server/kb/schema.ts` 建表，PG 走 `0010_kb_defaults.sql`）；
+  删库时残留绑定会在读取时被过滤掉，不会让检索 404。
 
 ### 控制台页面
 
@@ -726,6 +777,42 @@ Postgres 路径（P2）：
 
 ---
 
+## 编码 Agent（CLI）
+
+前面那些都是"配置面"：用页面管 Agent、知识库、技能。这一层是**执行面**——一个能在本地仓库里真正干活的编码 Agent，
+形态对齐 Codex：cd 到项目里，说一句"把这个 bug 修了"，它自己读文件、改代码、跑测试。
+
+```bash
+npm run code                      # 在当前目录开工
+npm run code -- --cwd ../别的仓库   # 换个工作目录
+npm run code -- --model deepseek-v4-pro
+npm run code -- --yes             # 跳过逐次审批（只在自己完全信任的任务里用）
+```
+
+**它复用平台的 core，不另写一套 agent 循环**：`createBusinessAgent`（Pi 的五个钩子）、`ToolRegistry`、
+`permission.ts` 的风险审批、`audit.ts` 的留痕，全是业务侧同一套代码。差别只在工具集与系统提示：
+
+| 工具 | 风险 | 干什么 |
+|---|---|---|
+| `fs_read` / `fs_list` / `fs_grep` / `fs_glob` | low | 读文件、列目录、按内容/文件名搜索 |
+| `fs_write` | **high** | 写文件（覆盖或新建，自动建目录） |
+| `shell_run` | **high** | 在**工作目录内**执行命令（跑测试、构建、git），120 秒超时 |
+| `git_status` / `git_diff` | low | 看改动 |
+| `git_commit` | **high** | 只提交已暂存的改动，**不自动 `git add`、不 push** |
+
+三条安全边界是**硬实现**，不是靠提示词约束（`code:selftest` 逐条断言）：
+
+1. **路径锁死在工作目录内**：`../` 和指向外部的绝对路径会被直接拒绝（`resolveInside`），写不出去；
+2. **高风险逐次当场审批**：写文件、跑命令、提交都要按 `y` 才执行，拒绝就把拒绝原因回给模型（它绕不过去）；
+3. **输出截断并标注**：单次结果超 2 万字符会截断并写明原始长度，不让一条 `ls` 撑爆上下文。
+
+已知边界（如实写在这里，免得用起来才发现）：
+
+- **不持久化会话**：`/clear` 清上下文，退出即丢；持久化在上面的 Web 会话里，不在 CLI；
+- **没有沙箱进程隔离**：`shell_run` 在工作目录里跑，但命令本身能访问整台机器（它不 `cd` 出去而已）。
+  真要强隔离得套容器，当前没做；
+- **需要真实模型**：`LLM_DISABLE=1` 会直接报错退出——模拟模型演不了文件操作任务；
+- **不做自动 `git add`**：提交前要自己 stage，这是有意的（避免把无关文件塞进 commit）。
 ## 快速开始
 
 ```bash
@@ -736,14 +823,21 @@ npm run demo:data        # 切片 B
 npm run demo:approval    # 切片 C
 npm run verify           # 边界能力自检（55 项）
 npm run ui-check         # 前端渲染单测（markdown，node:vm 沙盒，14 项）
-npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，248 项）
-npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具/重新向量化/向量配置来源，55 项，SQLite 本地）
+npm run ui-dom-check     # 控制台接线自检（自造迷你 DOM 跑 app.js，不引 jsdom，268 项）
+npm run web:build        # 新前端（client/，Vue 3 + Naive UI + Vite）构建到 client/dist
+npm run web:dev          # 新前端开发服务器 5173（/api 与 /v1 代理到 4317）
+npm run ui:e2e           # 新前端端到端（Playwright 真实浏览器，18 组；需服务在跑 + 已 web:build）
+npm run agents:selftest  # Agent 实体自检（六维配置/状态机全路径/已发布锁定/参数钳制，40 项）
+npm run code               # 编码 Agent（CLI）：cd 到任意仓库用，直接读写文件、跑命令、提交（见下文）
+npm run code:selftest      # 编码 Agent 自检（工具 / 路径越界 / 审批钩子 / 装配，25 项，不起服务）
+npm run kb:selftest      # 知识库自检（解析/分块/检索/绑定/工具/重新向量化/向量配置来源，66 项，SQLite 本地）
 npm run kb:pg:selftest   # 知识库 Postgres/pgvector 自检（16 项；需 DATABASE_URL + 已跑 db:migrate，没配就跳过）
 npm run auth:selftest    # 安全自检（scrypt/JWT/RBAC/限流/审计/成员保护，41 项）
 npm run models:selftest  # 多模型自检（AES-256-GCM/掩码/密文解不开/首启 default/ping，23 项）
 npm run mcp:selftest     # MCP 自检（stdio/HTTP/SSE、命名、超时与关闭，30 项）
 npm run obs:selftest     # 可观测自检（trace_id/内存队列/批量落库/聚合/保留期清理，24 项）
-npm run smoke            # 端到端冒烟（需先跑 npm run dev，182 项）
+npm run smoke            # 端到端冒烟（需先跑 npm run dev，204 项）
+npm run smoke:agents     # Agent 端到端 HTTP（建号→状态机→锁定→删除，14 项；需先跑 npm run dev）
 npm run smoke:auth       # 鉴权端到端（需 AUTH_MODE=required 实例，51 项）
 npm run smoke:openapi    # 开放 API + 多模型端到端（需 AUTH_MODE=required 实例，53 项）
 npm run smoke:mcp        # MCP 端到端（模拟模型实例即可，45 项）
@@ -765,7 +859,7 @@ demo 默认用 Pi 内置的 **faux provider**（脚本化假模型），不花�
 
 ```powershell
 $env:LLM_DISABLE="1"; npm run dev                       # 终端 1：模拟模型服务
-npm run smoke                                           # 终端 2：端到端 182 项断言
+npm run smoke                                           # 终端 2：端到端 204 项断言
 
 # 想隔离数据、不动正式会话库（端口自选）
 $env:LLM_DISABLE="1"; $env:PORT="4318"; $env:DB_PATH="$PWD\data\qa-smoke.db"; npm run dev
@@ -813,7 +907,7 @@ $env:DATABASE_URL="postgres://biz:biz@127.0.0.1:5433/biz"
 npm run db:migrate                                      # 建表（db/migrations/*.sql，按版本幂等）
 npm run db:check                                        # 后端应是 postgres，表清单 19 张（0001 的 17 张 + 0003 的两张模型表）
 $env:LLM_DISABLE="1"; npm run dev                       # 启动日志会打「会话库: Postgres（…）」
-$env:SMOKE_BASE="http://127.0.0.1:4330"; npm run smoke   # 期望 182 项
+$env:SMOKE_BASE="http://127.0.0.1:4330"; npm run smoke   # 期望 204 项
 ```
 
 `db:migrate` 会依次应用 `0001_init.sql`、`0002_auth.sql`；`db:check` 的「schema 迁移」段会打印已应用版本。
@@ -852,13 +946,16 @@ LLM_API_KEY=sk-xxx
 配置后界面右上角徽章会从「模拟模型」变成真实的 `provider · model`。
 没有 key 时自动回落到模拟模型，功能不中断。
 
-**DeepSeek 默认用 `deepseek-v4-pro`。** 实测 `deepseek-flash` 在高分期会持续返回
-503（`Service is too busy`），且单次响应要 20 秒以上；v4-pro 约 1~2 秒一次工具调用，
-一轮 4 步流程 15 秒内跑完。想省钱可以显式指定：
+**DeepSeek 默认用 `deepseek-flash`。** 便宜、够用，联调与测试都跑它。
+
+但它的历史记录要看一眼：高峰期会持续返回 503（`Service is too busy`），单次响应可能 20 秒以上；
+v4-pro 约 1~2 秒一次工具调用，一轮 4 步流程 15 秒内跑完。**正式演示或批量压测**时显式切回去：
 
 ```ini
-LLM_MODEL=deepseek-flash
+LLM_MODEL=deepseek-v4-pro
 ```
+
+（界面上也能切：「模型」页设为当前模型即可，但当前模型只存内存，重启回落默认值。）
 
 传输层参数（可选）：
 
@@ -941,19 +1038,19 @@ biz-agent/
 ├── examples/              终端 demo
 └── scripts/
     ├── selftest.ts        边界能力自检（55 项）
-    ├── kb-selftest.ts     知识库自检（55 项，SQLite 本地，解析/分块/检索/绑定/工具/重新向量化/向量配置来源，不起服务）
+    ├── kb-selftest.ts     知识库自检（66 项，SQLite 本地，解析/分块/检索/绑定/工具/重新向量化/向量配置来源，不起服务）
     ├── kb-pg-selftest.ts  知识库 Postgres/pgvector 自检（16 项，需 DATABASE_URL + 迁移，没配就跳过）
     ├── auth-selftest.ts   安全自检（41 项，scrypt/JWT/RBAC/限流/审计/成员保护，不起服务）
-    ├── models-selftest.ts 多模型自检（22 项，AES-256-GCM/掩码/首启 default/ping，不起服务）
+    ├── models-selftest.ts 多模型自检（24 项，AES-256-GCM/掩码/首启 default/ping，不起服务）
     ├── mcp-selftest.ts    MCP 自检（30 项，stdio/HTTP/SSE 传输、命名、超时/关闭，不起服务）
     ├── observability-selftest.ts  可观测自检（24 项，trace_id/队列/批量落库/聚合/保留期清理，不起服务）
     ├── ui-check.mjs       前端渲染单测（14 项，node:vm 加载 web/markdown.js）
-    ├── ui-dom-check.mjs   控制台 DOM 桩自检（248 项，自造迷你 DOM，不起服务、不引 jsdom）
+    ├── ui-dom-check.mjs   控制台 DOM 桩自检（268 项，自造迷你 DOM，不起服务、不引 jsdom）
     ├── ui-shot.mjs        观感核对：用本机 Edge/Chrome 无头截图（不联网、不装依赖，可选）
     ├── db-migrate.ts      Postgres 迁移（npm run db:migrate，打印版本）
     ├── db-check.ts        存储后端体检（npm run db:check：类型/位置/引擎/表/迁移/数据量）
     ├── fixtures/mcp-stdio-server.mjs  冒烟/自检用的假 MCP Server（stdio，零依赖）
-    ├── smoke.ts           端到端冒烟（182 项，走真实 HTTP+SSE，含知识库场景 G / G2 与审批中心场景 H）
+    ├── smoke.ts           端到端冒烟（204 项，走真实 HTTP+SSE，含知识库场景 G / G2 与审批中心场景 H）
     ├── smoke-auth.ts      鉴权端到端（51 项，要 AUTH_MODE=required 实例）
     ├── smoke-openapi.ts   开放 API + 多模型端到端（53 项，要 AUTH_MODE=required 实例）
     ├── smoke-mcp.ts       MCP 端到端（45 项，起假 MCP Server，模拟模型实例即可）

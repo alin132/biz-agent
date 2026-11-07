@@ -236,6 +236,7 @@ async function testRoles(): Promise<void> {
 		assert.equal(permissionFor("POST", "/api/sessions"), "session.write");
 		assert.equal(permissionFor("PATCH", "/api/sessions/s-1"), "session.write");
 		assert.equal(permissionFor("POST", "/api/sessions/s-1/messages"), "session.run");
+		assert.equal(permissionFor("POST", "/api/sessions/s-1/stop"), "session.run");
 		assert.equal(permissionFor("POST", "/api/sessions/s-1/skills"), "session.run");
 		assert.equal(permissionFor("GET", "/api/sessions/s-1/events"), "session.read");
 		assert.equal(permissionFor("GET", "/api/audit"), "audit.read");

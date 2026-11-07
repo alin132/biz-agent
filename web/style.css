@@ -1,18 +1,20 @@
 :root {
 	--bg: #ffffff;
-	--rail-bg: #f6f6f7;
-	--side-bg: #fbfbfc;
-	--line: #e8e8eb;
-	--line-strong: #dededf;
-	--text: #1f2023;
-	--muted: #71727b;
-	--faint: #9a9ba3;
-	--hover: #f1f1f3;
-	--active: #ececef;
-	--accent: #2f6fed;
-	--ok: #17925a;
-	--err: #d84b4b;
+	--rail-bg: #f4f5f6;
+	--side-bg: #fafbfc;
+	--canvas: #f7f8fa;
+	--line: #e5e7eb;
+	--line-strong: #d6dae1;
+	--text: #20242b;
+	--muted: #68717d;
+	--faint: #89919c;
+	--hover: #eef1f4;
+	--active: #e7edf3;
+	--accent: #256b63;
+	--ok: #19845c;
+	--err: #c84747;
 	--warn: #a86612;
+	--surface-shadow: 0 1px 2px rgba(26, 34, 43, 0.04), 0 8px 24px rgba(26, 34, 43, 0.035);
 	--chat-width: 800px;
 	--chat-gutter: clamp(20px, 3vw, 48px);
 	--mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -71,6 +73,7 @@ body {
 	scrollbar-width: none;
 }
 
+
 .rail-nav::-webkit-scrollbar {
 	display: none;
 }
@@ -90,12 +93,12 @@ body {
 
 .rail-btn {
 	width: 100%;
-	min-height: 46px;
+	min-height: 48px;
 	padding: 5px 2px 4px;
 	border: none;
 	background: transparent;
-	border-radius: 8px;
-	color: #5b5c66;
+	border-radius: 9px;
+	color: #555e68;
 	display: flex;
 	flex-direction: column;
 	align-items: center;
@@ -125,6 +128,7 @@ body {
 .rail-btn.active {
 	background: #1c1d21;
 	color: #fff;
+	box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .rail-btn.active:hover {
@@ -326,7 +330,7 @@ body {
 	/* flex 子项的 min-height 默认是 auto，不置 0 会导致消息区撑破容器 */
 	min-height: 0;
 	overflow: hidden;
-	background: var(--bg);
+	background: var(--canvas);
 	/* 「回到底部」按钮相对 .thread-foot 锚点定位（见文末），这里只是别的 absolute 子元素的兜底 */
 	position: relative;
 }
@@ -339,6 +343,7 @@ body {
 	min-height: 64px;
 	padding: 12px max(var(--chat-gutter), calc((100% - var(--chat-width)) / 2));
 	border-bottom: 1px solid var(--line);
+	background: rgba(255, 255, 255, 0.88);
 }
 
 .crumb {
@@ -755,7 +760,9 @@ button:disabled {
 	background: var(--bg);
 }
 
+/* 斜杠命令面板：由 composer 内的元素绝对定位到输入框上方 */
 .composer {
+	position: relative;
 	max-width: var(--chat-width);
 	margin: 0 auto;
 	border: 1px solid var(--line-strong);
@@ -769,6 +776,106 @@ button:disabled {
 .composer:focus-within {
 	border-color: #c3c4c9;
 	box-shadow: 0 2px 8px rgba(16, 17, 20, 0.06);
+}
+
+/* ---------------- 思考过程 ---------------- */
+
+/* 折起的思考块：不抢回答的位置，想看再展开 */
+.thinking {
+	margin: 0 0 8px;
+	padding: 8px 10px;
+	border-left: 2px solid var(--line-strong);
+	border-radius: 0 8px 8px 0;
+	background: #fafbfc;
+	color: var(--muted);
+	font-size: 12.5px;
+}
+
+.thinking__toggle {
+	cursor: pointer;
+	user-select: none;
+	color: var(--muted);
+	font-size: 12px;
+}
+
+/* 思考只是过程：展开后也不该盖过正文的回答 */
+.thinking__body {
+	margin-top: 6px;
+	white-space: pre-wrap;
+	word-break: break-word;
+	line-height: 1.6;
+}
+
+/* ---------------- 斜杠命令面板 ---------------- */
+
+.slash {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: calc(100% + 8px);
+	z-index: 40;
+	max-height: 320px;
+	overflow-y: auto;
+	background: #fff;
+	border: 1px solid var(--line-strong);
+	border-radius: 14px;
+	box-shadow: 0 14px 36px rgba(16, 17, 20, 0.16);
+	padding: 5px;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.slash[hidden] {
+	display: none;
+}
+
+.slash-item {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	width: 100%;
+	border: 0;
+	background: transparent;
+	border-radius: 9px;
+	padding: 8px 10px;
+	text-align: left;
+	cursor: pointer;
+	font: inherit;
+	color: inherit;
+}
+
+/* 鼠标悬停与键盘高亮是同一套视觉：用户不该分不清"光标在哪" */
+.slash-item:hover,
+.slash-item.active {
+	background: var(--hover);
+}
+
+.slash-item__slash {
+	color: var(--muted);
+	font-variant-numeric: tabular-nums;
+}
+
+.slash-item__label {
+	font-weight: 500;
+	white-space: nowrap;
+}
+
+/* 说明吃掉剩余宽度，过长省略——命令面板永远一行一个，别换行把面板撑高 */
+.slash-item__hint {
+	flex: 1;
+	min-width: 0;
+	color: var(--muted);
+	font-size: 12px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.slash-empty {
+	padding: 10px 12px;
+	color: var(--muted);
+	font-size: 13px;
 }
 
 .composer textarea {
@@ -2023,8 +2130,7 @@ button:disabled {
 
 /* ---------------- 右栏常驻技能面板 ---------------- */
 
-/* 右侧常驻技能栏已从对话页撤掉（技能统一在「技能」模块页）。
-   DOM 与接线先留着（测试与快速回滚都靠它），视觉上彻底隐藏。 */
+/* 右侧常驻技能栏已从对话页撤掉（技能统一在「技能」模块页）；DOM 与接线保留（测试与快速回滚都靠它） */
 .skill-side {
 	display: none;
 }
@@ -2212,21 +2318,30 @@ button:disabled {
 
 /* 手机端让标题、状态与输入工具自然换行，避免挤压消息区。 */
 @media (max-width: 600px) {
-	:root { --chat-gutter: 16px; }
-	.main-head { flex-wrap: wrap; gap: 6px; padding: 12px 16px; }
+	:root { --chat-gutter: 14px; }
+	.main-head { flex-wrap: wrap; gap: 8px 12px; padding: 12px 14px; }
 	.crumb { flex: 1 1 100%; }
-	.head-tools { max-width: 100%; flex-wrap: wrap; }
-	.thread { padding-top: 20px; }
-	.composer-wrap { padding-bottom: 12px; }
-	.composer-bar { flex-wrap: wrap; }
-	.bar-right { margin-left: auto; min-width: 0; }
-	.model-select { max-width: 150px; }
+	.head-tools { width: 100%; max-width: 100%; flex-wrap: wrap; gap: 6px; }
+	.thread { padding: 18px 14px 20px; }
+	.composer-wrap { padding: 0 10px 10px; }
+	.composer { border-radius: 14px; }
+	.composer-bar { flex-wrap: wrap; gap: 8px; }
+	.bar-left { min-width: 0; }
+	.bar-right { margin-left: auto; min-width: 0; gap: 2px; }
+	.model-select { max-width: min(150px, 38vw); }
 	.skill-chip { max-width: 180px; }
 	.empty-chip { flex-wrap: wrap; gap: 2px; }
 	.empty-chip-label { white-space: normal; }
 	.skill-module-current { flex-wrap: wrap; }
 	.skill-module-toolbar { align-items: stretch; flex-direction: column; gap: 8px; }
 	.skill-module-filters { gap: 2px; }
+	.module-page { padding: 24px 18px 40px; }
+	.module-page__head { align-items: flex-start; padding-bottom: 14px; margin-bottom: 18px; }
+	.module-page__title { font-size: 19px; }
+	.module-page__actions { width: 100%; margin-left: 0; }
+	.module-section-title { margin-top: 22px; }
+	.module-kv__row { flex-wrap: wrap; gap: 3px 10px; }
+	.module-kv__label { flex-basis: 100%; }
 }
 
 /* ---------------- 模块页（非「对话」模块整宽显示） ---------------- */
@@ -2237,7 +2352,7 @@ button:disabled {
 	grid-column: 2 / -1;
 	min-height: 0;
 	overflow-y: auto;
-	background: var(--bg);
+	background: var(--canvas);
 }
 
 .shell.module-view {
@@ -2256,9 +2371,32 @@ button:disabled {
 }
 
 .module-page {
-	max-width: 960px;
+	width: min(100%, 1120px);
 	margin: 0 auto;
-	padding: 28px 32px 48px;
+	padding: 32px 40px 56px;
+}
+
+.module-page__body > .module-empty,
+.module-page__body > .module-note,
+.module-page__body > .module-denied,
+.module-page__body > .module-summary,
+.module-page__body > .module-kv,
+.module-page__body > .module-table-wrap,
+.module-page__body > .module-model-list,
+.module-page__body > .model-status,
+.module-page__body > .model-embedding,
+.module-page__body > .kb-status,
+.module-page__body > .kb-layout,
+.module-page__body > .settings-section,
+.module-page__body > .monitor-kpis,
+.module-page__body > .monitor-section {
+	box-shadow: var(--surface-shadow);
+}
+
+.module-page[data-module="models"] .model-status,
+.module-page[data-module="models"] .model-key-warn,
+.module-page[data-module="models"] .model-embedding {
+	box-shadow: none;
 }
 
 .module-page__head {
@@ -2267,13 +2405,13 @@ button:disabled {
 	justify-content: space-between;
 	flex-wrap: wrap;
 	gap: 12px;
-	padding-bottom: 14px;
+	padding-bottom: 18px;
 	border-bottom: 1px solid var(--line);
-	margin-bottom: 20px;
+	margin-bottom: 24px;
 }
 
 .module-page__title {
-	font-size: 19px;
+	font-size: 21px;
 	font-weight: 650;
 	color: var(--text);
 	margin: 0;
@@ -2297,10 +2435,10 @@ button:disabled {
 
 .module-section-title {
 	font-size: 12px;
-	font-weight: 600;
-	letter-spacing: 0.04em;
-	color: var(--faint);
-	margin: 22px 0 8px;
+	font-weight: 650;
+	letter-spacing: 0;
+	color: var(--muted);
+	margin: 26px 0 10px;
 }
 
 /* 空态：一句说明 + 「未接入」徽标 */
@@ -2495,6 +2633,13 @@ button:disabled {
 
 .module-page__actions .btn-ghost {
 	white-space: nowrap;
+}
+
+.module-page__actions .btn-primary,
+.module-page__actions .btn-ghost {
+	min-height: 34px;
+	padding-right: 12px;
+	padding-left: 12px;
 }
 
 /* 模型页顶部：当前模型 + 模式徽标 + 切换入口 */
@@ -2837,10 +2982,14 @@ button:disabled {
 	margin: 0;
 }
 
-/* 设置页与模型页表格列多：给它们多一点宽度 */
-.module-page[data-module="settings"],
+/* 设置页与模型页列较多：使用完整内容宽度，减少中间大片留白 */
+.module-page[data-module="settings"] {
+	max-width: 1240px;
+}
+
 .module-page[data-module="models"] {
-	max-width: 1100px;
+	width: min(100%, 1480px);
+	max-width: none;
 }
 
 /* 当前技能条：右侧常驻栏撤掉后，装进/退出会话的入口都在这一页 */
@@ -3018,6 +3167,8 @@ button:disabled {
 .module-table-wrap {
 	border: 1px solid var(--line);
 	border-radius: 10px;
+	background: #fff;
+	box-shadow: var(--surface-shadow);
 	/* 列多的时候让表格自己横向滚，别把数字/时间挤出卡片 */
 	overflow-x: auto;
 }
@@ -3029,9 +3180,9 @@ button:disabled {
 }
 
 .module-th {
-	padding: 8px 10px;
+	padding: 9px 10px;
 	border-bottom: 1px solid var(--line);
-	background: #fafafa;
+	background: #f7f8fa;
 	color: var(--faint);
 	font-size: 11.5px;
 	font-weight: 600;
@@ -3040,10 +3191,14 @@ button:disabled {
 }
 
 .module-td {
-	padding: 8px 10px;
+	padding: 9px 10px;
 	border-bottom: 1px solid var(--line);
 	color: var(--text);
 	vertical-align: middle;
+}
+
+.module-table-row:hover .module-td {
+	background: #fafbfc;
 }
 
 .module-table-row:last-child .module-td {
@@ -3436,7 +3591,7 @@ body.auth-required .shell {
 }
 
 .kb-item.active {
-	background: #eef3fe;
+	background: #e7edf3;
 }
 
 .kb-item-name {
@@ -3452,15 +3607,59 @@ body.auth-required .shell {
 	font-size: 11.5px;
 }
 
+/* 库行里的「设为对话默认」开关：行本身是选中按钮，开关单独一行、点它别把详情切走 */
+.kb-default {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 2px;
+	color: var(--muted);
+	font-size: 11.5px;
+	line-height: 16px;
+	cursor: pointer;
+}
+
+.kb-default__box {
+	margin: 0;
+	cursor: inherit;
+}
+
+.kb-default__box:disabled {
+	cursor: not-allowed;
+}
+
+.kb-default:has(.kb-default__box:checked) {
+	color: #1f7a44;
+}
+
+.kb-default:has(.kb-default__box:disabled) {
+	color: var(--faint);
+}
+
+.kb-item:has(.kb-default__box:checked) .kb-item-name {
+	font-weight: 600;
+}
+
+/* 对话默认检索那句状态：开启时用绿色强调，和上面的向量检索状态区分开 */
+.kb-status__defaults {
+	color: var(--muted);
+}
+
+.kb-status__defaults.on {
+	color: #1f7a44;
+	font-weight: 600;
+}
+
 .kb-main {
 	display: flex;
 	flex-direction: column;
 	gap: 12px;
 	min-width: 0;
-	padding: 16px 18px;
+	padding: 18px 20px;
 	border: 1px solid var(--line);
 	border-radius: 12px;
 	background: #fff;
+	box-shadow: var(--surface-shadow);
 }
 
 .kb-main-head {
@@ -3831,6 +4030,22 @@ body.auth-required .shell {
 	}
 }
 
+/* 插件页：清单列表优先，动作保持紧凑便于逐条管理 */
+.module-page[data-module="plugins"] { max-width: 1040px; }
+.plugin-perm-hint, .plugin-notice { margin: 0 0 12px; color: var(--warn); font-size: 12.5px; line-height: 18px; }
+.plugin-notice { color: var(--accent); }
+.plugin-empty { padding: 22px 16px; border: 1px dashed var(--line); color: var(--muted); font-size: 13px; }
+.plugin-list { display: flex; flex-direction: column; gap: 8px; }
+.plugin-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.plugin-row__main { min-width: 0; display: grid; grid-template-columns: auto auto; align-items: baseline; justify-content: start; gap: 4px 10px; }
+.plugin-row__name { color: var(--text); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.plugin-row__version, .plugin-row__contents { color: var(--muted); font-size: 11.5px; }
+.plugin-row__description { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 12.5px; line-height: 18px; overflow-wrap: anywhere; }
+.plugin-row__contents { grid-column: 1 / -1; }
+.plugin-row__actions { display: flex; align-items: center; gap: 14px; flex: 0 0 auto; }
+.plugin-uninstall { color: var(--danger, #a43d38); }
+.plugin-import-input { display: none; }
+@media (max-width: 600px) { .plugin-row { align-items: flex-start; flex-direction: column; gap: 12px; } .plugin-row__actions { align-self: flex-end; } }
 /* MCP 页（P7）：服务卡片 + 展开后的工具表 + 调试输出 */
 .module-page[data-module="mcp"] {
 	max-width: 1040px;
@@ -5198,6 +5413,10 @@ body.auth-required .shell {
 		padding: 22px 18px 40px;
 	}
 
+	.kb-main {
+		padding: 14px;
+	}
+
 	.kb-status {
 		align-items: flex-start;
 	}
@@ -5280,14 +5499,30 @@ body.auth-required .shell {
 }
 /* 模型页的「向量模型」区块：一行讲清用哪条模型，换成组内元素要有间距（不然会粘成一串） */
 .model-embedding {
-	display: flex;
-	flex-direction: column;
-	gap: 8px;
-	margin-bottom: 20px;
-	padding: 14px 16px;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	column-gap: 18px;
+	row-gap: 8px;
+	margin-top: 24px;
+	padding: 12px 14px;
 	border: 1px solid var(--line);
-	border-radius: 10px;
-	background: #fafafa;
+	border-radius: 9px;
+	background: #fff;
+}
+
+.model-embedding > .module-section-title {
+	margin: 0;
+}
+
+.model-admin-empty {
+	padding: 11px 13px;
+	border: 1px dashed var(--line-strong);
+	border-radius: 8px;
+	background: rgba(255, 255, 255, 0.72);
+	color: var(--muted);
+	font-size: 12.5px;
+	line-height: 19px;
 }
 
 .model-embedding__line {
@@ -5340,6 +5575,7 @@ body.auth-required .shell {
 }
 
 .model-embedding__hint {
+	grid-column: 1 / -1;
 	margin: 0;
 	color: var(--faint);
 	font-size: 11.5px;
@@ -5348,11 +5584,118 @@ body.auth-required .shell {
 
 @media (max-width: 700px) {
 	.module-page[data-module="models"] {
-		padding: 22px 18px 40px;
+		width: 100%;
+		padding: 20px 18px 36px;
+	}
+
+	.model-status {
+		gap: 8px;
+		padding: 10px 12px;
+	}
+
+	.model-status__note {
+		line-height: 16px;
+	}
+
+	.model-key-warn {
+		gap: 8px;
+		margin-top: 8px;
+		padding: 9px 10px;
+	}
+
+	.model-key-warn__body {
+		flex-direction: row;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 4px 8px;
+	}
+
+	.model-key-warn__fix {
+		margin-top: 0;
+	}
+
+	.module-page[data-module="models"] .module-table-wrap {
+		border: 0;
+		background: transparent;
+		box-shadow: none;
+		overflow: visible;
+	}
+
+	.module-page[data-module="models"] .module-table,
+	.module-page[data-module="models"] .module-table tbody,
+	.module-page[data-module="models"] .module-table-row,
+	.module-page[data-module="models"] .module-td {
+		display: block;
+		width: 100%;
+	}
+
+	.module-page[data-module="models"] .module-table thead {
+		display: none;
+	}
+
+	.module-page[data-module="models"] .module-table-row {
+		margin-bottom: 8px;
+		padding: 9px 12px;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		background: #fff;
+	}
+
+	.module-page[data-module="models"] .module-td {
+		padding: 3px 0;
+		border: 0;
+		white-space: normal;
+	}
+
+	.module-page[data-module="models"] .module-table-row:hover .module-td {
+		background: transparent;
+	}
+
+	.module-page[data-module="models"] .model-admin-name {
+		font-weight: 650;
+	}
+
+	.provider-row .module-td:nth-child(2)::before { content: "类型："; }
+	.provider-row .module-td:nth-child(3)::before { content: "端点："; }
+	.provider-row .module-td:nth-child(4)::before { content: "Key："; }
+	.provider-row .module-td:nth-child(5)::before { content: "状态："; }
+	.model-admin-row .module-td:nth-child(2)::before { content: "供应商："; }
+	.model-admin-row .module-td:nth-child(3)::before { content: "modelId："; }
+	.model-admin-row .module-td:nth-child(4)::before { content: "类型："; }
+	.model-admin-row .module-td:nth-child(5)::before { content: "上下文窗口："; }
+	.model-admin-row .module-td:nth-child(6)::before { content: "状态："; }
+	.provider-row .module-td:nth-child(2)::before,
+	.provider-row .module-td:nth-child(3)::before,
+	.provider-row .module-td:nth-child(4)::before,
+	.provider-row .module-td:nth-child(5)::before,
+	.model-admin-row .module-td:nth-child(2)::before,
+	.model-admin-row .module-td:nth-child(3)::before,
+	.model-admin-row .module-td:nth-child(4)::before,
+	.model-admin-row .module-td:nth-child(5)::before,
+	.model-admin-row .module-td:nth-child(6)::before {
+		color: var(--faint);
+		font-size: 11px;
+	}
+
+	.module-page[data-module="models"] .provider-actions,
+	.module-page[data-module="models"] .model-actions {
+		flex-wrap: wrap;
+		gap: 8px;
+		padding-top: 6px;
+	}
+
+	.model-key-warn {
+		padding: 10px 12px;
 	}
 
 	.model-embedding {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 8px;
 		padding: 12px 14px;
+	}
+
+	.model-embedding__hint {
+		grid-column: 1;
 	}
 }
 
