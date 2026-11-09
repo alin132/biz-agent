@@ -12,9 +12,14 @@ import type { AuditEntry, WorkflowSkillText, WorkflowState, WorkflowStep } from 
 import type { Store } from "../../src/store/memory.js";
 
 export interface TranscriptEntry {
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "compaction";
 	text: string;
 	at: number;
+	/** 压缩节点的摘要元数据；压缩节点以摘要替代更早的 transcript。 */
+	before?: number;
+	after?: number;
+	kept?: number;
+	automatic?: boolean;
 	/** 用户轮次的整轮耗时和工具记录。 */
 	durationMs?: number;
 	tools?: Array<{
@@ -56,6 +61,10 @@ export interface PluginRecord {
 
 export interface PersistedSession {
 	id: string;
+	/** Internal Pi worker session owned by an Agent group; hidden from regular session lists. */
+	internalGroupSession?: boolean;
+	/** Pi automatic compaction setting captured when this session was created. */
+	piAutoCompactionEnabled?: boolean;
 	workflowId: string;
 	modelId: string | null;
 	/**
@@ -80,8 +89,12 @@ export interface PersistedSession {
 	audit: AuditEntry[];
 	workflow: WorkflowState;
 	store: Store;
-	/** Pi 的 AgentMessage[]，用于恢复模型上下文 */
-	agentMessages: unknown[];
+	/** 旧版本保存的 Pi AgentMessage 快照；仅供迁移旧会话时读取。 */
+	agentMessages?: unknown[];
+	/** Pi coding-agent 的追加式会话树，是新会话唯一写入的模型历史。老记录缺失时从 agentMessages 导入。 */
+	piSessionEntries?: unknown[];
+	/** Active Pi branch head; omitted by older payloads. */
+	piSessionLeafId?: string | null;
 	/** 当前加载的技能 id（= 流程 id）；老记录没有这个字段，视为没加载技能 */
 	activeSkillId?: string | null;
 	baseWorkflowState?: WorkflowState;
@@ -101,10 +114,14 @@ export interface PersistedSession {
 	};
 	/** 计划模式：会话级开关，落进 payload 才能跨重启保持（见 planModePromptOf） */
 	planMode?: boolean;
+	/** Pi AgentSession 的推理强度。 */
+	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** 最近一次上下文压缩的时间戳；null / 缺省 = 还没压缩过 */
 	compactedAt?: number | null;
 	/** 最近一次压缩生成的摘要原文（重开会话时前端要能显示回消息列表） */
 	summary?: string | null;
+	/** 最近一次压缩是否由短期记忆策略自动触发。 */
+	compactedAutomatically?: boolean;
 	/** 最近一次模型请求的输入上下文 token 数。 */
 	contextTokens?: number;
 	/** true 表示该值由本地文本估算得出。 */
@@ -766,6 +783,25 @@ export interface Storage {
 	 */
 	purgeTracesBefore(cutoffMs: number): { traces: number; events: number };
 
+	/* ---------------- Agent 群组运行数据 ---------------- */
+	listAgentGroups(): AgentGroupRecord[];
+	getAgentGroup(id: string): AgentGroupRecord | undefined;
+	createAgentGroup(group: AgentGroupRecord): AgentGroupRecord;
+	updateAgentGroup(id: string, patch: Partial<Pick<AgentGroupRecord, "name" | "updatedAt">>): AgentGroupRecord | undefined;
+	deleteAgentGroup(id: string): boolean;
+	listAgentGroupMembers(groupId: string): AgentGroupMemberRecord[];
+	getAgentGroupMember(id: string): AgentGroupMemberRecord | undefined;
+	addAgentGroupMember(member: AgentGroupMemberRecord): AgentGroupMemberRecord;
+	updateAgentGroupMember(id: string, patch: { sessionId?: string | null }): AgentGroupMemberRecord | undefined;
+	removeAgentGroupMember(id: string): boolean;
+	listAgentGroupTurns(groupId: string): AgentGroupTurnRecord[];
+	getAgentGroupTurn(id: string): AgentGroupTurnRecord | undefined;
+	createAgentGroupTurn(turn: AgentGroupTurnRecord): AgentGroupTurnRecord;
+	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt">>): AgentGroupTurnRecord | undefined;
+	listAgentGroupMessages(groupId: string): AgentGroupMessageRecord[];
+	listAgentGroupTurnMessages(turnId: string): AgentGroupMessageRecord[];
+	appendAgentGroupMessage(message: AgentGroupMessageRecord): AgentGroupMessageRecord;
+
 	/* ---------------- Agent 实体（P10，同步契约） ---------------- */
 	listAgents(): AgentRecord[];
 	getAgent(id: string): AgentRecord | undefined;
@@ -803,12 +839,12 @@ export interface AgentModelConfig {
 	stream?: boolean;
 }
 
-/** 记忆策略：对应 AgentOne 的 memoryConfig */
+/** Pi coding-agent 上下文压缩参数。 */
 export interface AgentMemoryConfig {
-	/** 短期记忆保留几轮 */
-	shortTermRounds?: number;
-	/** 溢出策略 */
-	overflowStrategy?: "sliding_window" | "summarize";
+	/** Pi starts automatic compaction below this many free context tokens. */
+	reserveTokens?: number;
+	/** Recent tokens Pi keeps outside the generated summary. */
+	keepRecentTokens?: number;
 }
 
 /** 高级配置：对应 AgentOne 的 advancedConfig，留给未来扩展 */
@@ -879,6 +915,46 @@ export interface AgentPatch {
 	advancedConfig?: AgentAdvancedConfig;
 	skillIds?: string[];
 	kbIds?: string[];
+}
+
+export interface AgentGroupRecord {
+	id: string;
+	name: string;
+	createdBy: string | null;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface AgentGroupMemberRecord {
+	id: string;
+	groupId: string;
+	agentId: string;
+	agentName: string;
+	position: number;
+	sessionId: string | null;
+	addedAt: number;
+}
+
+export interface AgentGroupTurnRecord {
+	id: string;
+	groupId: string;
+	sequence: number;
+	userMessage: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	createdAt: number;
+	completedAt: number | null;
+}
+
+export interface AgentGroupMessageRecord {
+	id: string;
+	groupId: string;
+	turnId: string;
+	role: "user" | "agent";
+	agentId: string | null;
+	agentName: string | null;
+	content: string;
+	isError: boolean;
+	createdAt: number;
 }
 
 /**

@@ -9,37 +9,34 @@
  * 放行时流程完整走完并归档。
  */
 
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import { ToolRegistry } from "../src/core/registry.js";
 import { createStore } from "../src/store/memory.js";
 import { createApprovalTools } from "../src/tools/approval.js";
 import { approvalWorkflow } from "../src/workflows/approval.js";
 import type { BizContext } from "../src/core/types.js";
 import type { FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
-import { callTool, createCtx, createFauxRuntime, lastAssistantText, say, section, title } from "./harness.js";
+import { callTool, createCtx, createFauxRuntime, createWorkflowPiSession, lastAssistantText, say, section, title } from "./harness.js";
 
 function buildAgent(steps: FauxResponseStep[], ctx: BizContext, maxTurns: number) {
 	const store = createStore();
 	const registry = new ToolRegistry().registerAll(createApprovalTools(store));
 	const runtime = createFauxRuntime(steps);
 
-	const built = createBusinessAgent({
+	const built = createBusinessRuntime({
 		workflow: approvalWorkflow,
 		registry,
-		ctx,
-		model: runtime.model,
-		streamFn: runtime.streamFn,
 		maxTurns,
 	});
 
-	return { ...built, store };
+	return { ...built, store, runtime, registry, ctx };
 }
 
-function report(built: ReturnType<typeof buildAgent>): void {
-	const { agent, engine, store } = built;
+function report(built: ReturnType<typeof buildAgent>, answer: string): void {
+	const { engine, store } = built;
 
 	section("模型最终回复");
-	console.log(lastAssistantText(agent) || "（无回复）");
+	console.log(answer || "（无回复）");
 
 	section("流程状态");
 	console.log(`已完成步骤：${engine.state.completed.join(" → ") || "（无）"}`);
@@ -74,8 +71,13 @@ function report(built: ReturnType<typeof buildAgent>): void {
 	);
 
 	title("切片 C：审批流（场景 1 —— 人工审批被拒）");
-	await built.agent.prompt("帮张明提交一笔 3200 元的报销，客户拜访差旅费");
-	report(built);
+	const session = await createWorkflowPiSession(built, { registry: built.registry, ctx: built.ctx, runtime: built.runtime, maxTurns: 3 });
+	try {
+		await session.prompt("帮张明提交一笔 3200 元的报销，客户拜访差旅费");
+	} finally {
+		session.dispose();
+	}
+	report(built, lastAssistantText(session));
 }
 
 // ---------- 场景 2：审批通过 ----------
@@ -100,6 +102,11 @@ function report(built: ReturnType<typeof buildAgent>): void {
 	);
 
 	title("切片 C：审批流（场景 2 —— 人工审批通过）");
-	await built.agent.prompt("帮张明提交一笔 3200 元的报销，客户拜访差旅费");
-	report(built);
+	const session = await createWorkflowPiSession(built, { registry: built.registry, ctx: built.ctx, runtime: built.runtime, maxTurns: 20 });
+	try {
+		await session.prompt("帮张明提交一笔 3200 元的报销，客户拜访差旅费");
+	} finally {
+		session.dispose();
+	}
+	report(built, lastAssistantText(session));
 }

@@ -13,6 +13,7 @@ const routes = [
 	{ path: "/workbench", name: "workbench", component: Workbench },
 	{ path: "/chat", name: "chat", component: () => import("./views/Chat.vue") },
 	{ path: "/agents", name: "agents", component: () => import("./views/Agents.vue") },
+	{ path: "/agent-groups", name: "agent-groups", component: () => import("./views/AgentGroups.vue") },
 	// Agent 专属对话：每个 Agent 一个对话入口，历史按 agentId 归位，不跟通用对话页混在一起。
 	// 放在 /agents 之后即可：vue-router 按 path 静态段匹配，/:id/chat 与 /agent-chat 不会互相吃掉。
 	{ path: "/agent-chat/:id", name: "agent-chat", component: () => import("./views/AgentChat.vue") },

@@ -14,12 +14,12 @@
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import { ToolRegistry } from "../src/core/registry.js";
 import { createStore } from "../src/store/memory.js";
 import { createTicketTools } from "../src/tools/ticket.js";
 import { ticketWorkflow } from "../src/workflows/ticket.js";
-import { createCtx, lastAssistantText, section, title } from "./harness.js";
+import { createCtx, createWorkflowPiSession, lastAssistantText, section, title } from "./harness.js";
 
 if (!process.env.DEEPSEEK_API_KEY) {
 	console.error("缺少 DEEPSEEK_API_KEY 环境变量。");
@@ -37,24 +37,26 @@ const store = createStore();
 const registry = new ToolRegistry().registerAll(createTicketTools(store));
 const ctx = createCtx();
 
-const { agent, engine } = createBusinessAgent({
+const built = createBusinessRuntime({
 	workflow: ticketWorkflow,
 	registry,
-	ctx,
-	model,
-	streamFn,
 });
 
 title("真实模型：工单流转（DeepSeek V4 Pro）");
-await agent.prompt("帮我把「支付回调偶发超时」这条工单处理掉，记得通知客户。");
+const session = await createWorkflowPiSession(built, { registry, ctx, runtime: { model, streamFn } });
+try {
+	await session.prompt("帮我把「支付回调偶发超时」这条工单处理掉，记得通知客户。");
+} finally {
+	session.dispose();
+}
 
 section("模型最终回复");
-console.log(lastAssistantText(agent));
+console.log(lastAssistantText(session));
 
 section("流程执行情况");
-console.log(`已完成步骤：${engine.state.completed.join(" → ") || "（无）"}`);
-console.log(`完成度：${engine.state.stepIndex}/${ticketWorkflow.steps.length}`);
-console.log(`工具调用序列：${engine.state.calls.map((call) => `${call.name}${call.ok ? "" : "(失败)"}`).join(" → ")}`);
+console.log(`已完成步骤：${built.engine.state.completed.join(" → ") || "（无）"}`);
+console.log(`完成度：${built.engine.state.stepIndex}/${ticketWorkflow.steps.length}`);
+console.log(`工具调用序列：${built.engine.state.calls.map((call) => `${call.name}${call.ok ? "" : "(失败)"}`).join(" → ")}`);
 
 section("工单最终数据");
 console.log(JSON.stringify(store.tickets.find((ticket) => ticket.title.includes("支付回调")), null, 2));

@@ -198,6 +198,13 @@ async function main(): Promise<void> {
 		session.tools.includes("mcp_smoke_mcp_add"),
 		"会话视图 tools 含 mcp_*（MCP 工具已并入会话工具集）",
 	);
+	const agent = await ok<{ id: string }>("POST", "/api/agents", { name: "Smoke MCP Agent" });
+	const agentSession = await ok<{ id: string; agentId: string | null; tools: string[] }>("POST", "/api/sessions", {
+		workflowId: "auto-flow",
+		agentId: agent.id,
+	});
+	assert(agentSession.agentId === agent.id, "Agent 会话绑定正确的 Agent");
+	assert(agentSession.tools.includes("mcp_smoke_mcp_add"), "Agent 会话自动获得已启用 MCP 工具");
 
 	/* ---------------- 7. 工具启停 ---------------- */
 	const addToolId = addTool!.id;

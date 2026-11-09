@@ -7,12 +7,12 @@
  * 权限/审计钩子在每次工具调用时生效。
  */
 
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import { ToolRegistry } from "../src/core/registry.js";
 import { createStore } from "../src/store/memory.js";
 import { createTicketTools } from "../src/tools/ticket.js";
 import { ticketWorkflow } from "../src/workflows/ticket.js";
-import { callTool, createCtx, createFauxRuntime, lastAssistantText, say, section, title } from "./harness.js";
+import { callTool, createCtx, createFauxRuntime, createWorkflowPiSession, lastAssistantText, say, section, title } from "./harness.js";
 
 const store = createStore();
 const registry = new ToolRegistry().registerAll(createTicketTools(store));
@@ -30,27 +30,29 @@ const runtime = createFauxRuntime([
 	say("工单 TK-1001「支付回调偶发超时」已处理完毕：已指派给李工，状态置为 processing，并已通过 IM 通知客户云图科技。"),
 ]);
 
-const { agent, engine } = createBusinessAgent({
+const built = createBusinessRuntime({
 	workflow: ticketWorkflow,
 	registry,
-	ctx,
-	model: runtime.model,
-	streamFn: runtime.streamFn,
 });
 
 title("切片 A：工单流转");
 console.log(`流程：${ticketWorkflow.name}`);
 console.log("用户输入：支付回调超时的工单帮我处理一下");
 
-await agent.prompt("支付回调超时的工单帮我处理一下");
+const session = await createWorkflowPiSession(built, { registry, ctx, runtime });
+try {
+	await session.prompt("支付回调超时的工单帮我处理一下");
+} finally {
+	session.dispose();
+}
 
 section("模型最终回复");
-console.log(lastAssistantText(agent));
+console.log(lastAssistantText(session));
 
 section("流程状态");
-console.log(`已完成步骤：${engine.state.completed.join(" → ")}`);
-console.log(`完成度：${engine.state.stepIndex}/${ticketWorkflow.steps.length}`);
-console.log(`工具调用序列：${engine.state.calls.map((call) => `${call.name}${call.ok ? "" : "(失败)"}`).join(" → ")}`);
+console.log(`已完成步骤：${built.engine.state.completed.join(" → ")}`);
+console.log(`完成度：${built.engine.state.stepIndex}/${ticketWorkflow.steps.length}`);
+console.log(`工具调用序列：${built.engine.state.calls.map((call) => `${call.name}${call.ok ? "" : "(失败)"}`).join(" → ")}`);
 
 section("工单最终数据");
 console.log(JSON.stringify(store.tickets[0], null, 2));

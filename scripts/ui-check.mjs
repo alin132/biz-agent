@@ -57,6 +57,8 @@ check("围栏代码块带语言标签与复制按钮", () => {
 	assert.ok(html.includes('class="code-block"'), "代码块容器");
 	assert.ok(html.includes('class="code-lang">ts<'), "语言标签");
 	assert.ok(html.includes('data-role="copy-code"'), "复制按钮");
+	assert.ok(html.includes('aria-label="复制代码"'), "复制按钮无障碍名称");
+	assert.ok(html.includes('<svg viewBox="0 0 24 24"'), "复制按钮显示图标");
 	assert.ok(html.includes("const a = 1;"), "代码内容");
 });
 

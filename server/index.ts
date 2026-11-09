@@ -79,13 +79,16 @@ import { handleKb, initKb } from "./kb/index.js";
 import { supportedKeyEnvs } from "./llm.js";
 import { initMcp } from "./mcp/index.js";
 import { handleModelsRoute } from "./models/routes.js";
+import { handlePiSettingsRoute } from "./piSettings.js";
 import { handleAgents } from "./agents/routes.js";
+import { AgentGroupService } from "./agentGroups/service.js";
+import { handleAgentGroups } from "./agentGroups/routes.js";
 import { AgentService } from "./agents/service.js";
 import { initModels } from "./models/service.js";
 import { PluginService, handlePluginRoute } from "./plugins/service.js";
 import { createObservability, handleMonitorRoute } from "./observability/index.js";
 import { handleOpenApiRoute } from "./openapi/routes.js";
-import { SessionHub } from "./session.js";
+import { PiSessionError, SessionHub } from "./session.js";
 import { WorkflowHttpError, WorkflowRepo } from "./workflows.js";
 
 loadEnvFile();
@@ -154,7 +157,9 @@ const hub = new SessionHub(
 	(modelId) => models.resolveRuntime(modelId),
 	observability,
 	(modelId) => models.modelKeyOf(modelId),
+	mcp.registry,
 );
+const agentGroups = new AgentGroupService(db, hub);
 const plugins = new PluginService(db, repo, mcp.registry, hub);
 const storage = db.info();
 // 鉴权：AUTH_MODE 未设置时是 off（全部放行，行为与 P2 一致）；required 时验 Bearer 令牌 + 四角色矩阵
@@ -306,9 +311,15 @@ const server = createServer((req, res) => {
 		if (await handleModelsRoute(req, res, url, models)) {
 			return;
 		}
+		if (await handlePiSettingsRoute(req, res, db)) {
+			return;
+		}
 
 		// ---- Agent 实体（/api/agents*）：六维配置 CRUD + 状态机动作 ----
 		if (await handleAgents(req, res, agents)) {
+			return;
+		}
+		if (await handleAgentGroups(req, res, url, agentGroups, auth)) {
 			return;
 		}
 
@@ -468,7 +479,7 @@ const server = createServer((req, res) => {
 			return;
 		}
 
-		const sessionMatch = /^\/api\/sessions\/([^/]+)(\/[a-z]+)?$/.exec(pathname);
+		const sessionMatch = /^\/api\/sessions\/([^/]+)(\/[a-z-]+(?:\/[a-z-]+)?)?$/.exec(pathname);
 		if (sessionMatch) {
 			const session = hub.get(sessionMatch[1]!);
 			const action = sessionMatch[2] ?? "";
@@ -485,6 +496,111 @@ const server = createServer((req, res) => {
 
 			if (action === "" && method === "GET") {
 				json(res, 200, session.view());
+				return;
+			}
+
+			if (action === "/export" && method === "GET") {
+				const content = session.exportPiJsonl();
+				const filename = `pi-session-${session.id}.jsonl`;
+				res.writeHead(200, {
+					"Content-Type": "application/x-ndjson; charset=utf-8",
+					"Content-Disposition": `attachment; filename="${filename}"`,
+					"Content-Length": Buffer.byteLength(content),
+				});
+				res.end(content);
+				return;
+			}
+
+			if (action === "/export-html" && method === "GET") {
+				try {
+					const content = await session.exportPiHtml();
+					const filename = `pi-session-${session.id}.html`;
+					res.writeHead(200, {
+						"Content-Type": "text/html; charset=utf-8",
+						"Content-Disposition": `attachment; filename="${filename}"`,
+						"Content-Length": Buffer.byteLength(content),
+					});
+					res.end(content);
+				} catch (error) {
+					json(res, 500, { error: error instanceof Error ? error.message : "导出 Pi HTML 会话失败" });
+				}
+				return;
+			}
+
+			if ((action === "/clone" || action === "/fork") && method === "POST") {
+				const body = action === "/fork" ? await readBody(req) : {};
+				if (action === "/fork" && (typeof body.entryId !== "string" || body.entryId.trim().length === 0)) {
+					json(res, 400, { error: "entryId 必须是非空字符串" });
+					return;
+				}
+				try {
+					const result = hub.derive(session.id, action === "/clone" ? "clone" : "fork", {
+						...(action === "/fork" ? { entryId: body.entryId as string } : {}),
+						ownerId: auth.userOf(req)?.id ?? null,
+					});
+					json(res, 201, { session: result.session.view(), ...(result.editorText !== undefined ? { editorText: result.editorText } : {}) });
+				} catch (error) {
+					const status = error instanceof PiSessionError ? error.status : error instanceof Error && error.message === "session not found" ? 404 : 400;
+					json(res, status, { error: error instanceof Error ? error.message : String(error), ...(error instanceof PiSessionError ? { code: error.code } : {}) });
+				}
+				return;
+			}
+
+			if (action === "/pi-stats" && method === "GET") {
+				json(res, 200, await session.piStats());
+				return;
+			}
+
+			if (action === "/pi-reload" && method === "POST") {
+				try {
+					json(res, 200, await session.reloadPiResources());
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					json(res, message.includes("正在执行中") ? 409 : 500, { error: message });
+				}
+				return;
+			}
+
+			if (action === "/pi-tree" && method === "GET") {
+				json(res, 200, session.piTree());
+				return;
+			}
+
+			if (action === "/pi-tree/navigate" && method === "POST") {
+				const body = await readBody(req);
+				if (typeof body.entryId !== "string" || body.entryId.trim().length === 0) {
+					json(res, 400, { error: "entryId 必须是非空字符串" });
+					return;
+				}
+				try {
+					json(res, 200, await session.navigatePiTree(body.entryId));
+				} catch (error) {
+					const status = error instanceof PiSessionError ? error.status : 400;
+					json(res, status, { error: error instanceof Error ? error.message : String(error), ...(error instanceof PiSessionError ? { code: error.code } : {}) });
+				}
+				return;
+			}
+
+			if (action === "/pi-tree/label" && method === "POST") {
+				const body = await readBody(req);
+				if (typeof body.entryId !== "string" || (body.label !== null && typeof body.label !== "string")) {
+					json(res, 400, { error: "entryId 必须是文本，label 必须是文本或 null" });
+					return;
+				}
+				if (session.isRunning()) {
+					json(res, 409, { error: "这条对话正在执行中，等它完成后再编辑会话标签" });
+					return;
+				}
+				const containsEntry = (nodes: ReturnType<typeof session.piTree>["nodes"]): boolean => nodes.some((node) => node.id === body.entryId || containsEntry(node.children));
+				if (!containsEntry(session.piTree().nodes)) {
+					json(res, 404, { error: "Pi 会话节点不存在" });
+					return;
+				}
+				try {
+					json(res, 200, session.setPiTreeLabel(body.entryId, body.label as string | null));
+				} catch (error) {
+					json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+				}
 				return;
 			}
 
@@ -559,7 +675,7 @@ const server = createServer((req, res) => {
 					return;
 				}
 				try {
-					const view = session.setModel(modelId);
+					const view = await session.setModel(modelId);
 					json(res, 200, {
 						session: view,
 						modelId: view.modelId,
@@ -568,6 +684,7 @@ const server = createServer((req, res) => {
 						modeLabel: view.modeLabel,
 						// 列表一起回：页面切完模型正好用它重画下拉，省一次往返
 						models: models.options(),
+						modelRows: models.store.models(),
 					});
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -593,6 +710,20 @@ const server = createServer((req, res) => {
 				}
 				try {
 					json(res, 200, session.setPlanMode(body.enabled));
+				} catch (error) {
+					json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+				}
+				return;
+			}
+
+			if (action === "/thinking" && method === "POST") {
+				const body = await readBody(req);
+				if (typeof body.thinkingLevel !== "string") {
+					json(res, 400, { error: "thinkingLevel 必须是字符串" });
+					return;
+				}
+				try {
+					json(res, 200, await session.setThinkingLevel(body.thinkingLevel as import("@earendil-works/pi-agent-core").ThinkingLevel));
 				} catch (error) {
 					json(res, 409, { error: error instanceof Error ? error.message : String(error) });
 				}
@@ -719,10 +850,15 @@ void mcp.start().catch((error: unknown) => {
 /** 优雅关闭：停止接受新连接，关闭 MCP 子进程与 SQLite，避免 WAL/句柄未落盘。 */
 function shutdown(signal: string): void {
 	console.log(`\n收到 ${signal}，正在关闭…`);
-	// 先杀 MCP 子进程：SSE/keep-alive 连接可能让 server.close 等一会儿，别留下孤儿 node 进程
-	void mcp.close();
+	// 结束会话级 Pi 扩展与注册表连接，保留会话历史后再关闭存储。
+	const closing = Promise.allSettled([hub.shutdown(), mcp.close()]);
 	server.close(() => {
-		void mcp.close().finally(() => {
+		void closing.then((results) => {
+			for (const result of results) {
+				if (result.status === "rejected") {
+					console.error(`运行时关闭失败: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+				}
+			}
 			try {
 				// 先把调用链队列刷完，再关库（顺序反了会丢最后几轮的事件）
 				observability.close();

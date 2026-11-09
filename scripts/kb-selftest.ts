@@ -21,6 +21,9 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { AgentSession, DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createPiSessionHistory } from "../server/piSessionHistory.js";
 
 import { CHUNK_DEFAULTS, chunkText, estimateTokens } from "../server/kb/chunk.js";
 import { createEmbeddingClient } from "../server/kb/embedding.js";
@@ -33,7 +36,7 @@ import type { KbChunkRow } from "../server/kb/schema.js";
 import { buildSnippet, cosineSimilarity, rankKeywordChunks, tokenizeQuery } from "../server/kb/search.js";
 import { ATTACHMENT_MAX_CHARS, createKbService, createKbServiceForPath } from "../server/kb/service.js";
 import { createKbStore } from "../server/kb/store.js";
-import { KB_SEARCH_TOOL_NAME, createKbSearchTool } from "../server/kb/tool.js";
+import { KB_SEARCH_TOOL_NAME, createKbPiExtension, createKbSearchTool } from "../server/kb/tool.js";
 import { DatabaseSync } from "node:sqlite";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -635,15 +638,28 @@ async function main(): Promise<void> {
 				data: Buffer.from("# 发票政策\n\n发票在订单完成后开具。"),
 			});
 			const searched = await vectorService.search(vectorKb.id, "退款怎么处理");
-			assert.equal(searched.mode, "vector");
+			assert.equal(searched.mode, "hybrid");
 			assert.ok(searched.results.length >= 1);
 			assert.equal(searched.results[0]!.docId, refund.document.id);
-			assert.equal(searched.results[0]!.mode, "vector");
+			assert.equal(searched.results[0]!.mode, "hybrid");
 			assert.ok(searched.results[0]!.score > 0.9);
 			const filtered = await vectorService.search(vectorKb.id, "退款怎么处理", { threshold: 0.99 });
 			assert.equal(filtered.results.length, 0, "高于相似度的阈值应当过滤掉");
 			assert.equal(vectorService.listKnowledgeBases()[0]!.embedding, true);
 			vectorService.close();
+			const withoutEmbedding = createKbServiceForPath(vectorDb, createEmbeddingClient({ config: { apiKey: "" } }));
+			const lexicalOnly = await withoutEmbedding.ingestDocument({
+				kbId: vectorKb.id,
+				filename: "未向量化.md",
+				data: Buffer.from("# 特殊编号\n\n客户保留编号 ZX-4817，后续核对时必须原样使用。"),
+			});
+			assert.equal(lexicalOnly.embedded, false, "without an embedding key, new chunks remain lexical-only");
+			withoutEmbedding.close();
+			const hybridService = createKbServiceForPath(vectorDb, stubEmbeddingClient());
+			const hybrid = await hybridService.search(vectorKb.id, "ZX-4817");
+			assert.equal(hybrid.mode, "hybrid", "partially embedded libraries use both retrieval paths");
+			assert.ok(hybrid.results.some((result) => result.docId === lexicalOnly.document.id), "keyword retrieval includes chunks missing embeddings");
+			hybridService.close();
 			removeDbFiles(vectorDb);
 		});
 
@@ -671,7 +687,7 @@ async function main(): Promise<void> {
 			assert.equal(result.embedded, true);
 			assert.equal(withKey.listKnowledgeBases()[0]!.embedding, true);
 			const after = await withKey.search(reKb.id, "退款怎么处理");
-			assert.equal(after.mode, "vector");
+			assert.equal(after.mode, "hybrid");
 			assert.ok(after.results.length >= 1);
 			await expectKbError(() => withKey.reembedKnowledgeBase("kb_nope"), 404, "知识库不存在");
 			withKey.close();
@@ -1066,7 +1082,7 @@ async function main(): Promise<void> {
 		// 小粒度分块 + 0 重叠：每段都自成一（<250 字符），用来验证 topK 的默认值与上下限
 		const bulkKb = toolService.createKnowledgeBase({ name: "多块库", chunkSize: 250, chunkOverlap: 0 });
 
-		await toolService.ingestDocument({
+		const toolRefundDocument = await toolService.ingestDocument({
 			kbId: refundKb.id,
 			filename: "退款流程.md",
 			data: Buffer.from("# 退款流程\n\n退款需要财务审批，3 个工作日内到账。\n\n提交退款申请后可在订单页查询进度。"),
@@ -1136,9 +1152,78 @@ async function main(): Promise<void> {
 			assert.equal(kbTool.example?.query, "退款多久到账");
 		});
 
+		await check("Pi 扩展：真实 AgentSession 加载并调用 Pi 原生 kb_search 工具", async () => {
+			const model = {
+				id: "kb-pi-selftest",
+				name: "KB Pi selftest",
+				api: "openai-completions" as const,
+				provider: "kb-pi-selftest",
+				baseUrl: "http://127.0.0.1:9/v1",
+				reasoning: false,
+				input: ["text"] as ("text")[],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 4096,
+				maxTokens: 512,
+			};
+			const agent = new Agent({
+				streamFn: () => { throw new Error("Pi extension selftest must not call a model"); },
+				initialState: { model, systemPrompt: "KB extension selftest", tools: [] },
+			});
+			const loader = new DefaultResourceLoader({
+				cwd: process.cwd(),
+				agentDir: process.cwd(),
+				settingsManager: SettingsManager.inMemory(),
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+				extensionFactories: [createKbPiExtension({ getActiveSkillId: () => "flow_refund_tool" })],
+			});
+			await loader.reload();
+			const session = new AgentSession({
+				agent,
+				sessionManager: createPiSessionHistory({ sessionId: "kb-pi-extension-selftest" }),
+				settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
+				cwd: process.cwd(),
+				resourceLoader: loader,
+				modelRuntime: {
+					getModel: () => model,
+					getPhysicalModel: () => model,
+					getModels: () => [model],
+					getAvailableSnapshot: () => [model],
+					hasConfiguredAuth: () => true,
+					checkAuth: async () => ({}),
+					isUsingOAuth: () => false,
+					getAuth: async () => ({ auth: { apiKey: "test-only" } }),
+					getError: () => undefined,
+					getProvider: () => undefined,
+					getModelOfType: () => undefined,
+					getCompatibilityRequestConfig: () => ({}),
+					getProviderAuthStatus: () => ({ configured: true }),
+					refresh: async () => ({ added: 0, removed: 0, updated: 0 }),
+				} as never,
+				initialActiveToolNames: [KB_SEARCH_TOOL_NAME],
+			});
+			try {
+				assert.ok(session.getAllTools().some((tool) => tool.name === KB_SEARCH_TOOL_NAME));
+				const definition = session.getToolDefinition(KB_SEARCH_TOOL_NAME);
+				assert.ok(definition, "Pi registers the kb_search definition");
+				const result = await definition.execute("kb-call", { query: "退款" }, undefined, undefined, {} as never);
+				const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+				assert.ok(text.includes("退款流程.md"), text);
+				assert.ok(text.includes(`[kb:${refundKb.id} doc:${toolRefundDocument.document.id} chunk:`), text);
+				assert.ok(text.includes("3 个工作日内到账"), text);
+				assert.ok(!agent.state.messages.some((message) => message.role === "user"), "calling the Pi tool directly does not append a user turn");
+			} finally {
+				session.dispose();
+			}
+		});
+
 		await check("工具：绑定知识库后命中，文本含片段编号/文件名/标题/模式与条数", async () => {
 			const text = await runTool(kbTool, { query: "退款" });
-			assert.ok(text.includes("[片段 1] 《退款流程.md》 · 退款流程"), text);
+			assert.ok(text.includes(`[片段 1] [kb:${refundKb.id} doc:${toolRefundDocument.document.id} chunk:`), text);
+			assert.ok(text.includes("《退款流程.md》 · 退款流程"), text);
 			assert.ok(text.includes("退款需要财务审批"), text);
 			assert.ok(text.includes("（关键词检索，共 1 条）"), text);
 		});

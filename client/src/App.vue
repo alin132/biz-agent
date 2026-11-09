@@ -19,6 +19,7 @@ import { can } from "./access.js";
 const route = useRoute();
 const router = useRouter();
 const mobileOpen = ref(false);
+const standaloneChat = computed(() => route.name === "chat" && route.query.standalone === "1");
 watch(() => route.fullPath, () => { mobileOpen.value = false; });
 // main.js 里 provide 进来的主题（唯一真相在 theme.js，别在组件里再写一份颜色）
 const themeOverrides = inject("themeOverrides");
@@ -47,6 +48,11 @@ const NAV = [
 				key: "agents",
 				label: "Agent",
 				icon: icon("M12 3.2 4.5 7v6.2c0 3.6 3.2 6.2 7.5 7.6 4.3-1.4 7.5-4 7.5-7.6V7zM9.2 11.5h.01M14.8 11.5h.01M9.5 15c1.5 1 3.5 1 5 0"),
+			},
+			{
+				key: "agent-groups",
+				label: "部门群聊",
+				icon: icon("M4 5h16v10H9l-5 4zM8 9h.01M12 9h.01M16 9h.01M14 19h6v-4"),
 			},
 			{
 				key: "knowledge",
@@ -194,10 +200,10 @@ function handleMenu(key) {
 		<n-message-provider>
 			<n-dialog-provider>
 		<AuthGate v-slot="{ user, roleLabel, logout, authRequired }">
-		<div class="app-shell" :class="{ 'nav-open': mobileOpen }">
-		<button class="nav-toggle" type="button" :aria-expanded="mobileOpen" aria-controls="app-navigation" @click="mobileOpen = !mobileOpen">☰ <span>导航</span></button>
-		<button v-if="mobileOpen" class="nav-backdrop" type="button" aria-label="关闭导航" @click="mobileOpen = false" />
-		<aside id="app-navigation" class="app-sider">
+		<div class="app-shell" :class="{ 'nav-open': mobileOpen, 'standalone-chat': standaloneChat }">
+		<button v-if="!standaloneChat" class="nav-toggle" type="button" :aria-expanded="mobileOpen" aria-controls="app-navigation" @click="mobileOpen = !mobileOpen">☰ <span>导航</span></button>
+		<button v-if="!standaloneChat && mobileOpen" class="nav-backdrop" type="button" aria-label="关闭导航" @click="mobileOpen = false" />
+		<aside v-if="!standaloneChat" id="app-navigation" class="app-sider">
 			<div class="brand">
 				<div class="brand-mark">B</div>
 				<div class="brand-text">
@@ -324,5 +330,20 @@ body {
 	min-width: 0;
 	overflow-y: auto;
 	background: var(--bg);
+}
+
+.app-shell.standalone-chat {
+	display: block;
+	height: 100dvh;
+}
+
+.app-shell.standalone-chat .app-main {
+	height: 100dvh;
+}
+
+@media (max-width: 760px) {
+	.app-shell.standalone-chat .app-main {
+		padding-top: 0;
+	}
 }
 </style>

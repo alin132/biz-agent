@@ -19,14 +19,16 @@ import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentEvent } from "@earendil-works/pi-agent-core";
-import { createBusinessAgent } from "../core/runtime.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEventListener } from "@earendil-works/pi-coding-agent";
+import { createBusinessRuntime } from "../core/runtime.js";
 import { ToolRegistry } from "../core/registry.js";
 import type { ApprovalRequest, BizContext, ToolDef } from "../core/types.js";
 import { createCodingTools } from "../tools/coding.js";
 import { createCodingWorkflow } from "../coding/workflow.js";
 import { llmDisabled, resolveLlm } from "../../server/llm.js";
 import { loadEnvFile } from "../../server/env.js";
+import { createPiBusinessAgent, createPiRuntimeAdapter } from "../../server/piRuntimeAdapter.js";
 
 // `.env` 要按这个 CLI 所在的包目录读，**不是**按 --cwd 的目标仓库读：
 // 用户的仓库里没有我们的 key，从那边读只会读不到。
@@ -69,6 +71,10 @@ const cyan = (text: string) => paint("36", text);
 const green = (text: string) => paint("32", text);
 const yellow = (text: string) => paint("33", text);
 const red = (text: string) => paint("31", text);
+
+function formatTokens(value: number): string {
+	return new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(value)));
+}
 
 /**
  * 工具调用摘要：写文件不能把整篇内容糊到终端上（既刷屏又可能泄密）。
@@ -177,21 +183,23 @@ async function main(): Promise<void> {
 		requestApproval: (request) => askApproval(request, cli, ask),
 	};
 
-	const built = createBusinessAgent({
+	const built = createBusinessRuntime({
 		workflow,
 		registry,
-		ctx,
-		model: runtime.model,
-		streamFn: runtime.streamFn,
 		// 关键：空 steps 的流程默认**不暴露任何工具**（runtime 按步骤 via 取工具集），
 		// 编码 Agent 没有固定步骤，必须显式把整份编码工具集装进去。
 		toolNames: tools.map((tool) => tool.name),
 	});
+	let sessionManager = SessionManager.continueRecent(root);
+	let resumedSession = sessionManager.getEntries().some((entry) => entry.type === "message");
+	let agent = createPiBusinessAgent({ business: built, registry, ctx, model: runtime.model, streamFn: runtime.streamFn });
+	let piSession = await createPiRuntimeAdapter({ agent, sessionManager, tools: agent.state.tools, cwd: root });
+	let unsubscribe = () => {};
 
 	/* -------- 事件渲染 -------- */
 
 	let wroteText = false;
-	built.agent.subscribe((event: AgentEvent) => {
+	const renderEvent: AgentSessionEventListener = (event) => {
 		if (event.type === "message_update") {
 			const delta = event.assistantMessageEvent;
 			if (delta.type === "text_delta") {
@@ -222,13 +230,29 @@ async function main(): Promise<void> {
 			if (text) stdout.write(`${previewResult(text)}\n`);
 			return;
 		}
-	});
+	};
+	const attachSession = () => {
+		unsubscribe();
+		unsubscribe = piSession.subscribe(renderEvent);
+	};
+	attachSession();
+	const switchSession = async (nextManager: SessionManager) => {
+		unsubscribe();
+		await piSession.shutdown();
+		sessionManager = nextManager;
+		resumedSession = sessionManager.getEntries().some((entry) => entry.type === "message");
+		agent = createPiBusinessAgent({ business: built, registry, ctx, model: runtime.model, streamFn: runtime.streamFn });
+		piSession = await createPiRuntimeAdapter({ agent, sessionManager, tools: agent.state.tools, cwd: root });
+		wroteText = false;
+		attachSession();
+	};
 
 	/* -------- 开场信息 -------- */
 
 	console.log(bold("\n编码 Agent"));
 	console.log(dim(`  工作目录：${root}`));
 	console.log(dim(`  模型：${runtime.label}`));
+	console.log(dim(`  Pi 会话：${sessionManager.getSessionId()}${resumedSession ? "（已恢复最近会话）" : "（新会话）"}`));
 	console.log(dim(`  工具：${tools.map((tool) => tool.name).join(", ")}`));
 	console.log(dim("  输入任务开始；/help 看命令，Ctrl+C 或 /exit 退出"));
 	if (cli.assumeYes) {
@@ -247,19 +271,70 @@ async function main(): Promise<void> {
 			if (text === "/exit" || text === "/quit") break;
 			if (text === "/help") {
 				console.log(dim("  /help   显示这段说明"));
-				console.log(dim("  /clear  清空对话上下文（工具与工作目录不变）"));
+				console.log(dim("  /session 查看 Pi 会话统计"));
+				console.log(dim("  /compact 使用 Pi 原生逻辑压缩上下文"));
+				console.log(dim("  /settings 查看当前 Pi 运行设置"));
+				console.log(dim("  /resume [序号或会话ID] 恢复指定 Pi 会话"));
+				console.log(dim("  /new    新建 Pi 会话"));
+				console.log(dim("  /clear  新建 Pi 会话（兼容别名）"));
 				console.log(dim("  /exit   退出"));
 				continue;
 			}
-			if (text === "/clear") {
-				// 直接把消息数组清空，等价于开新会话；agent 实例与工具集保持不变
-				built.agent.state.messages.length = 0;
-				console.log(dim("  上下文已清空。"));
+			if (text === "/session" || text === "/stats") {
+				const stats = piSession.stats();
+				console.log(dim(`  Pi 会话 ${sessionManager.getSessionId()}`));
+				console.log(dim(`  消息：用户 ${stats.userMessages} · 助手 ${stats.assistantMessages} · 工具调用 ${stats.toolCalls}`));
+				console.log(dim(`  Token：输入 ${formatTokens(stats.tokens.input)} · 输出 ${formatTokens(stats.tokens.output)} · 缓存读 ${formatTokens(stats.tokens.cacheRead)} · 缓存写 ${formatTokens(stats.tokens.cacheWrite)} · 累计 ${formatTokens(stats.tokens.total)}`));
+				console.log(dim(`  费用：$${stats.cost.toFixed(6)}`));
+				continue;
+			}
+			if (text === "/compact") {
+				try {
+					const result = await piSession.compact();
+					console.log(dim(`  Pi 已压缩上下文：压缩前 ${formatTokens(result.tokensBefore)} tokens · 摘要 ${result.summary.length} 字符`));
+				} catch (error) {
+					console.error(red(`  Pi 压缩失败：${error instanceof Error ? error.message : String(error)}`));
+				}
+				continue;
+			}
+			if (text === "/settings") {
+				console.log(dim(`  模型：${runtime.label}`));
+				console.log(dim(`  推理强度：${piSession.getThinkingLevel?.() ?? "默认"}`));
+				console.log(dim("  自动压缩：Pi AgentSession 已启用"));
+				console.log(dim(`  模型上下文窗口：${formatTokens(agent.state.model?.contextWindow ?? 0)} tokens`));
+				continue;
+			}
+			if (text === "/resume" || text.startsWith("/resume ")) {
+				const sessions = await SessionManager.list(root);
+				if (sessions.length === 0) {
+					console.log(dim("  当前工作目录没有可恢复的 Pi 会话。"));
+					continue;
+				}
+				console.log(dim("  可恢复的 Pi 会话："));
+				for (const [index, item] of sessions.slice(0, 20).entries()) {
+					const title = item.name || item.firstMessage.replace(/\s+/g, " ").slice(0, 72);
+					console.log(dim(`  ${index + 1}. ${item.id} · ${item.messageCount} 条 · ${item.modified.toLocaleString()} · ${title}`));
+				}
+				const selector = text.slice("/resume".length).trim() || await rl.question(`  ${green("输入序号或会话 ID")} `).catch(() => "");
+				const selected = /^\d+$/.test(selector)
+					? sessions[Number(selector) - 1]
+					: sessions.find((item) => item.id === selector || item.id.startsWith(selector));
+				if (!selected) {
+					console.log(yellow("  没有匹配的会话，当前会话未切换。"));
+					continue;
+				}
+				await switchSession(SessionManager.open(selected.path, undefined, root));
+				console.log(dim(`  已恢复 Pi 会话：${sessionManager.getSessionId()}`));
+				continue;
+			}
+			if (text === "/clear" || text === "/new") {
+				piSession.newSession();
+				console.log(dim(`  已新建 Pi 会话：${sessionManager.getSessionId()}`));
 				continue;
 			}
 
 			try {
-				await built.agent.prompt(text);
+				await piSession.prompt(text);
 			} catch (error) {
 				console.error(red(`\n运行失败：${error instanceof Error ? error.message : String(error)}`));
 			}
@@ -269,6 +344,8 @@ async function main(): Promise<void> {
 		if ((error as { name?: string }).name !== "AbortError") throw error;
 	} finally {
 		rl.close();
+		unsubscribe();
+		await piSession.shutdown();
 		console.log(dim("\n再见。"));
 	}
 }

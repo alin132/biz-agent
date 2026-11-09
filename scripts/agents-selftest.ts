@@ -6,6 +6,7 @@
  * 纯进程内、临时 SQLite，不起服务；HTTP 层的断言在 scripts/smoke-agents.ts（要服务在跑）。
  */
 import assert from "node:assert/strict";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,7 @@ import { openStore } from "../server/db/index.js";
 import { AgentError, AgentService } from "../server/agents/service.js";
 import { agentPromptOf } from "../server/session.js";
 import { ToolRegistry } from "../src/core/registry.js";
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import type { WorkflowDef } from "../src/core/types.js";
 import { WorkflowEngine } from "../src/core/workflow.js";
 import { createFauxRuntime, say } from "../examples/harness.js";
@@ -98,9 +99,9 @@ check("模型参数越界被钳制（temperature 5→2，topP -1→0，maxTokens
 	assert.equal(a.modelConfig.maxTokens, 128000);
 });
 
-check("记忆轮数钳制到 1..100", () => {
-	const a = service.create({ name: "记忆钳制", memoryConfig: { shortTermRounds: 0 } });
-	assert.equal(a.memoryConfig.shortTermRounds, 1);
+check("Pi 压缩参数钳制到安全范围", () => {
+	const a = service.create({ name: "记忆钳制", memoryConfig: { reserveTokens: -1, keepRecentTokens: 2_000_000 } });
+	assert.deepEqual(a.memoryConfig, { reserveTokens: 0, keepRecentTokens: 1_000_000 });
 });
 
 check("skillIds / kbIds 去重并丢掉非字符串", () => {
@@ -189,7 +190,7 @@ check("JSON 配置往返（写进去读回来一致）", () => {
 		name: "往返",
 		agentsMd: "# 指令",
 		modelConfig: { chatModelId: "m1", temperature: 0.3, stream: false },
-		memoryConfig: { shortTermRounds: 25, overflowStrategy: "summarize" },
+		memoryConfig: { reserveTokens: 8192, keepRecentTokens: 12000 },
 		advancedConfig: { maxIters: 20, showThinking: false },
 		skillIds: ["s1", "s2"],
 		kbIds: ["kb1"],
@@ -197,7 +198,7 @@ check("JSON 配置往返（写进去读回来一致）", () => {
 	const back = service.get(a.id);
 	assert.equal(back.agentsMd, "# 指令");
 	assert.deepEqual(back.modelConfig, { chatModelId: "m1", temperature: 0.3, stream: false });
-	assert.deepEqual(back.memoryConfig, { shortTermRounds: 25, overflowStrategy: "summarize" });
+	assert.deepEqual(back.memoryConfig, { reserveTokens: 8192, keepRecentTokens: 12000 });
 	assert.deepEqual(back.skillIds, ["s1", "s2"]);
 });
 
@@ -209,7 +210,7 @@ check("删除后查不到；list 为空", () => {
 
 console.log("\n── Agent 人格指令注入系统提示 ─────────────────");
 
-/** 造一个最小可装配的流程：只用来拿 createBusinessAgent 的系统提示，跑不跑得起来不重要 */
+/** 造一个最小业务运行时：只验证人格指令进入业务系统提示。 */
 function buildWithAgentPrompt(prompt: string | undefined): string {
 	const workflow: WorkflowDef = {
 		id: "probe-flow",
@@ -220,26 +221,14 @@ function buildWithAgentPrompt(prompt: string | undefined): string {
 	};
 	const registry = new ToolRegistry();
 	const engine = new WorkflowEngine(workflow);
-	const runtime = createFauxRuntime([say("ok")]);
-	const built = createBusinessAgent({
+	const built = createBusinessRuntime({
 		workflow,
 		registry,
-		ctx: {
-			tenantId: "t",
-			userId: "u",
-			traceId: "trace-probe",
-			allow: ["*"],
-			requireApproval: [],
-			audit: () => undefined,
-			requestApproval: async () => false,
-		},
-		model: runtime.model,
-		streamFn: runtime.streamFn,
 		engine,
 		toolNames: [],
 		systemPromptExtras: [agentPromptOf(prompt)].filter((text) => text.length > 0),
 	});
-	return built.agent.state.systemPrompt;
+	return built.systemPrompt;
 }
 
 check("写了人格指令：原文出现在系统提示里", () => {
@@ -366,7 +355,7 @@ check("恢复会话要还原 Agent 的 systemPromptExtras（人格真的进了�
 	const restored = hub.get(created.id)!;
 	// 直接看运行实例的系统提示，而不是只看视图字段：
 	// "绑定字段对得上"和"模型真的收到人格"是两件事
-	const sys = (restored as unknown as { agent: { state: { systemPrompt: string } } }).agent.state.systemPrompt;
+	const sys = (restored as unknown as { built: { systemPrompt: string } }).built.systemPrompt;
 	assert.ok(sys.includes("锚点ZZQ9911"), "恢复后系统提示里必须还有 Agent 人格");
 	assert.ok(sys.includes("你的角色与指令"), "人格小节标题也要在");
 });
@@ -389,8 +378,14 @@ console.log("\n── 斜杠命令：压缩对话 + 计划模式 ─────
 // 注入一个 faux 运行时（同 examples/harness 的造法），既走真实代码路径又不联网、可复现。
 const { Session: SessionClass } = await import("../server/session.js");
 type SessionLike = InstanceType<typeof SessionClass>;
-const readAgent = (session: SessionLike) =>
-	(session as unknown as { agent: { state: { systemPrompt: string; messages: unknown[] } } }).agent;
+const readRuntime = (session: SessionLike) => {
+	const internal = session as unknown as {
+		built: { systemPrompt: string };
+		piHistory: { buildSessionContext(): { messages: unknown[] } };
+		piRuntime: { messages(): unknown[] } | null;
+	};
+	return { state: { systemPrompt: internal.built.systemPrompt, messages: internal.piRuntime?.messages() ?? internal.piHistory.buildSessionContext().messages } };
+};
 
 /**
  * 会话历史条数（**不含开头那条系统提示**）。
@@ -400,14 +395,14 @@ const readAgent = (session: SessionLike) =>
  * 最容易的反应是去改断言，那就把测试改成了"迁就实现"，失去意义。
  */
 const historyOf = (session: SessionLike): number => {
-	const middle = readAgent(session).state.messages.filter((message) => {
+	const middle = readRuntime(session).state.messages.filter((message) => {
 		return (message as { role?: string }).role !== "system";
 	});
 	return middle.length;
 };
 
-/** 原始 messages 条数（含开头系统提示）：compact() 的 before/after 用的是这个口径。 */
-const rawCount = (session: SessionLike): number => readAgent(session).state.messages.length;
+const piContextOf = (session: SessionLike): AgentMessage[] =>
+	(session as unknown as { piHistory: { buildSessionContext(): { messages: AgentMessage[] } } }).piHistory.buildSessionContext().messages;
 
 /**
  * 造一个"真实模型"会话：faux 运行时按队列吐响应。
@@ -415,34 +410,42 @@ const rawCount = (session: SessionLike): number => readAgent(session).state.mess
  * 为什么必须让 mode=live：模拟模式下 compact() 会直接报"需要接入真实模型"——
  * 那样测到的只是错误分支，压缩逻辑一行没跑。
  */
-function liveSession(steps: Parameters<typeof createFauxRuntime>[0]): SessionLike {
+function liveSession(steps: Parameters<typeof createFauxRuntime>[0], keepRecentTokens = 20_000): SessionLike {
 	const runtime = createFauxRuntime(steps);
+	const record = service.create({ name: "压缩契约会话", memoryConfig: { reserveTokens: 16_384, keepRecentTokens } });
 	return new SessionClass(hubRepo.get("auto-flow")!, {
 		db: store,
 		repo: hubRepo,
+		agent: { id: record.id, name: record.name, prompt: record.agentsMd, skillIds: [], kbIds: [],
+			modelConfig: record.modelConfig, memoryConfig: record.memoryConfig, advancedConfig: record.advancedConfig },
 		resolveModel: () => ({ model: runtime.model, streamFn: runtime.streamFn, label: "Faux · 摘要模型", provider: "faux", modelId: "faux-summary" }),
 	});
 }
 
 /** 直接往会话历史里塞消息：等价于"聊了很多轮"，但不用真的跑那么多轮模型。 */
 function seedHistory(session: SessionLike, count: number, marker: string): void {
-	const agent = readAgent(session);
+	const internal = session as unknown as {
+		piHistory: { appendMessage(message: AgentMessage): unknown; buildSessionContext(): { messages: AgentMessage[] } };
+		transcript: Array<{ role: "user" | "assistant"; text: string; at: number }>;
+	};
 	for (let index = 0; index < count; index += 1) {
-		agent.state.messages.push({
-			role: index % 2 === 0 ? "user" : "assistant",
-			content: [{ type: "text", text: `第${index + 1}轮：${marker} 的细节 ${index + 1}` }],
+		const text = `第${index + 1}轮：${marker} 的细节 ${index + 1}`;
+		internal.piHistory.appendMessage({
+			role: "user",
+			content: text,
 			timestamp: Date.now(),
-		});
+		} as AgentMessage);
+		internal.transcript.push({ role: "user", text, at: Date.now() });
 	}
 }
 
 await acheck("计划模式：开启后系统提示真的多出「先给计划再执行」的约束", async () => {
 	const session = liveSession([say("好的")]);
-	const before = readAgent(session).state.systemPrompt;
+	const before = readRuntime(session).state.systemPrompt;
 	assert.equal(before.includes("计划模式"), false, "默认不该带计划模式约束");
 
 	session.setPlanMode(true);
-	const after = readAgent(session).state.systemPrompt;
+	const after = readRuntime(session).state.systemPrompt;
 	// 断言的是"模型真的收到这条指令"，不是"标志位变成了 true"
 	assert.ok(after.includes("计划模式"), "开了计划模式，系统提示里必须有它");
 	assert.ok(after.includes("先给计划"), "要明确要求先给计划");
@@ -453,9 +456,9 @@ await acheck("计划模式：开启后系统提示真的多出「先给计划再
 await acheck("计划模式：关掉后系统提示里的约束随之消失（是可关的开关，不是单向）", async () => {
 	const session = liveSession([say("好的")]);
 	session.setPlanMode(true);
-	assert.ok(readAgent(session).state.systemPrompt.includes("计划模式"));
+	assert.ok(readRuntime(session).state.systemPrompt.includes("计划模式"));
 	session.setPlanMode(false);
-	const off = readAgent(session).state.systemPrompt;
+	const off = readRuntime(session).state.systemPrompt;
 	assert.equal(off.includes("计划模式"), false, "关掉后提示里不能再留着这段约束");
 	assert.equal(session.view().planMode, false);
 });
@@ -472,7 +475,7 @@ await acheck("计划模式：落库并可回读（刷新/重启后开关还在�
 	});
 	assert.equal(restored.view().planMode, true, "planMode 必须从 payload 回读出来");
 	assert.ok(
-		readAgent(restored).state.systemPrompt.includes("计划模式"),
+		readRuntime(restored).state.systemPrompt.includes("计划模式"),
 		"恢复出来的会话系统提示里也要带着约束，否则重启一次就变回随便动手",
 	);
 });
@@ -499,7 +502,7 @@ await acheck("计划模式：走 hub 恢复后依然约束模型（防重启就�
 	assert.ok(restored, "会话应当能从库里恢复");
 	assert.equal(restored.view().planMode, true, "恢复后开关状态要对");
 	// 关键：断言**模型真正收到的系统提示**，不是只看视图字段
-	const sys = readAgent(restored).state.systemPrompt;
+	const sys = readRuntime(restored).state.systemPrompt;
 	assert.ok(sys.includes("计划模式"), "恢复后的系统提示必须仍带计划模式约束");
 	assert.ok(sys.includes("先给计划"), "约束正文也要在，不能只剩个标题");
 	assert.ok(sys.includes("等用户确认"), "「等确认」这条最容易漏，必须一起在");
@@ -531,32 +534,31 @@ await acheck("计划模式：约束真的进了发给模型的请求（不只是
 
 await acheck("压缩对话：消息条数真的变少，且摘要进了历史", async () => {
 	const SUMMARY = "锚点KK7788：用户要报销 3200 元差旅费，需要 L1 审批。";
-	const session = liveSession([say(SUMMARY)]);
+	const session = liveSession([say(SUMMARY)], 100);
 	seedHistory(session, 30, "差旅报销");
 	const before = historyOf(session);
 	assert.equal(before, 30, "先确认塞进去了 30 条");
 
-	const rawBefore = rawCount(session);
+	const rawBefore = piContextOf(session).length;
 	const result = await session.compact();
 	// ① 条数真的变少——看的是真实历史数组，不是返回值
 	const after = historyOf(session);
 	assert.ok(after < before, `压缩后历史必须变短（${before} → ${after}）`);
-	assert.equal(result.before, rawBefore, "before 要如实报告压缩前的原始条数");
+	assert.equal(result.before, rawBefore, "before 按 Pi 当前上下文消息数统计");
 	assert.equal(result.after, result.kept + 1, "after = 摘要 1 条 + 保留的原始消息");
-	// 压缩后 agent 历史 = 摘要 + 保留的最近 N 条 + 重新装配的系统提示
-	assert.equal(rawCount(session), result.after + 1, "真实历史要与返回值对得上（多一条是新拼的系统提示）");
+	assert.equal(piContextOf(session).length, result.after, "返回值与 Pi 的实际上下文投影一致");
 	assert.ok(result.kept >= 2, "至少要保留最近几条原始消息");
 
 	// ② 摘要真的进了后续上下文（这是压缩的意义所在：旧信息没丢，只是换了形式）
-	const flat = JSON.stringify(readAgent(session).state.messages);
+	const flat = JSON.stringify(readRuntime(session).state.messages);
 	assert.ok(flat.includes("锚点KK7788"), "摘要正文必须进了历史，否则等于把上下文丢了");
-	assert.ok(flat.includes("以下是之前对话的摘要"), "要能一眼看出这段是压缩产生的摘要");
+	assert.ok(flat.includes(SUMMARY), "Pi 压缩摘要应进入会话上下文");
 	// ③ 保留的最近消息也还在（不是整个换掉）
 	assert.ok(flat.includes("差旅报销 的细节 30"), "最近的消息要原样保留");
 });
 
 await acheck("压缩对话：摘要落库，刷新后不会变回压缩前的长历史", async () => {
-	const session = liveSession([say("锚点MM5566：结论是走 L2 审批。")]);
+	const session = liveSession([say("锚点MM5566：结论是走 L2 审批。")], 2);
 	seedHistory(session, 20, "报销单");
 	await session.compact();
 	const sid = session.id;
@@ -573,7 +575,7 @@ await acheck("压缩对话：摘要落库，刷新后不会变回压缩前的长
 });
 
 await acheck("压缩对话：会推 compacted 事件给前端（界面能同步）", async () => {
-	const session = liveSession([say("摘要内容 KX1234")]);
+	const session = liveSession([say("摘要内容 KX1234")], 2);
 	seedHistory(session, 12, "工单");
 	const events: { type: string; [key: string]: unknown }[] = [];
 	const unsubscribe = session.subscribe((event) => events.push(event as { type: string }));
@@ -601,7 +603,7 @@ await acheck("压缩对话：太短的会话直接拒绝，不假装压成功", 
 	// 原始条数 = 1 条系统提示 + 2 条对话 = 3，正好落在「压了也没意义」的区间里
 	seedHistory(session, 2, "短对话");
 	const before = historyOf(session);
-	await assert.rejects(() => session.compact(), /还太短/, "没几条就别压，摘要比原文还长纯亏");
+	await assert.rejects(() => session.compact(), /Nothing to compact/, "Pi 原生规则拒绝没有可摘要内容的短历史");
 	assert.equal(historyOf(session), before, "被拒绝时历史不能被动过");
 });
 
@@ -609,7 +611,7 @@ await acheck("压缩对话：模拟模型下如实报错（不静默失败，也
 	// 不注入 resolveModel → mode=simulated
 	const simulated = new SessionClass(hubRepo.get("auto-flow")!, { db: store, repo: hubRepo });
 	seedHistory(simulated, 30, "模拟");
-	await assert.rejects(() => simulated.compact(), /真实模型/, "拿不到真实运行时要说清原因");
+	await assert.rejects(() => simulated.compact(), /没有可用的真实模型/, "没有真实模型时明确拒绝压缩");
 	assert.equal(historyOf(simulated), 30, "失败时历史必须原封不动");
 	assert.equal(simulated.view().compactedAt, null, "失败不该留下「压过了」的痕迹");
 });

@@ -5,7 +5,7 @@
  *
  * 覆盖：
  *   1. 工具结果超长截断（afterToolCall）
- *   2. 上下文滑动窗口压缩（transformContext）
+ *   2. 流程状态机推进规则（上下文与压缩由 Pi AgentSession 自检覆盖）
  *   3. 流程状态机推进规则
  *   4. 注册表拒绝未注册工具
  *   5. 权限钩子阻断越权工具、审批结果复用
@@ -19,10 +19,8 @@
  */
 
 import assert from "node:assert/strict";
-import type { AfterToolCallContext, AgentMessage, BeforeToolCallContext } from "@earendil-works/pi-agent-core";
-import { createAuditHook, MAX_RESULT_CHARS } from "../src/core/audit.js";
+import { createAuditPolicy, MAX_RESULT_CHARS } from "../src/core/audit.js";
 import { createToolCatalog } from "../src/core/catalog.js";
-import { createContextTransformer } from "../src/core/context.js";
 import {
 	FLOW_TOOL_PREFIX,
 	flowToolDescription,
@@ -30,14 +28,17 @@ import {
 	flowToolParameters,
 	isFlowToolName,
 } from "../src/core/flowTools.js";
-import { createPermissionHook } from "../src/core/permission.js";
+import { createPermissionPolicy } from "../src/core/permission.js";
 import { ToolRegistry } from "../src/core/registry.js";
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import { SKILL_TOOL_NAME, skillCatalogPrompt, skillFromWorkflow, skillToolParameters } from "../src/core/skill.js";
 import { WorkflowEngine } from "../src/core/workflow.js";
+import { createWorkflowTurnPolicy } from "../src/core/workflowPolicy.js";
 import { mergeWorkflowInput, validateWorkflowInput, WORKFLOW_LIMITS, WorkflowSpecError } from "../src/core/workflowSpec.js";
 import type { WorkflowInput } from "../src/core/workflowSpec.js";
 import { runSubWorkflow } from "../src/core/subFlow.js";
+import { createPiBusinessSession } from "../server/piRuntimeAdapter.js";
+import { createPiSessionHistory } from "../server/piSessionHistory.js";
 import type { AuditEntry, BizContext, WorkflowDef } from "../src/core/types.js";
 import { createTicketTools } from "../src/tools/ticket.js";
 import { createStore } from "../src/store/memory.js";
@@ -65,40 +66,13 @@ function baseCtx(overrides: Partial<BizContext> = {}): BizContext {
 	};
 }
 
-function asAfter(ctx: {
-	toolCallName: string;
-	result: { content: { type: "text"; text: string }[]; details: undefined };
-	isError: boolean;
-}): AfterToolCallContext {
-	return {
-		assistantMessage: {},
-		toolCall: { type: "toolCall", id: "c1", name: ctx.toolCallName, arguments: {} },
-		args: {},
-		result: ctx.result,
-		isError: ctx.isError,
-		context: { messages: [] },
-	} as unknown as AfterToolCallContext;
-}
-
-function asBefore(toolName: string, id: string): BeforeToolCallContext {
-	return {
-		assistantMessage: {},
-		toolCall: { type: "toolCall", id, name: toolName, arguments: {} },
-		args: {},
-		context: { messages: [] },
-	} as unknown as BeforeToolCallContext;
-}
-
 // ---------- 1. 工具结果截断 ----------
 {
 	const entries: AuditEntry[] = [];
-	const hook = createAuditHook(baseCtx({ audit: (entry) => entries.push(entry) }));
+	const audit = createAuditPolicy(baseCtx({ audit: (entry) => entries.push(entry) }));
 	const huge = "字".repeat(MAX_RESULT_CHARS * 3);
-
-	const overridden = await hook(
-		asAfter({ toolCallName: "big_tool", result: { content: [{ type: "text", text: huge }], details: undefined }, isError: false }),
-	);
-	const text = (overridden?.content?.[0] as { text: string }).text;
+	const output = audit({ toolName: "big_tool", args: {}, content: [huge] });
+	const text = output.content[0]!;
 
 	await check("超长工具结果被截断并带标记", () => {
 		assert.ok(text.length < huge.length, "结果应被截断");
@@ -111,39 +85,6 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 		assert.equal(entries[0]!.truncated, true);
 		assert.equal(entries[0]!.outputChars, huge.length);
 		assert.equal(entries[0]!.ok, true);
-	});
-}
-
-// ---------- 2. 上下文滑动窗口 ----------
-{
-	const transformer = createContextTransformer({ maxMessages: 4 });
-	const messages: AgentMessage[] = [
-		{ role: "system", content: "sys", timestamp: 0 },
-		...Array.from(
-			{ length: 10 },
-			(_, index) => ({ role: "user", content: `m${index}`, timestamp: index + 1 }) as AgentMessage,
-		),
-	];
-
-	const out = await transformer(messages);
-
-	await check("保留 system + 最近 N 条 + 一条压缩提示", () => {
-		assert.equal(out[0]!.role, "system");
-		assert.equal(out.length, 1 + 1 + 4);
-		assert.equal(out[1]!.role, "system");
-		assert.ok(String(out[1]!.content).includes("已省略 6 条"));
-	});
-
-	await check("窗口内消息顺序保持原样", () => {
-		assert.deepEqual(
-			out.slice(2).map((message) => String(message.content)),
-			["m6", "m7", "m8", "m9"],
-		);
-	});
-
-	await check("未超限时原样返回（不复制）", async () => {
-		const small: AgentMessage[] = [{ role: "user", content: "only", timestamp: 1 }];
-		assert.equal(await transformer(small), small);
 	});
 }
 
@@ -212,6 +153,26 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 	});
 }
 
+// ---------- 3c. Pi native turn policy ----------
+{
+	const engine = new WorkflowEngine(ticketWorkflow);
+	const policy = createWorkflowTurnPolicy(engine, 2);
+	policy.startRun();
+	const first = policy.finishTurn([{ toolName: "ticket_search", isError: false } as never]);
+	assert.equal(first.continue, true);
+	assert.equal(engine.state.stepIndex, 1);
+	const second = policy.finishTurn([{ toolName: "ticket_assign", isError: true } as never]);
+	assert.equal(second.continue, false, "错误工具结果后不强迫 Pi 继续请求");
+	assert.equal(engine.state.stepIndex, 1, "错误工具结果不推进业务步骤");
+	policy.startRun();
+	policy.finishTurn([{ toolName: "ticket_search", isError: false } as never]);
+	const limited = policy.finishTurn([{ toolName: "ticket_assign", isError: false } as never]);
+	assert.equal(limited.continue, false, "步骤推进达到最大 Pi turn 数时结束循环");
+	assert.equal(limited.terminateTools, true, "最后一轮 Pi 工具结果带终止标记");
+	assert.equal(policy.limitReached(), true);
+	console.log("✓ 企业工作流策略通过 Pi 原生 turn hook 执行");
+}
+
 // ---------- 4. 注册表 ----------
 {
 	const registry = new ToolRegistry().registerAll(createTicketTools(createStore()));
@@ -234,21 +195,21 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 {
 	const registry = new ToolRegistry().registerAll(createTicketTools(createStore()));
 
-	const denied = createPermissionHook(baseCtx({ allow: ["ticket_search"] }), registry);
-	const blocked = await denied(asBefore("ticket_assign", "c1"));
+	const denied = createPermissionPolicy(baseCtx({ allow: ["ticket_search"] }), registry);
+	const blocked = await denied({ toolName: "ticket_assign", args: {} });
 
 	await check("越权工具被阻断", () => {
-		assert.equal(blocked?.block, true);
-		assert.ok(blocked?.reason?.includes("无权调用"));
+		assert.equal(blocked.allowed, false);
+		assert.ok(!blocked.allowed && blocked.reason.includes("无权调用"));
 	});
 
-	const allowed = createPermissionHook(baseCtx({ allow: ["*"] }), registry);
+	const allowed = createPermissionPolicy(baseCtx({ allow: ["*"] }), registry);
 	await check("白名单内工具直接放行", async () => {
-		assert.equal(await allowed(asBefore("ticket_search", "c2")), undefined);
+		assert.deepEqual(await allowed({ toolName: "ticket_search", args: {} }), { allowed: true });
 	});
 
 	let asked = 0;
-	const approvalHook = createPermissionHook(
+	const approvalPolicy = createPermissionPolicy(
 		baseCtx({
 			requireApproval: ["ticket_search"],
 			requestApproval: async () => {
@@ -258,8 +219,8 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 		}),
 		registry,
 	);
-	await approvalHook(asBefore("ticket_search", "c3"));
-	await approvalHook(asBefore("ticket_search", "c4"));
+	await approvalPolicy({ toolName: "ticket_search", args: {} });
+	await approvalPolicy({ toolName: "ticket_search", args: {} });
 
 	await check("同会话同一工具只确认一次", () => {
 		assert.equal(asked, 1, "不应重复询问");
@@ -503,9 +464,15 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 		workflow: approvalWorkflow,
 		store,
 		ctx,
-		model: runtime.model,
-		streamFn: runtime.streamFn,
 		task: "帮张明提交一笔 3200 元的报销，客户拜访差旅费",
+		createSession: (input) => createPiBusinessSession({
+			...input,
+			model: runtime.model,
+			streamFn: runtime.streamFn,
+			cwd: process.cwd(),
+			sessionManager: createPiSessionHistory({ sessionId: "verify-subflow" }),
+			keepRecentTokens: 20_000,
+		}),
 	});
 
 	await check("子流程按目标流程的步骤整条跑完并返回汇报文本", () => {
@@ -622,18 +589,14 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 			]);
 		}
 	}
-	const runtime = createFauxRuntime([say("演示不用真的跑模型")]);
 	const engine = new WorkflowEngine(ticketWorkflow);
 	// 和会话层一样：初始 toolNames 已含 use_skill 与 flow_*，keepToolNames 只负责换技能时别丢
 	const initialToolNames = [
 		...new Set([...ticketWorkflow.steps.flatMap((step) => step.via), SKILL_TOOL_NAME, flowToolName("data-flow")]),
 	];
-	const built = createBusinessAgent({
+	const built = createBusinessRuntime({
 		workflow: ticketWorkflow,
 		registry,
-		ctx: baseCtx(),
-		model: runtime.model,
-		streamFn: runtime.streamFn,
 		engine,
 		skills,
 		toolNames: initialToolNames,
@@ -656,15 +619,11 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 			].sort(),
 			"工具集 = 本流程步骤工具 + 保留的 use_skill/flow_*",
 		);
-		assert.deepEqual(
-			built.agent.state.tools.map((tool) => tool.name).sort(),
-			[...built.toolNames()].sort(),
-			"真正挂到 agent 上的工具与 toolNames() 一致",
-		);
+		assert.deepEqual(built.toolDefinitions().map((tool) => tool.name).sort(), [...originalTools].sort());
+		assert.equal("agent" in built, false, "业务 runtime 不创建或持有 Pi Agent");
 	});
 
-	await check("激活 data-flow：换工具集 + 换状态机，但不重建 agent", () => {
-		const before = built.agent;
+	await check("激活 data-flow：业务 runtime 更新技能工具集与状态机", () => {
 		const skill = built.activateSkill("data-flow");
 		assert.equal(skill.id, "data-flow");
 		assert.equal(built.activeSkill()?.id, "data-flow");
@@ -677,7 +636,7 @@ function asBefore(toolName: string, id: string): BeforeToolCallContext {
 		assert.ok(built.toolNames().includes(SKILL_TOOL_NAME), "加载器永远保留");
 		assert.ok(built.toolNames().includes(flowToolName("data-flow")), "flow_* 委托入口永远保留");
 		assert.ok(!built.toolNames().includes("ticket_search"), "原流程的工具不再暴露");
-		assert.equal(built.agent, before, "换技能只改 state.tools，不重建 Agent");
+		assert.deepEqual(built.toolDefinitions().map((tool) => tool.name).sort(), [...built.toolNames()].sort());
 	});
 
 	await check("退出技能：恢复会话原流程与工具集", () => {

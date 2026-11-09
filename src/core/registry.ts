@@ -1,12 +1,10 @@
 /**
- * 工具注册表：业务能力 → Pi AgentTool 的适配层。
+ * 业务工具定义注册表；运行时宿主负责将定义转换成模型工具。
  *
- * 流程定义里只写工具名，注册表负责把名字解析成真正可执行的 AgentTool，
- * 并把 BizContext 绑定进 execute 闭包。缺工具时启动即报错，不留到运行时。
+ * 流程定义里只写工具名，注册表负责解析到 ToolDef；缺工具时立即报错。
  */
 
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { BizContext, ToolDef } from "./types.js";
+import type { ToolDef } from "./types.js";
 
 export class ToolRegistry {
 	private readonly defs = new Map<string, ToolDef>();
@@ -49,28 +47,4 @@ export class ToolRegistry {
 		});
 	}
 
-	/**
-	 * 适配成 Pi 的 AgentTool。
-	 *
-	 * 返回 `AgentTool<any>`：参数 schema 是运行期 JSON Schema，静态类型拿不到，
-	 * 这正是 Pi 允许自定义 JSON Schema 的场景。
-	 */
-	toAgentTools(names: string[], ctx: BizContext): AgentTool<any>[] {
-		return this.select(names).map((def) => ({
-			name: def.name,
-			label: def.name,
-			description: def.description,
-			parameters: def.parameters,
-			// 高风险工具串行执行，避免并发触发外部系统的写冲突。
-			executionMode: def.risk === "high" ? "sequential" : "parallel",
-			execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-				const result = await def.execute(params ?? {}, ctx);
-				return {
-					content: [{ type: "text" as const, text: result.content }],
-					details: undefined,
-					...(result.isError === true ? { isError: true } : {}),
-				};
-			},
-		}));
-	}
 }

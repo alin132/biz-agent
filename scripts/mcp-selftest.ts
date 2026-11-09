@@ -26,6 +26,7 @@ import type { McpClient } from "../server/mcp/client.js";
 import { createMcpClient, mcpResultText } from "../server/mcp/client.js";
 import { MCP_TOOL_PREFIX, mcpToolName } from "../server/mcp/names.js";
 import { McpRegistry } from "../server/mcp/registry.js";
+import { piMcpToolName } from "../server/mcp/piNames.js";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const TMP_DIR = resolve(ROOT, "data");
@@ -562,6 +563,23 @@ async function main(): Promise<void> {
 			assert.equal(registry.toolNames().includes("mcp_selftest_mcp_add"), true);
 		});
 
+		await check("Pi MCP 配置与名称映射：数据库快照保留 legacy alias 和禁用标记", () => {
+			const config = registry.piConfigSnapshot();
+			const server = config.servers.find((item) => item.name === "Selftest MCP");
+			assert.ok(server);
+			assert.equal(server.config.type, "stdio");
+			assert.equal(server.config.exposure, "deferred");
+			const aliases = registry.piToolAliases();
+			assert.equal(aliases[piMcpToolName("Selftest MCP", "add")], "mcp_selftest_mcp_add");
+			const add = registry.listTools(serverId)?.find((tool) => tool.name === "add");
+			assert.ok(add);
+			registry.setToolEnabled(add.id, false);
+			const disabledServer = registry.piConfigSnapshot().servers.find((item) => item.name === "Selftest MCP");
+			assert.ok(disabledServer);
+			assert.equal(disabledServer.config.toolExposure.add, "hidden");
+			registry.setToolEnabled(add.id, true);
+		});
+
 		await check("重启恢复：新 registry 构造时用库里的工具建快照", () => {
 			// WorkflowRepo 构造时就要能校验"技能 via 里的 MCP 工具"，所以快照不能等到 start() 才有
 			const fresh = new McpRegistry(db, { onLog: () => {} });
@@ -579,15 +597,17 @@ async function main(): Promise<void> {
 			assert.ok(failed.text.includes("故意失败"));
 		});
 
-		await check("工具启停：禁用后从快照消失，重新启用后回来", () => {
+		await check("工具启停：禁用后旧会话调用被拒绝，重新启用后恢复", async () => {
 			const addTool = registry.listTools(serverId)?.find((tool) => tool.name === "add");
 			assert.ok(addTool);
 			const disabled = registry.setToolEnabled(addTool.id, false);
 			assert.equal(disabled?.enabled, false);
 			assert.equal(registry.toolDefs().some((def) => def.name === "mcp_selftest_mcp_add"), false);
 			assert.equal(db.getMcpTool(addTool.id)?.enabled, false);
+			await assert.rejects(() => registry.callTool(serverId, "add", { a: 1, b: 2 }), /已停用/);
 			assert.equal(registry.setToolEnabled(addTool.id, true)?.enabled, true);
 			assert.equal(registry.toolDefs().some((def) => def.name === "mcp_selftest_mcp_add"), true);
+			assert.equal((await registry.callTool(serverId, "add", { a: 1, b: 2 })).text, "3");
 		});
 
 		await check("refresh 幂等：工具数不变、无重名", async () => {

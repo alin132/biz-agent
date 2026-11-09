@@ -31,7 +31,11 @@
 }
 
 /* 统一页面和操作密度；内容较宽的表格在自身容器内滚动。 */
-:root { --focus-ring: 0 0 0 3px var(--brand-soft-border); }
+:root {
+	--focus-ring: 0 0 0 3px var(--brand-soft-border);
+	--session-selected-bg: #eceff1;
+	--active: var(--session-selected-bg);
+}
 body { font-size: 14px; }
 button, input, textarea { font: inherit; }
 button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--brand-primary); outline-offset: 3px; }
@@ -76,21 +80,27 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .markdown-body code { font-family: Consolas, monospace; font-size: 13px; }
 .code-block { overflow: hidden; border-radius: 8px; margin: 14px 0; }
 .code-head, .code-header { display: flex; justify-content: space-between; background: #26344c; color: white; padding: 6px 12px; }
-.code-copy { margin-left: auto; cursor: pointer; }
-.message-copy { border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 5px 0; font-size: 12px; }
+.code-copy, .message-copy { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 5px; color: var(--muted); background: transparent; border: 0; border-radius: 6px; cursor: pointer; }
+.code-copy { margin-left: auto; color: white; }
+.code-copy:hover, .message-copy:hover { background: var(--surface-alt); color: var(--text); }
+.code-copy svg, .message-copy svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .plain-message { white-space: pre-wrap; }
 .page .chat-bubble { white-space: normal; font-size: 14px; }
-.page .chat-main { background: white; border: 1px solid var(--line); border-radius: 14px; min-width: 0; }
+.page .chat-main { height: 100%; min-height: 0; overflow: hidden; background: white; border: 1px solid var(--line); border-radius: 14px; min-width: 0; }
 .page .chat-scroll { padding: 24px; }
 .page .chat-input { background: white; border-top: 1px solid var(--line); padding: 16px 24px; }
 .page .chat-list { border-right: 1px solid var(--line); padding-right: 16px; }
 .page .chat-session { border-radius: 8px; cursor: pointer; }
-.page .chat-session.active { background: var(--brand-soft); }
-.page .chat-layout { min-height: 580px; height: calc(100dvh - 150px); }
+.page .chat-session.active { background: var(--session-selected-bg); }
+.page .chat-layout { min-height: 0; height: calc(100dvh - 150px); }
 .page .chat-msg { width: 100%; max-width: 1100px; margin-left: 0; margin-right: 0; }
 .page .chat-msg.assistant { align-self: stretch; }
 .page .chat-msg.user { width: fit-content; max-width: min(88%, 900px); margin-left: auto; }
 .page .chat-head { padding: 14px 20px; border-bottom: 1px solid var(--line); }
+.page .chat-compaction-record { width: min(100%, 1000px); align-self: center; padding: 12px 16px; border-left: 3px solid var(--brand); border-radius: 6px; background: var(--surface-alt); color: var(--text); }
+.chat-compaction-record > header { display: flex; align-items: baseline; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.chat-compaction-record > header span { color: var(--muted); font-size: 12px; }
+.chat-compaction-summary { padding-top: 8px; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
 .chat-operations { margin-bottom: 12px; }
 .chat-runtime { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--surface-alt); margin: 12px 0; }
 .chat-runtime summary { cursor: pointer; }
@@ -109,7 +119,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
  .page .chat-list { display: none; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); padding: 12px; margin-bottom: 12px; background: white; }
  .page .chat-layout.show-sessions .chat-list { display: block; }
  .chat-list-toggle { display: inline-flex; }
- .page .chat-main { height: 100%; } .page .chat-scroll { padding: 16px; } .page .chat-input { padding: 12px; }
+ .page .chat-layout { min-height: 420px; }
+ .page .chat-main { height: 100%; min-height: 0; } .page .chat-scroll { padding: 16px; } .page .chat-input { padding: 12px; }
  .page .agent-grid, .page .skill-grid { grid-template-columns: minmax(0,1fr); }
  .page .row, .page .row-actions { flex-wrap: wrap; } .page .row-main { min-width: 0; overflow-wrap: anywhere; }
  .page .row-actions { justify-content: flex-start; } .page .kb-layout { grid-template-columns: minmax(0,1fr); }

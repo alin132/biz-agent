@@ -1,18 +1,16 @@
 /**
  * 平台对外出口。
  *
- * 用法：
- *   const agent = createBusinessAgent({ workflow: ticketWorkflow, registry, ctx, model, streamFn });
- *   await agent.agent.prompt("处理一下支付回调超时的工单");
+ * `createBusinessRuntime` builds business policy; the host uses Pi adapters for agents and sessions.
  */
 
-export { createBusinessAgent, pipeTextToStdout } from "./core/runtime.js";
-export type { BusinessAgent, CreateBusinessAgentOptions } from "./core/runtime.js";
+export { buildBusinessSystemPrompt, createBusinessRuntime } from "./core/runtime.js";
+export type { BusinessRuntime, CreateBusinessRuntimeOptions } from "./core/runtime.js";
 export { ToolRegistry } from "./core/registry.js";
 export { WorkflowEngine } from "./core/workflow.js";
-export { createPermissionHook } from "./core/permission.js";
-export { createAuditHook, MAX_RESULT_CHARS } from "./core/audit.js";
-export { createContextTransformer } from "./core/context.js";
+export { createWorkflowTurnPolicy } from "./core/workflowPolicy.js";
+export { createPermissionPolicy } from "./core/permission.js";
+export { createAuditPolicy, MAX_RESULT_CHARS } from "./core/audit.js";
 export type {
 	AuditEntry,
 	ApprovalRequest,
@@ -51,5 +49,5 @@ export type { ValidateOptions, WorkflowInput } from "./core/workflowSpec.js";
 
 /** 流程即工具：把一条流程当工具整条跑完。 */
 export { flowToolDescription, flowToolName, flowToolParameters, isFlowToolName } from "./core/flowTools.js";
-export { lastAssistantTextOf, runSubWorkflow } from "./core/subFlow.js";
+export { runSubWorkflow } from "./core/subFlow.js";
 export type { SubFlowOptions, SubFlowResult } from "./core/subFlow.js";

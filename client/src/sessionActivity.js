@@ -1,27 +1,54 @@
 import { computed, onBeforeUnmount, ref } from "vue";
-export function useSessionActivity(){
-	const tools=ref([]),pending=ref([]),lastDurationMs=ref(0),runningSince=ref(0),now=ref(Date.now());
-	let timer=null;
-	const elapsedMs=computed(()=>runningSince.value?Math.max(0,now.value-runningSince.value):lastDurationMs.value);
-	function hydrate(view){
-		pending.value=view.pendingApprovals??[];
-		const turns=(view.transcript??[]).filter(item=>item.role==='user');
-		lastDurationMs.value=Number(turns.at(-1)?.durationMs??0);
-		tools.value=turns.flatMap(turn=>(turn.tools??[]).map(tool=>({...tool,running:false}))).slice(-20);
-		if(!tools.value.length)tools.value=(view.audit??[]).slice(-20).map((item,index)=>({id:`history-${index}`,name:item.toolName,args:item.args,ok:item.ok,running:false}));
-		runningSince.value=view.running?Date.now():0;
-		clearInterval(timer);timer=null;
-		if(view.running)timer=setInterval(()=>{now.value=Date.now();},250);
+
+export function useSessionActivity() {
+	const pending = ref([]);
+	const activeTurn = ref(null);
+	const now = ref(Date.now());
+	let timer = null;
+	const elapsedMs = computed(() => {
+		const turn = activeTurn.value;
+		if (!turn) return 0;
+		return turn.startedAt ? Math.max(0, now.value - turn.startedAt) : Number(turn.durationMs ?? 0);
+	});
+
+	function hydrate(view, turns = view.transcript ?? []) {
+		pending.value = view.pendingApprovals ?? [];
+		activeTurn.value = [...turns].reverse().find((item) => item.role === "user") ?? null;
+		if (activeTurn.value && view.running) activeTurn.value.startedAt = Date.now();
+		clearInterval(timer);
+		timer = view.running ? setInterval(() => { now.value = Date.now(); }, 250) : null;
 	}
-	function event(payload){
-		if(payload.type==='tool_start')tools.value.push({id:payload.id,name:payload.name,args:payload.args,running:true});
-		if(payload.type==='tool_end'){const row=tools.value.find(t=>t.id===payload.id);if(row)Object.assign(row,{running:false,ok:payload.ok,result:payload.result,durationMs:payload.durationMs});}
-		if(payload.type==='busy'&&payload.running){runningSince.value=Date.now();lastDurationMs.value=0;clearInterval(timer);timer=setInterval(()=>{now.value=Date.now();},250);}
-		if(payload.type==='busy'&&!payload.running){if(runningSince.value)lastDurationMs.value=Date.now()-runningSince.value;runningSince.value=0;clearInterval(timer);timer=null;}
-		if(payload.type==='approval'&&!pending.value.some(p=>p.requestId===payload.requestId))pending.value.push(payload);
-		if(payload.type==='done'||payload.type==='error')pending.value=[];
+
+	function beginTurn(turn) {
+		activeTurn.value = turn;
+		turn.tools ??= [];
+		turn.durationMs = 0;
+		turn.startedAt = Date.now();
+		clearInterval(timer);
+		timer = setInterval(() => { now.value = Date.now(); }, 250);
 	}
-	function resolved(id){pending.value=pending.value.filter(p=>p.requestId!==id);}
-	onBeforeUnmount(()=>clearInterval(timer));
-	return {tools,pending,elapsedMs,hydrate,event,resolved};
+
+	function event(payload) {
+		const turn = activeTurn.value;
+		if (payload.type === "tool_start" && turn) {
+			turn.tools ??= [];
+			if (!turn.tools.some((tool) => tool.id === payload.id)) turn.tools.push({ id: payload.id, name: payload.name, args: payload.args, running: true });
+		}
+		if (payload.type === "tool_end" && turn) {
+			const tool = (turn.tools ?? []).find((item) => item.id === payload.id);
+			if (tool) Object.assign(tool, { running: false, ok: payload.ok, result: payload.result, durationMs: payload.durationMs });
+		}
+		if (payload.type === "approval" && !pending.value.some((item) => item.requestId === payload.requestId)) pending.value.push(payload);
+		if ((payload.type === "done" || payload.type === "error") && turn?.startedAt) {
+			turn.durationMs = Date.now() - turn.startedAt;
+			delete turn.startedAt;
+			clearInterval(timer);
+			timer = null;
+			pending.value = [];
+		}
+	}
+
+	function resolved(id) { pending.value = pending.value.filter((item) => item.requestId !== id); }
+	onBeforeUnmount(() => clearInterval(timer));
+	return { pending, activeTurn, elapsedMs, hydrate, beginTurn, event, resolved };
 }

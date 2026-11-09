@@ -23,6 +23,8 @@ import type { ToolDef } from "../../src/core/types.js";
 import { createMcpClient, mcpResultText } from "./client.js";
 import type { McpCallToolResult, McpClient, McpClientOptions, McpToolDescriptor } from "./client.js";
 import { mcpToolName } from "./names.js";
+import { piMcpToolName } from "./piNames.js";
+import { piSseSource } from "./piTransport.js";
 
 /** 新建/修改服务时路由层校验后的配置（id/时间戳由这里生成）。 */
 export interface McpServerDraft {
@@ -173,6 +175,68 @@ export class McpRegistry {
 		return this.snapshot.map((binding) => binding.toolName);
 	}
 
+	/** Database-backed MCP configuration consumed by Pi's native MCP extension for each session. */
+	piConfigSnapshot(): {
+		servers: Array<{
+			name: string;
+			source: string;
+			scope: "extension";
+			config:
+				| { type: "stdio"; command: string; args: string[]; env: Record<string, string>; exposure: "deferred"; toolExposure: Record<string, "hidden"> }
+				| { type: "http"; url: string; headers: Record<string, string>; exposure: "deferred"; toolExposure: Record<string, "hidden"> };
+		}>;
+		errors: string[];
+	} {
+		const servers = this.db.listMcpServers().filter((server) => server.enabled).map((server) => {
+			const tools = this.db.listMcpTools(server.id);
+			const exposure = "deferred" as const;
+			const toolExposure = Object.fromEntries(tools.filter((tool) => !tool.enabled).map((tool) => [tool.name, "hidden" as const]));
+			const config = server.transport === "stdio"
+				? { type: "stdio" as const, command: server.command ?? "", args: server.args, env: server.env, exposure, toolExposure }
+				: { type: "http" as const, url: server.url ?? "", headers: server.headers, exposure, toolExposure };
+			return {
+				name: server.name,
+				source: server.transport === "sse" ? piSseSource(server.id) : `biz-agent:${server.id}`,
+				scope: "extension" as const,
+				config,
+			};
+		});
+		return { servers, errors: [] };
+	}
+
+	/** Maps Pi's native `mcp__...` names to the stable enterprise names persisted in skills. */
+	piToolAliases(): Record<string, string> {
+		const owners = new Map<string, string>();
+		const aliases: Record<string, string> = {};
+		const plainCounts = new Map<string, number>();
+		for (const binding of this.snapshot) {
+			const key = `${binding.server.name}\0${piMcpToolName(binding.server.name, binding.tool.name)}`;
+			plainCounts.set(key, (plainCounts.get(key) ?? 0) + 1);
+		}
+		for (const binding of this.snapshot) {
+			const owner = `${binding.server.name}\0${binding.tool.name}`;
+			const plain = piMcpToolName(binding.server.name, binding.tool.name);
+			const nativeName = piMcpToolName(binding.server.name, binding.tool.name, (candidate) => {
+				const existing = owners.get(candidate);
+				return (existing !== undefined && existing !== owner) || (candidate === plain && (plainCounts.get(`${binding.server.name}\0${plain}`) ?? 0) > 1);
+			});
+			owners.set(nativeName, owner);
+			aliases[nativeName] = binding.toolName;
+		}
+		return aliases;
+	}
+
+	isToolEnabled(toolName: string): boolean {
+		for (const server of this.db.listMcpServers()) {
+			for (const tool of this.db.listMcpTools(server.id)) {
+				if (mcpToolName(server.name, tool.name) === toolName || this.snapshot.some((binding) => binding.server.id === server.id && binding.tool.id === tool.id && binding.toolName === toolName)) {
+					return server.enabled && tool.enabled;
+				}
+			}
+		}
+		return false;
+	}
+
 	/* ---------------- 变更 ---------------- */
 
 	/** 新建服务：先落库（失败也要留下记录），再立即 initialize + tools/list。 */
@@ -312,6 +376,9 @@ export class McpRegistry {
 		if (!tool) {
 			throw new McpRegistryError(`MCP 服务「${server.name}」没有名为「${wanted}」的工具`, 404);
 		}
+		if (!tool.enabled) {
+			throw new McpRegistryError(`MCP 工具「${tool.name}」已停用，请先启用再调用`, 409);
+		}
 		const client = await this.ensureClient(server);
 		try {
 			const result = await client.callTool(tool.name, args);
@@ -448,8 +515,8 @@ export class McpRegistry {
 			parameters: tool.inputSchema,
 			execute: async (args: Record<string, unknown>) => {
 				try {
-					const result = await this.callBinding(binding, args);
-					return { content: mcpResultText(result), ...(result.isError ? { isError: true } : {}) };
+					const result = await this.callTool(server.id, tool.name, args);
+					return { content: result.text, ...(result.result.isError ? { isError: true } : {}) };
 				} catch (error) {
 					return {
 						content: `MCP 工具「${toolName}」调用失败：${errorMessage(error)}`,
@@ -458,11 +525,6 @@ export class McpRegistry {
 				}
 			},
 		};
-	}
-
-	private async callBinding(binding: McpToolBinding, args: Record<string, unknown>): Promise<McpCallToolResult> {
-		const client = await this.ensureClient(binding.server);
-		return client.callTool(binding.tool.name, args);
 	}
 
 	/** 拿一个可用连接；没有就现连（服务可能刚启动失败/被重启过）。失败按 502 上抛。 */

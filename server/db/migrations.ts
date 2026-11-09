@@ -47,7 +47,7 @@ export function loadMigrations(dir = MIGRATIONS_DIR): Migration[] {
 	const files = readdirSync(dir)
 		.filter((file) => file.endsWith(".sql"))
 		.sort();
-	return files.map((file) => {
+	const migrations = files.map((file) => {
 		const match = /^(\d+)_(.+)\.sql$/.exec(file);
 		if (!match) {
 			throw new Error(`迁移文件名不规范（要「0001_init.sql」这种数字前缀 + 下划线）：${file}`);
@@ -58,6 +58,15 @@ export function loadMigrations(dir = MIGRATIONS_DIR): Migration[] {
 			sql: readFileSync(join(dir, file), "utf8"),
 		};
 	});
+	const versions = new Map<string, string>();
+	for (const migration of migrations) {
+		const duplicate = versions.get(migration.version);
+		if (duplicate) {
+			throw new Error(`迁移版本重复：${migration.version} 同时用于 ${duplicate} 和 ${migration.name}`);
+		}
+		versions.set(migration.version, migration.name);
+	}
+	return migrations;
 }
 
 export interface MigrationRun {

@@ -44,6 +44,11 @@ function toggle() {
 	}
 }
 
+function openMenu() {
+	if (props.disabled || props.switching) return;
+	if (!open.value) toggle();
+}
+
 function close() {
 	open.value = false;
 }
@@ -104,6 +109,8 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onDocumentPoin
 
 // 会话或模型被外部改掉（切会话/换模型成功回包）时收起菜单，别停在旧高亮上
 watch(() => props.value, close);
+
+defineExpose({ open: openMenu });
 </script>
 
 <template>

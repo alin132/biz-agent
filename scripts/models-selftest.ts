@@ -30,6 +30,7 @@ import {
 import { ModelService, pingModel } from "../server/models/service.js";
 import type { FetchLike } from "../server/models/service.js";
 import { ModelError, ModelStore } from "../server/models/store.js";
+import { processPiModelRuntime } from "../server/piModelRuntime.js";
 
 // 固定密钥：让本脚本的加密结果可断言；也避免误用本机 .env 里的 SECRET_KEY
 process.env.SECRET_KEY = "models-selftest-secret";
@@ -302,6 +303,34 @@ async function main(): Promise<void> {
 		} finally {
 			delete process.env.LLM_DISABLE;
 		}
+	});
+
+	await check("模型管理 CRUD 同步 Pi 目录并清掉旧模型", async () => {
+		const service = new ModelService(storage);
+		const syncProvider = service.createProvider({
+			name: "Pi 目录同步自检",
+			kind: "openai",
+			baseUrl: "https://pi-sync.invalid/v1",
+			apiKey: "pi-sync-key",
+			enabled: true,
+		});
+		const first = await service.createModel({ providerId: syncProvider.id, modelId: "pi-sync-first" });
+		const firstRuntime = service.resolveRuntime(first.id);
+		assert.ok(firstRuntime?.prepareModel);
+		await firstRuntime.prepareModel;
+		const providerId = `biz_${syncProvider.id.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+		assert.ok((await processPiModelRuntime.runtime()).getModel(providerId, "pi-sync-first"));
+		const second = await service.createModel({ providerId: syncProvider.id, modelId: "pi-sync-second" });
+		assert.ok((await processPiModelRuntime.runtime()).getModel(providerId, "pi-sync-first"));
+		assert.ok((await processPiModelRuntime.runtime()).getModel(providerId, "pi-sync-second"));
+		await service.updateModel(second.id, { modelId: "pi-sync-renamed" });
+		const modelRuntime = await processPiModelRuntime.runtime();
+		assert.equal(modelRuntime.getModel(providerId, "pi-sync-second"), undefined);
+		assert.ok(modelRuntime.getModel(providerId, "pi-sync-renamed"));
+		await service.updateProvider(syncProvider.id, { enabled: false });
+		assert.equal(modelRuntime.getModel(providerId, "pi-sync-first"), undefined, "停用供应商后 Pi 目录不可再取到模型");
+		await service.removeProvider(syncProvider.id);
+		assert.equal(modelRuntime.getModel(providerId, "pi-sync-renamed"), undefined, "删除供应商后 Pi 目录不可再取到模型");
 	});
 
 	await check("options：库里的 chat 模型会进下拉，embedding 不进", () => {

@@ -27,8 +27,11 @@
     "models:selftest": "tsx scripts/models-selftest.ts",
     "mcp:selftest": "tsx scripts/mcp-selftest.ts",
     "agents:selftest": "tsx scripts/agents-selftest.ts",
+    "agent-groups:selftest": "tsx scripts/agent-groups-storage-selftest.ts",
+    "plugins:selftest": "tsx scripts/plugins-selftest.ts",
     "contracts:selftest": "tsx scripts/session-contract-selftest.ts",
     "contracts:e2e": "node scripts/contracts-e2e.mjs",
+    "pi:selftest": "tsx scripts/pi-runtime-adapter-selftest.ts",
     "smoke:agents": "tsx scripts/smoke-agents.ts",
     "obs:selftest": "tsx scripts/observability-selftest.ts",
     "im:selftest": "tsx scripts/im-selftest.ts",
@@ -48,18 +51,21 @@
     "demo:approval": "tsx examples/approval.demo.ts",
     "demo:real": "tsx examples/real-model.ts",
     "code": "tsx src/cli/code.ts",
-    "code:selftest": "tsx scripts/code-selftest.ts"
+    "code:selftest": "tsx scripts/code-selftest.ts",
+    "pi:cli-selftest": "tsx scripts/pi-cli-session-selftest.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.5.0",
     "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
     "@earendil-works/pi-schema": "1.5.0",
     "mammoth": "^1.13.0",
     "naive-ui": "^2.45.3",
     "pg": "^8.23.1",
     "unpdf": "^1.9.1",
     "vue": "^3.5.44",
-    "vue-router": "^4.6.4"
+    "vue-router": "^4.6.4",
+    "typebox": "1.3.27"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",

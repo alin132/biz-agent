@@ -14,9 +14,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { createPermissionHook } from "../src/core/permission.js";
+import { createPermissionPolicy } from "../src/core/permission.js";
 import { ToolRegistry } from "../src/core/registry.js";
-import { createBusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
 import type { BizContext, ToolDef } from "../src/core/types.js";
 import { createCodingTools } from "../src/tools/coding.js";
 import { createCodingWorkflow } from "../src/coding/workflow.js";
@@ -175,56 +175,49 @@ async function main(): Promise<void> {
 		});
 
 		console.log("\n-- 审批钩子（高风险必须挡住）--");
-		const hook = createPermissionHook(ctx, registry);
+		const policy = createPermissionPolicy(ctx, registry);
 		await check("没有审批出口时 fs_write 被阻断", async () => {
-			const result = await hook({ toolCall: { name: "fs_write" }, args: { path: "x.txt", content: "x" } } as never);
-			assert.equal(result?.block, true);
-			assert.ok(result?.reason?.includes("未获人工审批"), result?.reason);
+			const result = await policy({ toolName: "fs_write", args: { path: "x.txt", content: "x" } });
+			assert.equal(result.allowed, false);
+			assert.ok(!result.allowed && result.reason.includes("未获人工审批"));
 		});
 		await check("低风险工具不触发审批", async () => {
-			const result = await hook({ toolCall: { name: "fs_read" }, args: { path: "hello.txt" } } as never);
-			assert.equal(result, undefined);
+			const result = await policy({ toolName: "fs_read", args: { path: "hello.txt" } });
+			assert.deepEqual(result, { allowed: true });
 		});
 		let asked = 0;
-		const approvingHook = createPermissionHook(makeCtx({ requestApproval: async () => { asked += 1; return true; } }), registry);
+		const approvingPolicy = createPermissionPolicy(makeCtx({ requestApproval: async () => { asked += 1; return true; } }), registry);
 		await check("审批通过后放行，且同一会话内不再重复询问", async () => {
-			assert.equal(await approvingHook({ toolCall: { name: "shell_run" }, args: { command: "echo hi" } } as never), undefined);
-			assert.equal(await approvingHook({ toolCall: { name: "shell_run" }, args: { command: "echo hi" } } as never), undefined);
+			assert.deepEqual(await approvingPolicy({ toolName: "shell_run", args: { command: "echo hi" } }), { allowed: true });
+			assert.deepEqual(await approvingPolicy({ toolName: "shell_run", args: { command: "echo hi" } }), { allowed: true });
 			assert.equal(asked, 1, "应只询问一次，实际 " + asked);
 		});
 		await check("审批拒绝时阻断且带上原因", async () => {
-			const denyHook = createPermissionHook(makeCtx({ requestApproval: async () => false }), registry);
-			const result = await denyHook({ toolCall: { name: "shell_run" }, args: { command: "echo hi" } } as never);
-			assert.equal(result?.block, true);
+			const denyPolicy = createPermissionPolicy(makeCtx({ requestApproval: async () => false }), registry);
+			const result = await denyPolicy({ toolName: "shell_run", args: { command: "echo hi" } });
+			assert.equal(result.allowed, false);
 		});
 
 		console.log("\n-- 装配（回归：空 steps 不暴露工具）--");
 		await check("显式 toolNames 后 agent 装上全部编码工具", () => {
 			const workflow = createCodingWorkflow(root);
 			assert.equal(workflow.steps.length, 0, "编码 Agent 不应有固定步骤");
-			const built = createBusinessAgent({
+			const built = createBusinessRuntime({
 				workflow,
 				registry,
-				ctx: makeCtx(),
-				// 模型只在装配期用到类型，这里用假 runtime 即可：我们只断言工具集
-				model: {} as never,
-				streamFn: (() => { throw new Error("本用例不发起模型调用"); }) as never,
 				toolNames: tools.map((tool) => tool.name),
 			});
-			const exposed = built.agent.state.tools.map((tool) => tool.name);
+			const exposed = built.toolDefinitions().map((tool) => tool.name);
 			assert.equal(exposed.length, 9, "应装上 9 个工具，实际 " + exposed.join(","));
 			assert.ok(exposed.includes("shell_run"));
 		});
 		await check("不传 toolNames 时确实一个工具都装不上（说明必须显式传）", () => {
 			const workflow = createCodingWorkflow(root);
-			const built = createBusinessAgent({
+			const built = createBusinessRuntime({
 				workflow,
 				registry,
-				ctx: makeCtx(),
-				model: {} as never,
-				streamFn: (() => { throw new Error("本用例不发起模型调用"); }) as never,
 			});
-			assert.equal(built.agent.state.tools.length, 0);
+			assert.equal(built.toolDefinitions().length, 0);
 		});
 		await check("系统提示写明了工作目录与审批约束", () => {
 			const prompt = createCodingWorkflow(root).systemPrompt;

@@ -95,7 +95,7 @@ async function route(
 		}
 		if (method === "POST") {
 			const body = await readJsonBody(req);
-			json(res, 201, service.store.createModel(body));
+			json(res, 201, await service.createModel(body));
 			return;
 		}
 		methodNotAllowed(res, method, "GET / POST");
@@ -137,7 +137,7 @@ async function route(
 		}
 		if (method === "POST") {
 			const body = await readJsonBody(req);
-			json(res, 201, service.store.createProvider(body));
+			json(res, 201, service.createProvider(body));
 			return;
 		}
 		methodNotAllowed(res, method, "GET / POST");
@@ -157,11 +157,11 @@ async function route(
 		}
 		if (method === "PATCH") {
 			const body = await readJsonBody(req);
-			json(res, 200, service.store.updateProvider(providerId, body));
+			json(res, 200, await service.updateProvider(providerId, body));
 			return;
 		}
 		if (method === "DELETE") {
-			json(res, 200, service.store.removeProvider(providerId));
+			json(res, 200, await service.removeProvider(providerId));
 			return;
 		}
 		methodNotAllowed(res, method, "GET / PATCH / DELETE");
@@ -193,11 +193,11 @@ async function route(
 		}
 		if (method === "PATCH") {
 			const body = await readJsonBody(req);
-			json(res, 200, service.store.updateModel(modelId, body));
+			json(res, 200, await service.updateModel(modelId, body));
 			return;
 		}
 		if (method === "DELETE") {
-			if (!service.store.removeModel(modelId)) {
+			if (!await service.removeModel(modelId)) {
 				throw new ModelError(404, "模型不存在");
 			}
 			json(res, 200, { removed: true });

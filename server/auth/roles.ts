@@ -98,6 +98,7 @@ export function permissionFor(method: string, pathname: string): Permission | nu
 	if (pathname === "/api/audit") {
 		return "audit.read";
 	}
+	if (pathname === "/api/pi/settings") return write ? "settings.write" : "workflow.read";
 	// P9 监控：首页 summary 四种角色都能看（operator 只读这一页）；
 	// 调用链（traces / traces/:id）属于审计数据，读走 audit.read —— owner / developer / auditor，
 	// operator 会在 guard 层直接 403。这里没有写接口。
@@ -149,12 +150,17 @@ export function permissionFor(method: string, pathname: string): Permission | nu
 	if (pathname === "/api/approvals" || pathname.startsWith("/api/approvals/")) {
 		return write ? "session.run" : "session.read";
 	}
+	if (pathname === "/api/agent-groups" || pathname.startsWith("/api/agent-groups/")) {
+		if (!write) return "session.read";
+		if (/^\/api\/agent-groups\/[^/]+\/turns$/.test(pathname)) return "session.run";
+		return "session.write";
+	}
 	if (pathname.startsWith("/api/sessions")) {
 		if (!write) {
 			return "session.read";
 		}
 		// 让模型干活的几个子接口算"运行"，其余算"增删改会话"
-		if (/^\/api\/sessions\/[^/]+\/(messages|skills|approve|permissions|stop)$/.test(pathname)) {
+		if (/^\/api\/sessions\/[^/]+\/(messages|skills|approve|permissions|stop|thinking|pi-tree\/(label|navigate))$/.test(pathname)) {
 			return "session.run";
 		}
 		return "session.write";

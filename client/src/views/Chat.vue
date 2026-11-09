@@ -5,10 +5,8 @@
  * 为什么需要这一页：之前 Agent 页只能"发布"，发布完没有入口说话——配置再完整也是死的。
  * 这里复用会话的全部既有链路（SSE、审批、技能快照、审计），不另造一套聊天协议。
  *
- * **Agent 的对话不在这一页**：那些会话归各自的专属页（/agent-chat/:id）。
- * 一个列表混装所有 Agent 的历史时，用户分不清在跟谁说话（"怎么所有 agent 的对话都在一个页面"）。
- * 所以这里只列 agentId 为空的会话，并且不再提供"新建时挑一个 Agent"的入口——
- * 想跟 Agent 说话，从 Agent 列表点进去，比在这一页的下拉里挑更说得通。
+ * Agent 从列表进入时也复用这套对话界面，通过 agentId 只显示对应 Agent 的会话。
+ * 不带 agentId 时仍只列通用会话，避免不同 Agent 的历史混在一起。
  *
  * 三条如实呈现的约定：
  *  1. 已停用的 Agent 后端会回 409，这里把错误原样显示，不假装能聊；
@@ -27,30 +25,52 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router";
 import MessageBody from "../components/MessageBody.vue";
 import SessionActivity from "../components/SessionActivity.vue";
-import SessionToolbar from "../components/SessionToolbar.vue";
+import SessionContextMenu from "../components/SessionContextMenu.vue";
+import PiSessionTree from "../components/PiSessionTree.vue";
+import PiSessionStats from "../components/PiSessionStats.vue";
 import { useSessionActivity } from "../sessionActivity.js";
+import { readPinnedSessionIds, sortPinnedSessions, togglePinnedSession } from "../sessionPins.js";
 import { can } from "../access.js";
 import { NAlert, NButton, NEmpty, NInput, NSpin, NTag, useMessage } from "naive-ui";
 import PageShell from "../components/PageShell.vue";
 import ModelPicker from "../components/ModelPicker.vue";
 import SlashCommandPanel from "../components/SlashCommandPanel.vue";
-import { http, modelsApi, sessionApi, sessionEvents } from "../api.js";
-import { createSlashCommands, slashQueryOf } from "../slashCommands.js";
-import { formatTokens } from "../contextUsage.js";
+import { agentsApi, http, modelsApi, pluginsApi, sessionApi, sessionEvents } from "../api.js";
+import { createSlashCommands, piSkillsFromPlugins, slashQueryOf } from "../slashCommands.js";
+import { downloadPiSession, downloadPiSessionHtml } from "../piSessionDownload.js";
+import { copyText, lastAssistantText } from "../clipboard.js";
+import { contextRingDash, formatTokens } from "../contextUsage.js";
 
 const route = useRoute();
 const router = useRouter();
 const message = useMessage();
+const agentId = computed(() => typeof route.query.agentId === "string" ? route.query.agentId : "");
+const agent = ref(null);
 
 const activity = useSessionActivity();
 const showSessions=ref(false),sessionQuery=ref("");
-async function removed() { closeStream();current.value=null;messages.value=[];streamText.value="";streamThinking.value="";sending.value=false;activity.hydrate({});await router.replace({path:"/chat",query:{}});await refreshList(); }
+const pinRevision = ref(0);
+async function removed() { closeStream();current.value=null;messages.value=[];streamText.value="";streamThinking.value="";sending.value=false;activity.hydrate({});await router.replace({path:"/chat",query:{...(agentId.value?{agentId:agentId.value}:{}),...(route.query.standalone==="1"?{standalone:"1"}:{})}});await refreshList(); }
 const sessions = ref([]);
-const visibleSessions=computed(()=>sessions.value.filter(s=>titleOf(s).toLowerCase().includes(sessionQuery.value.toLowerCase())));
+const pinnedIds = computed(() => { pinRevision.value; return readPinnedSessionIds(agentId.value); });
+const visibleSessions=computed(()=>sortPinnedSessions(sessions.value.filter(s=>titleOf(s).toLowerCase().includes(sessionQuery.value.toLowerCase())),pinnedIds.value));
 const current = ref(null);
+const piSkills = ref([]);
+const piTreeOpen = ref(false);
+const piStatsOpen = ref(false);
+const piStats = ref(null);
+const modelPickerRef = ref(null);
+const contextSession = ref(null);
+const sessionContextMenuRef = ref(null);
+const contextX = ref(0);
+const contextY = ref(0);
 const messages = ref([]);
 const draft = ref("");
+const attachments = ref([]);
+const attachmentBusy = ref(false);
+const fileInput = ref(null);
 const sending = ref(false);
+const queuedFollowUps = ref([]);
 const toolbarBusy = ref(false);
 const loading = ref(true);
 const error = ref("");
@@ -78,6 +98,37 @@ function titleOf(item) {
 	return first?.text?.slice(0, 40) || "新对话";
 }
 
+function toggleSessionPin(item) {
+	if (!item) return;
+	togglePinnedSession(item.id, agentId.value);
+	pinRevision.value += 1;
+}
+
+function openSessionContextMenu(item, event) {
+	if (!can("session.read") && !can("session.write")) return;
+	const rect = event.currentTarget.getBoundingClientRect();
+	contextSession.value = item;
+	contextX.value = event.clientX || rect.left + 16;
+	contextY.value = event.clientY || rect.top + rect.height / 2;
+}
+
+function onSessionContextKeydown(item, event) {
+	if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+	event.preventDefault();
+	openSessionContextMenu(item, event);
+}
+
+async function onContextSessionRemoved(id) {
+	contextSession.value = null;
+	if (current.value?.id === id) await removed();
+	else await refreshList();
+}
+
+function onContextSessionUpdated(view) {
+	if (current.value?.id === view.id) current.value = view;
+	refreshList();
+}
+
 async function scrollToEnd() {
 	await nextTick();
 	const box = scrollBox.value;
@@ -86,15 +137,57 @@ async function scrollToEnd() {
 
 /** 把会话快照灌进消息列表（历史 + 当前）。transcript 是唯一真相。 */
 function hydrate(view) {
- activity.hydrate(view);
- sending.value=Boolean(view.running);
+	messages.value = (view.transcript ?? []).map((entry) => ({ ...entry, tools: entry.tools ?? [] }));
+	activity.hydrate(view, messages.value);
+	sending.value = Boolean(view.running);
+	queuedFollowUps.value = view.queuedFollowUps ?? [];
 	usedTokens.value = Math.max(0, Number(view.contextTokens ?? 0));
 	contextEstimated.value = Boolean(view.contextTokensEstimated ?? true);
-	messages.value = (view.transcript ?? []).map((entry) => ({
-		role: entry.role,
-		text: entry.text,
-		at: entry.at,
-	}));
+	scrollToEnd();
+}
+
+function onPiTreeNavigate(result) {
+	current.value = result.session;
+	draft.value = result.editorText ?? "";
+	hydrate(result.session);
+}
+
+async function onPiTreeFork(result) {
+	await refreshList();
+	await openSession(result.session.id);
+	draft.value = result.editorText ?? "";
+}
+
+async function onContextSessionCreated(view) {
+	contextSession.value = null;
+	await refreshList();
+	await openSession(view.id);
+}
+
+async function cloneCurrentSession() {
+	if (!current.value || sending.value) return;
+	try {
+		const result = await sessionApi.clone(current.value.id);
+		await refreshList();
+		await openSession(result.session.id);
+		message.success("已复制为独立对话");
+	} catch (cause) {
+		message.error(cause?.message ?? "复制对话失败");
+	}
+}
+
+function applyCompressedTranscript(entries) {
+	const previous = messages.value;
+	const active = activity.activeTurn.value;
+	messages.value = (entries ?? []).map((entry) => {
+		const old = [...previous].reverse().find((item) => item.role === entry.role &&
+			(item.at === entry.at || (entry.role === "user" && item.text === entry.text)));
+		return { ...(old ?? {}), ...entry, tools: entry.tools ?? old?.tools ?? [] };
+	});
+	if (active) {
+		activity.activeTurn.value = [...messages.value].reverse().find((item) => item.role === "user" &&
+			(item.at === active.at || item.text === active.text)) ?? null;
+	}
 	scrollToEnd();
 }
 
@@ -126,6 +219,10 @@ function subscribe(id) {
 				contextEstimated.value = Boolean(payload.estimated);
 				if (current.value) current.value = { ...current.value, contextTokens: usedTokens.value, contextTokensEstimated: contextEstimated.value };
 				break;
+			case "compacting":
+				compacting.value = true;
+				startCompactingTimer();
+				break;
 			case "workflow":
 				if(current.value) current.value={...current.value,steps:payload.steps,current:payload.current,done:payload.done};
 				break;
@@ -146,6 +243,9 @@ function subscribe(id) {
 			case "busy":
 				sending.value = payload.running;
 				break;
+			case "queue":
+				queuedFollowUps.value = payload.followUp ?? [];
+				break;
 			case "done":
 				if (!streamText.value && payload.text) streamText.value = payload.text;
 				if (streamText.value.trim()) {
@@ -157,18 +257,20 @@ function subscribe(id) {
 				scrollToEnd();
 				break;
 			case "compacted":
-				// 压缩完成：只点亮提示条，**不把摘要塞进消息列表**。
-				// 摘要是后端上下文里的事，界面上只该知道"压过了"；把它当一条助手消息显示
-				// 等于凭空多出一条用户从没见过的回复（用户要的就是别看见摘要）。
-				compactedInfo.value = { summary: payload.summary, kept: payload.kept };
-				compactedDismissed.value = false;
-				scrollToEnd();
+				compacting.value = false;
+				stopCompactingTimer();
+				applyCompressedTranscript(payload.transcript);
 				break;
 			case "plan":
 				// 计划模式是会话级开关，别的标签页切了这里也要跟上
 				if (current.value) current.value = { ...current.value, planMode: payload.planMode };
 				break;
+			case "thinking_level":
+				if (current.value) current.value = { ...current.value, thinkingLevel: payload.thinkingLevel };
+				break;
 			case "error":
+				compacting.value = false;
+				stopCompactingTimer();
 				error.value = payload.message;
 				sending.value = false;
 				break;
@@ -182,32 +284,45 @@ function subscribe(id) {
 	};
 }
 
-async function openSession(id) {
+async function openSession(id, { updateRoute = true } = {}) {
  showSessions.value=false;
 	error.value = "";
+	const requestedAgentId = agentId.value;
+	const requestedPath = route.fullPath;
 	const view = await http.get(`/api/sessions/${id}`);
+	if (route.name !== "chat" || route.fullPath !== requestedPath || requestedAgentId !== agentId.value) return;
+	if ((view.agentId ?? "") !== requestedAgentId) {
+		error.value = agentId.value ? "这条会话不属于当前 Agent。" : "这条会话属于 Agent，请从对应 Agent 的对话入口打开。";
+		return;
+	}
 	current.value = view;
+	attachments.value = [];
 	selectedModel.value = view?.modelKey ?? null;
 	// 换会话时清掉上一段的状态：面板、压缩提示都不该跨会话残留
 	slashOpen.value = false;
 	slashQuery.value = "";
-	compactedInfo.value = null;
 	// 上下文用量是**这条会话**的累计值：换会话必须清零，否则数字会串到别的对话上
 	resetUsage();
 	hydrate(view);
 	subscribe(id);
-	router.replace({ path: "/chat", query: { session: id } });
+	if (updateRoute && route.name === "chat" && route.fullPath === requestedPath) {
+		void router.replace({ path: "/chat", query: { ...(agentId.value ? { agentId: agentId.value } : {}), session: id, ...(route.query.standalone === "1" ? { standalone: "1" } : {}) } });
+	}
 }
 
 /**
- * 只留没有绑定 Agent 的会话。
+ * 按当前入口筛选会话：Agent 对话只列该 Agent 的记录，普通对话只列未绑定 Agent 的记录。
  *
  * 直接 map 成普通数组：列表是页面内部的展示数据，不回传给任何接口；
  * 反过来（Agent 会话留在这里）会让同一个会话出现在两个页面上，正是要修的问题。
  */
 async function refreshList() {
 	const all = await http.get("/api/sessions");
-	sessions.value = all.filter((item) => !item.agentId);
+	sessions.value = all.filter((item) => (item.agentId ?? "") === agentId.value);
+}
+
+async function loadAgent() {
+	agent.value = agentId.value ? await agentsApi.get(agentId.value) : null;
 }
 
 async function createSession() {
@@ -216,6 +331,7 @@ async function createSession() {
 		// 空会话时选过模型就先记着，建会话时带上：POST /api/sessions 本来就认 modelId，
 		// 不传的话它会取全局当前模型——那就把用户在下拉里的选择丢了。
 		const body = { workflowId: "auto-flow" };
+		if (agentId.value) body.agentId = agentId.value;
 		if (selectedModel.value) body.modelId = selectedModel.value;
 		const view = await http.post("/api/sessions", body);
 		await refreshList();
@@ -228,17 +344,61 @@ async function createSession() {
 
 async function send() {
 	const text = draft.value.trim();
-	if (!text || !current.value || sending.value) return;
+	if ((!text && attachments.value.length === 0) || !current.value || toolbarBusy.value) return;
+	const alreadyRunning = sending.value;
+	const outgoing = buildOutgoingText(text, attachments.value);
 	draft.value = "";
+	attachments.value = [];
 	error.value = "";
-	messages.value.push({ role: "user", text, at: Date.now() });
+	const turn = { role: "user", text: outgoing, at: Date.now(), tools: [], durationMs: 0 };
+	messages.value.push(turn);
+	activity.beginTurn(turn);
 	sending.value = true;
 	scrollToEnd();
 	try {
-		await http.post(`/api/sessions/${current.value.id}/messages`, { text });
+		await http.post(`/api/sessions/${current.value.id}/messages`, { text: outgoing });
 	} catch (err) {
 		error.value = err?.message ?? "发送失败";
-		sending.value = false;
+		activity.event({ type: "error" });
+		sending.value = alreadyRunning;
+	}
+}
+
+function buildOutgoingText(text, files) {
+	if (!files.length) return text;
+	const blocks = files.map((file) => `<附件 name="${file.name}">\n${file.content}\n</附件>`);
+	return [text, ...blocks].filter(Boolean).join("\n\n");
+}
+
+async function addFiles(fileList) {
+	const files = [...(fileList ?? [])];
+	if (!files.length) return;
+	attachmentBusy.value = true;
+	try {
+		for (const file of files) {
+			if (!/\.(txt|md|json|csv|log|ya?ml)$/i.test(file.name) || file.size > 400_000) {
+				const bytes = new Uint8Array(await file.arrayBuffer());
+				let binary = "";
+				for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+					binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+				}
+				const result = await http.post("/api/kb/extract", {
+					filename: file.name,
+					contentBase64: btoa(binary),
+				});
+				attachments.value.push({ name: file.name, content: result.text });
+				if (result.totalChars > result.text.length) {
+					message.warning(`「${file.name}」共 ${result.totalChars} 字，附件最多送 ${result.text.length} 字（已截断）`);
+				}
+			} else {
+				attachments.value.push({ name: file.name, content: (await file.text()).slice(0, 60_000) });
+			}
+		}
+	} catch (cause) {
+		error.value = cause?.message ?? "附件解析失败";
+	} finally {
+		attachmentBusy.value = false;
+		if (fileInput.value) fileInput.value.value = "";
 	}
 }
 
@@ -264,24 +424,81 @@ const compactingText = computed(() =>
 	compactingElapsed.value < 8 ? "正在压缩上下文：总结旧对话…" : "对话较长，仍在压缩中，可能需要几分钟…",
 );
 function startCompactingTimer() {
+	stopCompactingTimer();
 	compactingElapsed.value = 0;
 	compactingTimer = setInterval(() => { compactingElapsed.value += 1; }, 1000);
 }
 function stopCompactingTimer() {
 	if (compactingTimer) { clearInterval(compactingTimer); compactingTimer = null; }
 }
-/** 本次压缩的结果（摘要 + 保留条数）；刷新后由会话快照里的 summary 兜底 */
-const compactedInfo = ref(null);
-/** 用户手动收起提示；换会话或再次压缩时复位（新结果要让人看见） */
-const compactedDismissed = ref(false);
 
 /** 命令表：动作在运行时注入，缺哪条就少哪条（界面不必为了对齐塞空函数） */
 const slashCommands = computed(() =>
 	createSlashCommands({
+		...((!agentId.value && can("session.write")) || (agentId.value && can("session.write") && agent.value?.status !== "stopped") ? { new: () => createSession() } : {}),
 		compact: () => compactContext(),
 		plan: () => togglePlanMode(),
+		thinking: () => cycleThinkingLevel(),
+		name: () => openRenameDialog(),
+		reload: () => reloadPiResources(),
+		copy: () => copyLatestAssistant(),
+		session: () => showPiStats(),
+		resume: () => { showSessions.value = true; },
+		settings: () => router.push({ name: "settings" }),
+		...(current.value && can("session.read") ? { export: () => exportPiSession() } : {}),
+		...(current.value && can("session.read") ? { "export-html": () => exportPiSessionHtml() } : {}),
+		tree: () => { piTreeOpen.value = true; },
+		fork: () => { piTreeOpen.value = true; },
+		...(current.value && can("session.write") ? { clone: () => cloneCurrentSession() } : {}),
+		model: () => modelPickerRef.value?.open(),
+		piSkills: piSkills.value,
+		piSkill: (name) => {
+			draft.value = `/skill:${name} `;
+			nextTick(() => document.querySelector(".chat-input textarea")?.focus());
+		},
+		skills: current.value?.skills ?? [],
+		skill: (skillId) => selectSkill(skillId),
 	}),
 );
+
+async function exportPiSession() {
+	if (!current.value || !can("session.read")) return;
+	try {
+		await downloadPiSession(current.value.id);
+	} catch (cause) {
+		message.error(cause?.message ?? "导出 Pi 会话失败");
+	}
+}
+
+async function copyLatestAssistant() {
+	try {
+		await copyText(lastAssistantText(messages.value));
+		message.success("已复制最近一条助手回复");
+	} catch (cause) {
+		message.error(cause?.message ?? "复制失败，请手动选择文本复制");
+	}
+}
+
+async function reloadPiResources() {
+	if (!current.value) return;
+	try {
+		const result = await sessionApi.reloadPiResources(current.value.id);
+		current.value = result.session;
+		hydrate(result.session);
+		message.success(`Pi 资源已刷新：${result.piSkills.length} 个原生技能`);
+	} catch (cause) {
+		message.error(cause?.message ?? "刷新 Pi 资源失败");
+	}
+}
+
+async function exportPiSessionHtml() {
+	if (!current.value || !can("session.read")) return;
+	try {
+		await downloadPiSessionHtml(current.value.id);
+	} catch (cause) {
+		message.error(cause?.message ?? "导出 Pi HTML 会话失败");
+	}
+}
 
 /** 面板要显示的项：按输入框里的过滤词筛 */
 const slashItems = computed(() => {
@@ -310,17 +527,61 @@ function onDraftInput() {
 /** 执行一条命令：先清空输入框（命令是动作，不是要发出去的消息）再跑 */
 function runSlashItem(item) {
 	if (!item) return;
+	if (item.kind === "pi-skill") {
+		slashOpen.value = false;
+		slashQuery.value = "";
+		item.run();
+		return;
+	}
 	draft.value = "";
 	slashOpen.value = false;
 	slashQuery.value = "";
 	item.run();
 }
 
+function openRenameDialog() {
+	if (!current.value) {
+		error.value = "先打开一个对话，再设置会话名称。";
+		return;
+	}
+	if (!can("session.write")) {
+		error.value = "没有重命名会话的权限。";
+		return;
+	}
+	sessionContextMenuRef.value?.openRenameFor(current.value);
+}
+
+async function showPiStats() {
+	if (!current.value) return;
+	try {
+		piStats.value = await sessionApi.piStats(current.value.id);
+		piStatsOpen.value = true;
+	} catch (cause) {
+		message.error(cause?.message ?? "读取 Pi 会话统计失败");
+	}
+}
+
+async function selectSkill(skillId) {
+	if (!current.value || !can("session.run")) return;
+	const sessionId = current.value.id;
+	try {
+		await http.post(`/api/sessions/${sessionId}/skills`, { skillId });
+		const view = await http.get(`/api/sessions/${sessionId}`);
+		if (current.value?.id !== sessionId) return;
+		current.value = view;
+		hydrate(view);
+		await refreshList();
+		message.success(skillId ? `已加载技能：${view.skills.find((skill) => skill.id === skillId)?.name ?? "技能"}` : "已退出当前技能");
+	} catch (cause) {
+		error.value = cause?.message ?? "切换技能失败";
+	}
+}
+
 /**
  * /compact：压缩这条对话的上下文。
  *
- * 成功后**以服务端返回为准刷新界面**：提示条由 SSE 的 compacted 事件点亮，
- * 这里记下 kept 供提示条显示「保留了最近 N 条」；摘要只收不显，界面上不再展示正文。
+ * 成功后以服务端返回为准刷新界面：压缩摘要作为时间线记录显示，
+ * 被摘要覆盖的旧消息从当前 transcript 移除。
  */
 async function compactContext() {
 	if (!current.value) {
@@ -336,10 +597,14 @@ async function compactContext() {
 	compacting.value = true;
 	startCompactingTimer();
 	error.value = "";
+	const sessionId = current.value.id;
 	try {
-		const result = await sessionApi.compact(current.value.id);
-		compactedInfo.value = { summary: result?.summary ?? "", kept: Number(result?.kept ?? 0) };
-		compactedDismissed.value = false;
+		await sessionApi.compact(sessionId);
+		const view = await http.get(`/api/sessions/${sessionId}`);
+		if (current.value?.id === sessionId) {
+			current.value = view;
+			applyCompressedTranscript(view.transcript);
+		}
 	} catch (err) {
 		// 太短 / 模拟模型都会在这里拿到后端的原话，如实显示
 		error.value = err?.message ?? "压缩失败";
@@ -367,21 +632,24 @@ async function togglePlanMode() {
 	}
 }
 
+async function cycleThinkingLevel() {
+	if (!current.value) {
+		error.value = "先打开一个对话，再调整推理强度。";
+		return;
+	}
+	const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+	const index = levels.indexOf(current.value.thinkingLevel ?? "medium");
+	const thinkingLevel = levels[(index + 1) % levels.length];
+	try {
+		current.value = await sessionApi.setThinking(current.value.id, thinkingLevel);
+		message.success(`Pi 推理强度：${thinkingLevel}`);
+	} catch (err) {
+		error.value = err?.message ?? "调整推理强度失败";
+	}
+}
+
 /** 当前是否处于计划模式（页头标记与关闭按钮都用它） */
 const planModeOn = computed(() => Boolean(current.value?.planMode));
-
-/**
- * 界面上要显示的压缩提示：本次压缩的结果优先，其次用会话快照里那份。
- *
- * 摘要仍然照收（后端契约不变），但**只用来判定"压过没有"**——提示条只剩标题行，
- * 所以这里只需 kept 有值与否；summary 不再进模板。
- */
-const compactedNotice = computed(() => {
-	if (compactedInfo.value) return compactedInfo.value;
-	const summary = current.value?.summary;
-	if (!summary) return null;
-	return { summary, kept: null };
-});
 
 /**
  * 面板展开时接管上下键 / 回车 / Esc。
@@ -413,7 +681,7 @@ function handleSlashKeydown(event) {
 	return false;
 }
 
-const canChat = computed(() => Boolean(current.value) && !sending.value && !toolbarBusy.value);
+const canChat = computed(() => Boolean(current.value) && !toolbarBusy.value);
 const modeBadge = computed(() => current.value?.modeLabel ?? null);
 
 /**
@@ -557,12 +825,14 @@ const usageTitle = computed(() => {
 	const total = contextWindow.value;
 	const source = contextEstimated.value ? "估算" : "模型返回";
 	return total > 0
-		? "上下文用量（" + source + "）：" + used + " / " + total + " tokens"
-		: "上下文用量（" + source + "）：" + used + " tokens（未配置上下文窗口）";
+		? "上下文用量（" + source + "）：" + usageText.value + "；精确数值 " + used + " / " + total + " tokens"
+		: "上下文用量（" + source + "）：" + usageText.value + "；精确数值 " + used + " tokens（未配置上下文窗口）";
 });
+const usagePercent = computed(() => contextWindow.value > 0 ? Math.round((usedTokens.value / contextWindow.value) * 100) : null);
 
 /** 用掉超过 80% 就该换警示色：这个量再聊几轮就要压缩了 */
 const usageWarn = computed(() => contextWindow.value > 0 && usedTokens.value / contextWindow.value > 0.8);
+const ctxRingDash = computed(() => contextRingDash(usedTokens.value, contextWindow.value));
 
 /**
  * 选一个模型。
@@ -598,8 +868,8 @@ async function onModelChange(value) {
 		// 注意：result.models 是**模型行**清单（行 id 命名空间），而 modelOptions 是 options
 		// （modelId 命名空间）——直接覆盖会让 currentModelTitle 的翻译表错乱，按钮显示原始行 id。
 		// 行清单只更新翻译表 modelRows。
-		if (Array.isArray(result?.models) && result.models.length > 0) {
-			modelRows.value = result.models;
+		if (Array.isArray(result?.modelRows) && result.modelRows.length > 0) {
+			modelRows.value = result.modelRows;
 		}
 		message.success(`已切换这条对话的模型：${current.value.modeLabel || "模拟模型"}`);
 	} catch (err) {
@@ -611,13 +881,15 @@ async function onModelChange(value) {
 }
 
 onMounted(async () => {
+	const initialPath = route.fullPath;
 	try {
-		await Promise.all([refreshList(), loadModels()]);
+		await Promise.all([refreshList(), loadModels(), loadAgent(), pluginsApi.list().then((plugins) => { piSkills.value = piSkillsFromPlugins(plugins); })]);
+		if (route.name !== "chat" || route.fullPath !== initialPath) return;
 		const wanted = typeof route.query.session === "string" ? route.query.session : null;
 		if (wanted) {
 			await openSession(wanted);
 		} else if (sessions.value.length > 0) {
-			await openSession(sessions.value[0].id);
+			await openSession(sessions.value[0].id, { updateRoute: false });
 		}
 	} catch (err) {
 		error.value = err?.message ?? "加载失败";
@@ -639,8 +911,12 @@ watch(() => route.query.session, async (id) => {
 </script>
 
 <template>
-	<PageShell title="对话" subtitle="直接提问，或加载技能完成业务任务" wide>
-<template #actions><n-button class="chat-list-toggle" @click="showSessions=!showSessions">会话列表</n-button><n-button :disabled="!can('session.write')" @click="createSession">新对话</n-button></template>
+	<PageShell :title="agent?.name ?? (agentId ? 'Agent 对话' : '对话')" :subtitle="agent ? agent.description : '直接提问，或加载技能完成业务任务'" wide>
+		<template #actions>
+			<n-button class="chat-list-toggle" @click="showSessions=!showSessions">会话列表</n-button>
+			<n-button v-if="current" @click="piTreeOpen=true">Pi 会话树</n-button>
+			<n-button v-if="!agentId" :disabled="!can('session.write')" @click="createSession">新对话</n-button>
+		</template>
 		<n-alert v-if="error" type="error" :bordered="false" class="chat-alert">
 			{{ error }}
 		</n-alert>
@@ -649,7 +925,7 @@ watch(() => route.query.session, async (id) => {
 			<div class="chat-layout" :class="{'show-sessions':showSessions}">
 				<aside class="chat-list">
 					<div class="chat-list-head">
-						<div class="chat-list-title">通用会话</div>
+						<div v-if="!agent" class="chat-list-title">通用会话</div>
 						<n-button type="primary" size="small" block @click="createSession">新对话</n-button>
 					</div>
 					<n-input v-model:value="sessionQuery" placeholder="搜索会话" clearable style="margin:10px 0"/>
@@ -660,22 +936,30 @@ watch(() => route.query.session, async (id) => {
 							class="chat-session"
 							:class="{ active: item.id === current?.id }"
 							@click="openSession(item.id)"
- role="button" tabindex="0" @keydown.enter="openSession(item.id)" @keydown.space.prevent="openSession(item.id)"
+							role="button" tabindex="0"
+							@keydown.enter="openSession(item.id)"
+							@keydown.space.prevent="openSession(item.id)"
+							@keydown="onSessionContextKeydown(item, $event)"
+							@contextmenu.prevent.stop="openSessionContextMenu(item, $event)"
 						>
 							<div class="chat-session-title">{{ titleOf(item) }}</div>
+							<span v-if="pinnedIds.includes(item.id)" class="chat-session-pin">置顶</span>
 							<div class="chat-session-meta">
 								<n-tag v-if="item.archived" size="tiny" :bordered="false">已归档</n-tag>
 							</div>
 						</li>
 					</ul>
-					<n-empty v-if="sessions.length === 0" description="还没有通用会话" size="small" />
+					<n-empty v-if="sessions.length === 0" :description="agent ? '还没有这个 Agent 的会话' : '还没有通用会话'" size="small" />
 				</aside>
 
 				<section class="chat-main">
-<div style="padding:12px 16px 0"><SessionToolbar :session="current" :busy="sending" @busy="value=>toolbarBusy=value" @updated="view=>{current=view;hydrate(view);refreshList()}" @removed="removed" /></div>
+					<PiSessionTree v-model:show="piTreeOpen" :session-id="current?.id" :can-fork="Boolean(current && !sending && !current.pendingApprovals?.length)" :can-navigate="Boolean(current && !sending && !current.pendingApprovals?.length)" @navigate="onPiTreeNavigate" @fork="onPiTreeFork" />
+					<PiSessionStats v-model:show="piStatsOpen" :stats="piStats" />
+					<SessionContextMenu ref="sessionContextMenuRef" :session="contextSession" :x="contextX" :y="contextY" :busy="toolbarBusy || (sending && contextSession?.id === current?.id)" :pinned="contextSession ? pinnedIds.includes(contextSession.id) : false" @close="contextSession=null" @pin="toggleSessionPin(contextSession)" @busy="toolbarBusy=$event" @updated="onContextSessionUpdated" @removed="onContextSessionRemoved" @created="onContextSessionCreated" />
 					<header v-if="current" class="chat-head">
 						<div class="chat-head-title">{{ titleOf(current) }}</div>
 						<div class="chat-head-tags">
+							<n-tag v-if="agent" size="small" :bordered="false">{{ agent.name }}</n-tag>
 							<!-- 计划模式是会话级开关：标记要显眼、并且提供就地关闭的入口 -->
 							<Transition name="badge">
 								<span v-if="planModeOn" class="plan-badge" data-testid="plan-mode-badge">计划模式</span>
@@ -686,40 +970,18 @@ watch(() => route.query.session, async (id) => {
 					</header>
 
 					<div ref="scrollBox" class="chat-scroll">
-<SessionActivity :session-id="current?.id" :tools="activity.tools.value" :pending="activity.pending.value" :steps="current?.steps??[]" :elapsed-ms="activity.elapsedMs.value" :running="sending" @resolved="activity.resolved"/>
-						<!--
-							压缩进行中：旋转图标 + 阶段文案 + 流动光带。
-							压缩要真调一次模型（可能要几十秒），干等着像卡死——这条状态条就是给这段等待一个可视进度。
-						-->
-						<Transition name="notice">
-							<div v-if="compacting" class="chat-compacting" data-testid="compacting-indicator">
-								<span class="chat-compacting-spin" aria-hidden="true"></span>
-								<span class="chat-compacting-text">{{ compactingText }}</span>
-								<div class="chat-compacting-bar" aria-hidden="true"><span class="chat-compacting-bar-fill"></span></div>
-							</div>
-						</Transition>
-						<!--
-							压缩提示：/compact 成功后出现，只有标题行 + 收起。
-							**不显示摘要正文**——摘要是后端上下文里的事，摆到界面上只是噪声；
-							滑入动画尊重 prefers-reduced-motion，点「收起」只是折起这条提示，不影响历史。
-						-->
-						<Transition name="notice">
-							<div
-								v-if="compactedNotice && !compactedDismissed"
-								class="chat-compacted"
-								data-testid="compacted-notice"
-							>
-								<div class="chat-compacted-head">
-									<span>已压缩上下文{{ compactedNotice.kept !== null ? `（保留了最近 ${compactedNotice.kept} 条）` : "" }}</span>
-									<button type="button" class="chat-compacted-close" @click="compactedDismissed = true">收起</button>
-								</div>
-							</div>
-						</Transition>
 						<n-empty v-if="!current" description="选一个对话，或点「新对话」" />
-						<div v-for="(msg, index) in messages" :key="index" class="chat-msg" :class="msg.role">
-							<div class="chat-role">{{ msg.role === "user" ? "我" : "助手" }}</div>
-							<div class="chat-bubble"><MessageBody :text="msg.text" :markdown="msg.role==='assistant'"/></div>
-						</div>
+						<template v-for="(msg, index) in messages" :key="`${msg.role}-${msg.at}-${index}`">
+							<article v-if="msg.role === 'compaction'" class="chat-compaction-record" data-testid="compaction-record">
+								<header><span class="chat-compaction-badge">{{ msg.automatic ? "上下文已自动压缩" : "上下文已压缩" }}</span><span>前序对话摘要</span></header>
+								<div class="chat-compaction-summary"><MessageBody :text="msg.text" :markdown="true"/></div>
+							</article>
+							<div v-else class="chat-msg" :class="[msg.role, { 'with-activity': msg.role==='user' && (msg.startedAt || msg.durationMs > 0 || msg.tools?.length || activity.pending.value.length && activity.activeTurn.value===msg) }]">
+								<div v-if="msg.role === 'user'" class="chat-role">我</div>
+								<div class="chat-bubble"><MessageBody :text="msg.text" :markdown="msg.role==='assistant'"/></div>
+								<SessionActivity v-if="msg.role==='user' && (msg.startedAt || msg.durationMs > 0 || msg.tools?.length || activity.pending.value.length && activity.activeTurn.value===msg)" :session-id="current?.id" :turn="msg" :pending="activity.activeTurn.value===msg ? activity.pending.value : []" :elapsed-ms="activity.activeTurn.value===msg ? activity.elapsedMs.value : msg.durationMs" :running="sending && activity.activeTurn.value===msg" @resolved="activity.resolved"/>
+							</div>
+						</template>
 
 						<div v-if="streamThinking" class="chat-thinking">
 							<button class="chat-thinking-head" @click="showThinking = !showThinking">
@@ -729,9 +991,16 @@ watch(() => route.query.session, async (id) => {
 						</div>
 
 						<div v-if="streamText" class="chat-msg assistant">
-							<div class="chat-role">助手</div>
 							<div class="chat-bubble"><MessageBody :text="streamText"/></div>
 						</div>
+
+						<Transition name="notice">
+							<div v-if="compacting" class="chat-compacting" data-testid="compacting-indicator">
+								<span class="chat-compacting-spin" aria-hidden="true"></span>
+								<span class="chat-compacting-text">{{ compactingText }}</span>
+								<div class="chat-compacting-bar" aria-hidden="true"><span class="chat-compacting-bar-fill"></span></div>
+							</div>
+						</Transition>
 					</div>
 
 					<footer class="chat-input">
@@ -754,38 +1023,58 @@ watch(() => route.query.session, async (id) => {
 								@input="onDraftInput"
 							/>
 						</div>
+						<input ref="fileInput" type="file" multiple accept=".txt,.md,.json,.csv,.log,.yaml,.yml,.pdf,.doc,.docx" class="chat-file-input" @change="addFiles($event.target.files)" />
+						<div v-if="attachments.length" class="chat-attachments" aria-label="待发送附件">
+							<div v-for="(file, index) in attachments" :key="`${file.name}-${index}`" class="chat-attachment">
+								<span>{{ file.name }}</span>
+								<n-button size="tiny" quaternary :aria-label="`移除附件 ${file.name}`" @click="attachments.splice(index, 1)">移除</n-button>
+							</div>
+						</div>
 						<!--
 							右下角：模型选择器 + 发送。
 							模型写在发送按钮左边（同一个右下角区域），选完立刻生效于**这一条对话**。
 						-->
 						<div class="chat-compose-actions">
+							<n-button quaternary :loading="attachmentBusy" :disabled="attachmentBusy || toolbarBusy || !current" @click="fileInput?.click()">附加文件</n-button>
+							<span v-if="queuedFollowUps.length" class="queue-status">已排队 {{ queuedFollowUps.length }} 条</span>
 							<!--
-								上下文用量圆环：放输入框左下角。SVG 描边显示占比，中心「已用k/总量k」；
-								没配窗口只显示已用（不编总量）；超 80% 换警示色；hover 给精确 token 数。
+								上下文用量圆环：放输入框左下角。中心留空，悬停时显示已用比例和精确 token 数。
 							-->
-							<div
-								class="ctx-ring"
-								:class="{ warn: usageWarn }"
-								data-testid="context-usage"
-								:title="usageTitle"
-							>
-								<svg viewBox="0 0 36 36" class="ctx-ring-svg" aria-hidden="true">
-									<circle class="ctx-ring-track" cx="18" cy="18" r="15.5" />
-									<circle
-										v-if="contextWindow > 0"
-										class="ctx-ring-fill"
-										cx="18" cy="18" r="15.5"
-										:stroke-dasharray="ctxRingDash"
-									/>
-								</svg>
-								<span class="ctx-ring-text" data-testid="context-usage-text">{{ usageText }}</span>
-							</div>
-							<div class="chat-model-picker">
+							<div class="chat-compose-main-actions">
+								<div
+									class="ctx-ring"
+									:class="{ warn: usageWarn }"
+									data-testid="context-usage"
+									:aria-label="usageTitle"
+									:aria-describedby="`context-usage-tooltip-${current?.id ?? 'empty'}`"
+									role="img"
+									tabindex="0"
+								>
+									<div :id="`context-usage-tooltip-${current?.id ?? 'empty'}`" class="ctx-ring-tooltip" role="tooltip">
+										<strong>背景信息窗口：</strong>
+										<span v-if="usagePercent !== null">{{ usagePercent }}% 已用</span>
+										<span v-else>总量未配置</span>
+										<b v-if="contextWindow > 0">已用 {{ formatTokens(usedTokens) }} 标记，共 {{ formatTokens(contextWindow) }}</b>
+										<b v-else>已用 {{ formatTokens(usedTokens) }} 标记</b>
+									</div>
+									<svg viewBox="0 0 36 36" class="ctx-ring-svg" aria-hidden="true">
+										<circle class="ctx-ring-track" cx="18" cy="18" r="15.5" />
+										<circle
+											v-if="contextWindow > 0"
+											class="ctx-ring-fill"
+											cx="18" cy="18" r="15.5"
+											:stroke-dasharray="ctxRingDash"
+										/>
+									</svg>
+									<span class="ctx-ring-text" data-testid="context-usage-text">{{ usageText }}</span>
+								</div>
+								<div class="chat-model-picker">
 								<!--
 									Codex 风格：内联按钮 + 向上弹出的轻量菜单（组件内管弹出/键盘/勾选），
 									这里只接 choose——继续走 onModelChange 的会话级语义，不碰全局当前模型。
 								-->
 								<ModelPicker
+									ref="modelPickerRef"
 									:options="modelOptions"
 									:value="modelValueAsOptionId"
 									:current-label="currentModelTitle"
@@ -793,10 +1082,11 @@ watch(() => route.query.session, async (id) => {
 									:disabled="modelOptions.length === 0"
 									@choose="onModelChange"
 								/>
+								</div>
+								<n-button class="chat-send-button" type="primary" aria-label="发送" title="发送" :loading="attachmentBusy" :disabled="!canChat || (!draft.trim() && !attachments.length) || attachmentBusy || !can('session.run')" @click="send">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+								</n-button>
 							</div>
-							<n-button type="primary" :loading="sending" :disabled="!canChat || !draft.trim() || !can('session.run')" @click="send">
-								发送
-							</n-button>
 						</div>
 					</footer>
 				</section>
@@ -862,6 +1152,33 @@ watch(() => route.query.session, async (id) => {
 /* 压缩提示滑入/滑出：不是装饰——出现时消息列表刚被换过，动画帮用户看清"列表变了" */
 .notice-enter-active, .notice-leave-active { transition: opacity .25s ease, transform .25s ease; }
 .notice-enter-from, .notice-leave-to { opacity: 0; transform: translateY(-8px); }
+.chat-compaction-record {
+	margin: 0 0 14px;
+	padding: 12px 14px;
+	border: 1px solid #cbdde3;
+	border-radius: 8px;
+	background: #f5fafb;
+	color: #344b50;
+}
+.chat-compaction-record > header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+.chat-compaction-badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 3px 8px;
+	border-radius: 5px;
+	background: #e2f0f2;
+	color: #245d65;
+	font-size: 12px;
+	font-weight: 600;
+}
+.chat-compaction-record > header > span:last-child { color: #65777b; font-size: 12px; }
+.chat-compaction-summary { margin-top: 9px; padding-top: 9px; border-top: 1px solid #dce8ea; }
 /* 计划模式标记滑入滑出 */
 .badge-enter-active, .badge-leave-active { transition: opacity .2s ease, transform .2s ease; }
 .badge-enter-from, .badge-leave-to { opacity: 0; transform: translateX(-10px); }
@@ -939,6 +1256,7 @@ watch(() => route.query.session, async (id) => {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+.chat-session-pin { margin-left: 6px; color: var(--text-2); font-size: 11px; white-space: nowrap; }
 .chat-session-meta {
 	margin-top: 4px;
 	display: flex;
@@ -1001,6 +1319,10 @@ watch(() => route.query.session, async (id) => {
 	align-self: flex-end;
 	align-items: flex-end;
 }
+.chat-msg.user.with-activity { width: 100%; max-width: 100%; align-self: stretch; align-items: stretch; }
+.chat-msg.user.with-activity > .chat-role,
+.chat-msg.user.with-activity > .chat-bubble { align-self: flex-end; }
+.chat-msg.user.with-activity :deep(.turn-timing) { align-self: stretch; width: 100%; }
 .chat-role {
 	font-size: 11px;
 	opacity: 0.6;
@@ -1041,13 +1363,17 @@ watch(() => route.query.session, async (id) => {
 	flex-direction: column;
 	gap: 8px;
 }
-/* 输入框下方一行：模型选择器靠左、发送靠右，整体贴在右下角 */
+/* 附件靠左；用量、模型和发送作为一组贴在右侧。 */
 .chat-compose-actions {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
+	justify-content: flex-start;
 	gap: 10px;
 }
+.chat-compose-main-actions { display: flex; align-items: center; gap: 16px; min-width: 0; margin-left: auto; }
+.chat-compose-main-actions :deep(.chat-send-button) { width: 34px; height: 34px; padding: 0; border-radius: 50%; }
+.queue-status { color: var(--text-muted); font-size: 12px; }
+.chat-compose-main-actions :deep(.chat-send-button svg) { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .chat-model-picker {
 	display: flex;
 	align-items: center;
@@ -1060,12 +1386,55 @@ watch(() => route.query.session, async (id) => {
 /* 上下文用量圆环：贴模型选择器，SVG 描边显示占比，中心文字用 k */
 .ctx-ring {
 	position: relative;
-	width: 32px;
-	height: 32px;
+	width: 18px;
+	height: 18px;
 	flex: none;
 	cursor: default;
 }
+.ctx-ring-tooltip {
+	position: absolute;
+	left: 50%;
+	bottom: calc(100% + 8px);
+	z-index: 40;
+	display: grid;
+	gap: 4px;
+	width: max-content;
+	max-width: min(272px, calc(100vw - 32px));
+	padding: 8px 10px;
+	border-radius: 8px;
+	background: #191b1e;
+	color: #f5f5f5;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, .22);
+	font-size: 12px;
+	line-height: 1.35;
+	text-align: center;
+	white-space: normal;
+	opacity: 0;
+	visibility: hidden;
+	transform: translate(-50%, 4px);
+	transition: opacity .14s ease, transform .14s ease, visibility .14s ease;
+	pointer-events: none;
+}
+.ctx-ring-tooltip::after {
+	position: absolute;
+	top: 100%;
+	left: 50%;
+	border: 5px solid transparent;
+	border-top-color: #191b1e;
+	content: "";
+	transform: translateX(-50%);
+}
+.ctx-ring-tooltip b { font-weight: 600; }
+.ctx-ring:hover .ctx-ring-tooltip,
+.ctx-ring:focus-visible .ctx-ring-tooltip {
+	opacity: 1;
+	visibility: visible;
+	transform: translate(-50%, 0);
+}
 .ctx-ring-svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.chat-file-input { display: none; }
+.chat-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.chat-attachment { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 7px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
 .ctx-ring-track { fill: none; stroke: rgba(108,124,255,.15); stroke-width: 5; }
 .ctx-ring-fill {
 	fill: none;
@@ -1075,18 +1444,15 @@ watch(() => route.query.session, async (id) => {
 	transition: stroke-dasharray .6s ease, stroke .3s ease;
 }
 .ctx-ring.warn .ctx-ring-fill { stroke: #e08a3c; }
-.ctx-ring.warn .ctx-ring-text { color: #b45309; }
 .ctx-ring-text {
 	position: absolute;
-	inset: 0;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	font-size: 8px;
-	font-weight: 700;
-	color: #4b5268;
-	line-height: 1;
-	text-align: center;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+	visibility: hidden;
+	pointer-events: none;
 }
 @media (prefers-reduced-motion: reduce) { .ctx-ring-fill { transition: none; } }
 /* 说明文字：模拟模型时会顶掉长模型名，所以允许省略号 */

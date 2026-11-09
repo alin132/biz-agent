@@ -35,8 +35,8 @@ const modelId = ref("");
 const name = ref("");
 const kind = ref("chat");
 const enabled = ref(true);
-/** 最大上下文用字符串存：number 类型在 naive 的 input-number 里没法表达「留空」 */
-const contextWindow = ref(null);
+/** 以 k 为单位输入；number 类型在 naive 的 input-number 里没法表达「留空」 */
+const contextWindowK = ref(null);
 
 const isEdit = computed(() => props.model !== null && props.model !== undefined);
 const title = computed(() => (isEdit.value ? "编辑模型" : "新建模型"));
@@ -69,7 +69,7 @@ watch(
 			name.value = row.name ?? "";
 			kind.value = row.kind ?? "chat";
 			enabled.value = row.enabled !== false;
-			contextWindow.value = typeof row.contextWindow === "number" ? row.contextWindow : null;
+			contextWindowK.value = typeof row.contextWindow === "number" ? row.contextWindow / 1024 : null;
 		} else {
 			// 新建的默认供应商：第一条可用的（通常是 default），省掉一次必选点击
 			const first = props.providers.find((item) => item.enabled !== false);
@@ -78,7 +78,7 @@ watch(
 			name.value = "";
 			kind.value = "chat";
 			enabled.value = true;
-			contextWindow.value = null;
+			contextWindowK.value = null;
 		}
 	},
 	{ immediate: true },
@@ -105,7 +105,7 @@ async function save() {
 			name: name.value.trim(),
 			kind: kind.value,
 			enabled: enabled.value,
-			contextWindow: contextWindow.value,
+			contextWindow: contextWindowK.value === null ? null : Math.round(contextWindowK.value * 1024),
 		};
 		const saved = isEdit.value
 			? await modelsApi.patch(props.model.id, payload)
@@ -115,12 +115,12 @@ async function save() {
 		const storedContext = saved?.contextWindow;
 		const adjusted =
 			typeof storedContext === "number" &&
-			contextWindow.value !== null &&
-			storedContext !== contextWindow.value;
+			contextWindowK.value !== null &&
+			storedContext !== Math.round(contextWindowK.value * 1024);
 		const label = `${isEdit.value ? "已保存" : "已新建"}「${saved?.name || saved?.modelId}」`;
 		message.success(
 			adjusted
-				? `${label}；最大上下文按后端规则取整为 ${storedContext}`
+				? `${label}；最大上下文已按 token 取整为 ${storedContext}`
 				: label,
 		);
 		emit("saved", saved);
@@ -177,12 +177,14 @@ async function save() {
 			</label>
 
 			<label class="field">
-				<span class="field-label">最大上下文（token）</span>
+				<span class="field-label">最大上下文（k）</span>
 				<n-input-number
-					v-model:value="contextWindow"
+					v-model:value="contextWindowK"
 					data-testid="model-form-context"
-					placeholder="例如 131072；留空表示未配置"
-					:min="1"
+					placeholder="例如 128；留空表示未配置"
+					:min="0.001"
+					:step="0.1"
+					:precision="3"
 					:show-button="false"
 					style="width: 100%"
 				/>

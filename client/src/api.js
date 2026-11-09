@@ -121,12 +121,37 @@ async function request(method, path, body, options = {}) {
 	return data;
 }
 
+async function download(path) {
+	let response;
+	try {
+		response = await fetch(path, { headers: authHeaders() });
+	} catch {
+		throw new ApiError("无法连接服务，请确认后端已启动。", 0);
+	}
+	if (response.status === 401) {
+		setAuthToken("");
+		onUnauthorized();
+	}
+	if (!response.ok) {
+		let message = `请求失败（HTTP ${response.status}）`;
+		try {
+			const data = await response.json();
+			if (typeof data?.error === "string") message = data.error;
+		} catch { /* 非 JSON 错误体使用 HTTP 状态文案 */ }
+		throw new ApiError(message, response.status);
+	}
+	const disposition = response.headers.get("content-disposition") ?? "";
+	const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] ?? "download";
+	return { blob: await response.blob(), filename };
+}
+
 export const http = {
 	get: (path) => request("GET", path),
 	post: (path, body) => request("POST", path, body),
 	patch: (path, body) => request("PATCH", path, body),
 	put: (path, body) => request("PUT", path, body),
 	delete: (path, body) => request("DELETE", path, body),
+	download,
 };
 /** 列表接口有裸数组和 { items } 两种形状，统一在这里抹平，页面不用各写一遍 */
 function items(data) {
@@ -217,10 +242,25 @@ export const imApi = {
  * 是两件事——全局那个只决定「之后新建的会话用哪条模型」，改它不会动已有会话。
  */
 export const sessionApi = {
+	exportPiJsonl: (id) => http.download(`/api/sessions/${encodeURIComponent(id)}/export`),
+	exportPiHtml: (id) => http.download(`/api/sessions/${encodeURIComponent(id)}/export-html`),
+	piStats: (id) => http.get(`/api/sessions/${id}/pi-stats`),
+	reloadPiResources: (id) => http.post(`/api/sessions/${id}/pi-reload`, {}),
+	piTree: (id) => http.get(`/api/sessions/${id}/pi-tree`),
+	clone: (id) => http.post(`/api/sessions/${id}/clone`, {}),
+	fork: (id, entryId) => http.post(`/api/sessions/${id}/fork`, { entryId }),
+	setPiTreeLabel: (id, entryId, label) => http.post(`/api/sessions/${id}/pi-tree/label`, { entryId, label }),
+	navigatePiTree: (id, entryId) => http.post(`/api/sessions/${id}/pi-tree/navigate`, { entryId }),
 	setModel: (id, modelId) => http.post(`/api/sessions/${id}/model`, { modelId }),
 	setPlan: (id, enabled) => http.post(`/api/sessions/${id}/plan`, { enabled }),
+	setThinking: (id, thinkingLevel) => http.post(`/api/sessions/${id}/thinking`, { thinkingLevel }),
 	compact: (id) => http.post(`/api/sessions/${id}/compact`),
 	stop: (id) => http.post(`/api/sessions/${id}/stop`, {}),
+};
+
+export const piSettingsApi = {
+	get: () => http.get("/api/pi/settings"),
+	update: (settings) => http.put("/api/pi/settings", settings),
 };
 
 export const approvalsApi = {
@@ -248,6 +288,8 @@ export const membersApi = {
 export const pluginsApi = {
 	list: async () => items(await http.get("/api/plugins")),
 	import: (manifest) => http.post("/api/plugins/import", { manifest }),
+	importPiSkill: (markdown) => http.post("/api/plugins/import-pi-skill", { markdown }),
+	importGitHubSkill: (url) => http.post("/api/plugins/import-github-skill", { url }),
 	patch: (id, enabled) => http.patch(`/api/plugins/${id}`, { enabled }),
 	remove: (id) => http.delete(`/api/plugins/${id}`),
 };
@@ -283,5 +325,14 @@ export const agentsApi = {
 	 * 后端不必为一种"前端分组方式"再加一条路由。
 	 */
 	sessions: async (id) => items(await http.get(`/api/sessions?agentId=${encodeURIComponent(id)}`)),
+};
+
+export const agentGroupsApi = {
+	list: async () => items(await http.get("/api/agent-groups")),
+	get: (id) => http.get(`/api/agent-groups/${encodeURIComponent(id)}`),
+	create: (input) => http.post("/api/agent-groups", input),
+	send: (id, message) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/turns`, { message }),
+	cancel: (id) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/cancel`, {}),
+	remove: (id) => http.delete(`/api/agent-groups/${encodeURIComponent(id)}`),
 };
 

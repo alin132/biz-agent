@@ -198,11 +198,12 @@ export function createKbService(options: CreateKbServiceOptions): KbService {
 			})
 			.slice(0, limit);
 		const allVector = responses.every((response) => response.mode === "vector");
+		const allKeyword = responses.every((response) => response.mode === "keyword");
 		const fallbackReasons = responses
 			.map((response) => response.fallbackReason)
 			.filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
 		return {
-			mode: allVector ? "vector" : "keyword",
+			mode: allVector ? "vector" : allKeyword ? "keyword" : "hybrid",
 			results,
 			kbIds: unique,
 			...(fallbackReasons.length > 0 ? { fallbackReason: fallbackReasons.join("；") } : {}),

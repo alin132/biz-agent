@@ -12,7 +12,8 @@
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { builtinModels, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { processPiModelRuntime } from "../piModelRuntime.js";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import type { ModelProviderKind, ModelProviderRecord, ModelRecord, Storage } from "../db/types.js";
 import type { LlmRuntime, ModelOption } from "../llm.js";
 import { currentModelId, envProviderInfo, listModelOptions, llmDisabled, resolveLlm } from "../llm.js";
@@ -213,7 +214,8 @@ export class ModelService {
 	 */
 	modelKeyOf(modelId?: string): string | null {
 		if (typeof modelId === "string" && modelId.trim().length > 0) {
-			return this.store.findModelByKey(modelId.trim())?.id ?? null;
+			const row = this.store.findModelByKey(modelId.trim());
+			return row && row.kind === "chat" && row.enabled && this.providerEnabled(row.providerId) ? row.id : null;
 		}
 		return this.currentRow()?.id ?? null;
 	}
@@ -452,6 +454,45 @@ export class ModelService {
 		return this.store.modelRows().length;
 	}
 
+	createProvider(body: Record<string, unknown>) {
+		return this.store.createProvider(body);
+	}
+
+	async updateProvider(id: string, body: Record<string, unknown>) {
+		const updated = this.store.updateProvider(id, body);
+		await this.syncPiProvider(id);
+		return updated;
+	}
+
+	async removeProvider(id: string) {
+		const removed = this.store.removeProvider(id);
+		await processPiModelRuntime.unregisterProvider(this.piProviderId(id));
+		return removed;
+	}
+
+	async createModel(body: Record<string, unknown>) {
+		const created = this.store.createModel(body);
+		await this.syncPiProvider(created.providerId);
+		return created;
+	}
+
+	async updateModel(id: string, body: Record<string, unknown>) {
+		const current = this.store.modelRow(id);
+		const updated = this.store.updateModel(id, body);
+		await this.syncPiProvider(updated.providerId);
+		if (current && current.providerId !== updated.providerId) {
+			await this.syncPiProvider(current.providerId);
+		}
+		return updated;
+	}
+
+	async removeModel(id: string): Promise<boolean> {
+		const current = this.store.modelRow(id);
+		const removed = this.store.removeModel(id);
+		if (removed && current) await this.syncPiProvider(current.providerId);
+		return removed;
+	}
+
 	ping(modelKey: string, fetchImpl: FetchLike = defaultFetch): Promise<PingResult> {
 		const row = this.store.findModelByKey(modelKey) ?? this.store.modelRow(modelKey);
 		if (!row) {
@@ -487,26 +528,81 @@ export class ModelService {
 		if (!baseUrl) {
 			return null;
 		}
-		const model: Model<any> = { ...template, id: row.modelId, name: row.name, provider: piProvider, baseUrl };
+		const runtimeProviderId = `biz_${provider.id.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+		const model: Model<any> = {
+			...template,
+			id: row.modelId,
+			name: row.name,
+			provider: runtimeProviderId,
+			baseUrl,
+			contextWindow: row.contextWindow ?? template.contextWindow,
+		};
 		const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
 		const maxRetries = Number(process.env.LLM_MAX_RETRIES ?? 3);
-		const models = builtinModels();
-		const baseStream = models.streamSimple.bind(models);
-		const streamFn: StreamFn = (requestModel, context, options) =>
-			baseStream(requestModel, context, {
+		const modelRuntime = processPiModelRuntime.runtime();
+		const registeredModel = processPiModelRuntime.register({ model, providerId: runtimeProviderId, providerName: provider.name, apiKey: apiKey ?? undefined });
+		const streamFn: StreamFn = async (requestModel, context, options) => {
+			const piRuntime = await modelRuntime;
+			await registeredModel;
+			return piRuntime.streamSimple(requestModel, context, {
 				...options,
-				apiKey: apiKey ?? undefined,
 				timeoutMs,
 				maxRetries,
 				maxRetryDelayMs: 15_000,
 			});
+		};
 		return {
 			model,
 			streamFn,
 			label: `${provider.name} · ${row.name}`,
 			provider: piProvider,
 			modelId: row.modelId,
+			modelRuntime,
+			prepareModel: registeredModel,
 		};
+	}
+
+	private piProviderId(providerId: string): string {
+		return `biz_${providerId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+	}
+
+	private async syncPiProvider(providerId: string): Promise<void> {
+		const provider = this.store.providerRow(providerId);
+		const piProviderId = this.piProviderId(providerId);
+		if (!provider?.enabled) {
+			await processPiModelRuntime.unregisterProvider(piProviderId);
+			return;
+		}
+
+		let apiKey: string | null;
+		try {
+			apiKey = this.store.secretOf(provider);
+		} catch {
+			await processPiModelRuntime.unregisterProvider(piProviderId);
+			return;
+		}
+		const piProvider = providerKindToPi(provider.kind);
+		const models = this.store.modelRows()
+			.filter((row) => row.providerId === providerId && row.kind === "chat" && row.enabled)
+			.flatMap((row) => {
+				const template = pickTemplate(piProvider, row.modelId);
+				const baseUrl = template && resolveBaseUrl(provider, template.baseUrl);
+				if (!template || !baseUrl) return [];
+				return [{
+					...template,
+					id: row.modelId,
+					name: row.name,
+					provider: piProviderId,
+					baseUrl,
+					contextWindow: row.contextWindow ?? template.contextWindow,
+				} as Model<any>];
+			});
+		await processPiModelRuntime.replaceProvider({
+			providerId: piProviderId,
+			providerName: provider.name,
+			apiKey: apiKey ?? undefined,
+			models,
+		});
 	}
 }
 

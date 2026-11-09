@@ -10,7 +10,8 @@
  * 数据全部来自真接口：/api/kb、/api/kb/:id/documents、/api/kb/embedding。
  * 没有库时显示一张"能直接动手"的空态卡，而不是一句"暂无数据"。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import {
 	NAlert,
 	NButton,
@@ -27,9 +28,13 @@ import { kbApi } from "../api.js";
 
 const message = useMessage();
 const dialog = useDialog();
+const route = useRoute();
+const router = useRouter();
 let selectionSeq=0, searchSeq=0;
 const activeTab=ref("documents"), query=ref(""), searchResult=ref(null), searching=ref(false), settingsBusy=ref(false);
+const sourceChunkId = ref("");
 async function search(){if(!query.value.trim())return;const id=activeId.value,seq=++searchSeq;searching.value=true;try{const result=await kbApi.search(id,{query:query.value.trim()});if(id===activeId.value&&seq===searchSeq)searchResult.value=result;}catch(e){if(seq===searchSeq)message.error(e.message);}finally{if(seq===searchSeq)searching.value=false;}}
+function openSearchSource(result) { void router.push({ name: "knowledge", query: { kbId: result.kbId, docId: result.docId, chunkId: String(result.chunkId) } }); }
 async function setDefault(){const id=activeId.value,wasDefault=activeBase.value.isDefault;settingsBusy.value=true;try{const current=await kbApi.defaults();const ids=new Set(current.kbIds??[]);if(wasDefault)ids.delete(id);else ids.add(id);await kbApi.setDefaults([...ids]);await loadBases();message.success("默认检索范围已更新");}catch(e){message.error(e.message);}finally{settingsBusy.value=false;}}
 async function reindex(){const id=activeId.value;settingsBusy.value=true;try{await kbApi.reindex(id);if(activeId.value===id)await selectBase(id);await loadBases();message.success("向量已重新计算");}catch(e){message.error(e.message);}finally{settingsBusy.value=false;}}
 function removeDoc(doc){dialog.warning({title:"删除文档",content:`确定删除「${doc.filename}」及其分块？`,positiveText:"删除",negativeText:"取消",onPositiveClick:async()=>{try{await kbApi.removeDocument(doc.id);await selectBase(activeId.value);await loadBases();}catch(e){message.error(e.message);return false;}}});}
@@ -97,6 +102,27 @@ async function loadBases() {
 	} finally {
 		loading.value = false;
 	}
+}
+
+async function openSourceFromRoute() {
+	const kbId = typeof route.query.kbId === "string" ? route.query.kbId : "";
+	const docId = typeof route.query.docId === "string" ? route.query.docId : "";
+	const chunkId = typeof route.query.chunkId === "string" ? route.query.chunkId : "";
+	if (!kbId || !docId) return;
+	sourceChunkId.value = chunkId;
+	if (!bases.value.some((base) => base.id === kbId)) {
+		message.warning("引用的知识库不存在或当前不可访问");
+		return;
+	}
+	activeTab.value = "documents";
+	await selectBase(kbId);
+	await nextTick();
+	const row = document.querySelector(`[data-kb-doc-id="${CSS.escape(docId)}"]`);
+	if (!row) {
+		message.warning("引用的文档已不存在或不属于该知识库");
+		return;
+	}
+	row.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 async function selectBase(id) {
@@ -195,7 +221,8 @@ function onFilePicked(event) {
 	void uploadFiles(files);
 }
 
-onMounted(loadBases);
+onMounted(async () => { await loadBases(); await openSourceFromRoute(); });
+watch(() => [route.query.kbId, route.query.docId, route.query.chunkId], () => { void openSourceFromRoute(); });
 </script>
 
 <template>
@@ -272,7 +299,7 @@ onMounted(loadBases);
 					</div>
 
 					<div class="action-row" style="margin-top:20px;margin-bottom:16px"><n-button :type="activeTab==='documents'?'primary':'default'" @click="activeTab='documents'">文档</n-button><n-button :type="activeTab==='search'?'primary':'default'" @click="activeTab='search'">检索测试</n-button><n-button :type="activeTab==='settings'?'primary':'default'" @click="activeTab='settings'">设置</n-button></div>
-<template v-if="activeTab==='search'"><p class="hint">用实际业务问题检查资料能否命中。</p><div class="action-row"><n-input v-model:value="query" placeholder="输入检索问题" @keyup.enter="search"/><n-button type="primary" :loading="searching" @click="search">检索</n-button></div><template v-if="searchResult"><p class="hint">{{searchResult.mode==='vector'?'语义检索':'关键词检索'}} · {{searchResult.fallbackReason||'按相关性排序'}}</p><n-empty v-if="!searchResult.results.length" description="没有命中结果"/><article v-for="r in searchResult.results" :key="r.chunkId" class="search-result"><b>{{documents.find(d=>d.id===r.docId)?.filename||r.heading||'文档分块'}}</b><p>{{r.snippet}}</p><span class="hint">相关性 {{r.score}}</span></article></template></template>
+<template v-if="activeTab==='search'"><p class="hint">用实际业务问题检查资料能否命中。</p><div class="action-row"><n-input v-model:value="query" placeholder="输入检索问题" @keyup.enter="search"/><n-button type="primary" :loading="searching" @click="search">检索</n-button></div><template v-if="searchResult"><p class="hint">{{searchResult.mode==='vector'?'语义检索':searchResult.mode==='hybrid'?'语义与关键词混合检索':'关键词检索'}} · {{searchResult.fallbackReason||'按相关性排序'}}</p><n-empty v-if="!searchResult.results.length" description="没有命中结果"/><article v-for="r in searchResult.results" :key="r.chunkId" class="search-result"><b>{{documents.find(d=>d.id===r.docId)?.filename||r.heading||'文档分块'}}</b><p>{{r.snippet}}</p><button class="source-ref" type="button" @click="openSearchSource(r)">来源编号 [kb:{{r.kbId}} doc:{{r.docId}} chunk:{{r.chunkId}}] · 查看文档</button><span class="hint">相关性 {{r.score}}</span></article></template></template>
 <template v-if="activeTab==='settings'"><dl class="detail-grid"><dt>默认检索</dt><dd>{{activeBase.isDefault?'已加入通用对话默认检索':'未加入默认检索'}}</dd><dt>向量模型</dt><dd>{{embeddingLabel()}}</dd><dt>分块策略</dt><dd>{{chunkPolicy()}}</dd></dl><div v-if="can('workflow.write')" class="action-row"><n-button :loading="settingsBusy" @click="setDefault">{{activeBase.isDefault?'取消默认检索':'设为默认检索'}}</n-button><n-button :disabled="!embedding?.available" :loading="settingsBusy" @click="reindex">重新向量化</n-button><n-button type="error" quaternary @click="removeBase">删除知识库</n-button></div><p v-if="!embedding?.available" class="hint">请先在模型管理中配置可用的向量模型，当前可使用关键词检索。</p></template>
 <template v-if="activeTab==='documents'">
 <!-- 文档上传与解析 -->
@@ -304,11 +331,12 @@ onMounted(loadBases);
 						<span>文档列表</span>
 						<span class="kb-count">{{ documents.length }}</span>
 					</div>
+					<p v-if="sourceChunkId" class="source-location">来源分块 #{{ sourceChunkId }}</p>
 
 					<n-spin :show="docsLoading">
 						<div v-if="documents.length === 0" class="kb-doc-empty">还没有文档，上传一份就能开始检索</div>
 						<ul v-else class="kb-doc-list">
-							<li v-for="doc in documents" :key="doc.id" class="kb-doc">
+							<li v-for="doc in documents" :key="doc.id" class="kb-doc" :data-kb-doc-id="doc.id" :class="{ 'kb-doc--source': doc.id === route.query.docId }">
 								<div class="kb-doc-main">
 									<div class="kb-doc-name">{{ doc.filename }}</div>
 									<div class="kb-doc-meta">
@@ -549,6 +577,9 @@ onMounted(loadBases);
 	font-size: 13px;
 	word-break: break-all;
 }
+.kb-doc--source { background: var(--primary-soft, #e8edff); outline: 2px solid var(--primary); outline-offset: 2px; }
+.source-ref { display: block; margin: 6px 0; padding: 0; border: 0; background: none; color: var(--primary); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.source-location { margin: 0 6px 8px; color: var(--primary); font-size: 12px; }
 
 .kb-doc-meta {
 	font-size: 12px;

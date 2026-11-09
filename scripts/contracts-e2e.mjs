@@ -88,10 +88,51 @@ try {
 		assert.equal(await page.evaluate(() => sessionStorage.getItem("biz-agent-token")), null);
 		assert.deepEqual(errors, []);
 		mkdirSync("data", { recursive: true });
-		await page.screenshot({ path: "data/contracts-login.png", fullPage: true });
+		await page.screenshot({ path: join("data", `contracts-login-${randomUUID()}.png`), fullPage: true });
 	});
 
 	const off = await start("off");
+	await check("Pi clone 与 fork API 生成独立活动分支并保留原会话", async () => {
+		async function request(path, method = "GET", body) {
+			const response = await fetch(off + path, { method, ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+			return { status: response.status, body: await response.json() };
+		}
+		async function waitForAssistant(id, minimum = 2) {
+			for (let attempt = 0; attempt < 80; attempt++) {
+				const result = await request(`/api/sessions/${id}`);
+			if (!result.body.running && result.body.transcript.length >= minimum && result.body.transcript.some((entry) => entry.role === "assistant")) return result.body;
+				await delay(100);
+			}
+			throw new Error("Pi 衍生会话源消息未完成");
+		}
+		const created = await request("/api/sessions", "POST", { workflowId: "auto-flow" });
+		assert.equal(created.status, 201);
+		await request(`/api/sessions/${created.body.id}/messages`, "POST", { text: "Pi fork 第一条上下文" });
+		await waitForAssistant(created.body.id);
+		await request(`/api/sessions/${created.body.id}/messages`, "POST", { text: "Pi fork 选中的用户消息" });
+		const source = await waitForAssistant(created.body.id, 4);
+		const tree = (await request(`/api/sessions/${created.body.id}/pi-tree`)).body;
+		const findUser = (nodes, text) => {
+			for (const node of nodes) {
+				if (node.label === "用户" && node.preview === text) return node;
+				const nested = findUser(node.children ?? [], text);
+				if (nested) return nested;
+			}
+			return null;
+		};
+		const target = findUser(tree.nodes, "Pi fork 选中的用户消息");
+		assert.ok(target);
+		const clone = await request(`/api/sessions/${created.body.id}/clone`, "POST", {});
+		assert.equal(clone.status, 201);
+		assert.notEqual(clone.body.session.id, created.body.id);
+		assert.deepEqual(clone.body.session.transcript.map((entry) => entry.text), source.transcript.map((entry) => entry.text));
+		const fork = await request(`/api/sessions/${created.body.id}/fork`, "POST", { entryId: target.id });
+		assert.equal(fork.status, 201);
+		assert.notEqual(fork.body.session.id, created.body.id);
+		assert.equal(fork.body.editorText, "Pi fork 选中的用户消息");
+		assert.deepEqual(fork.body.session.transcript.map((entry) => entry.role), ["user", "assistant"]);
+		assert.equal((await request(`/api/sessions/${created.body.id}`)).body.transcript.length, source.transcript.length);
+	});
 	await check("停用 Agent 的旧会话消息接口返回 409，历史仍可读", async () => {
 		async function call(path, body) {
 			const response = await fetch(off + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

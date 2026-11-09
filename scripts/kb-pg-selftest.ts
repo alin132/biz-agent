@@ -221,10 +221,10 @@ try {
 	});
 	await check("service：语义检索 mode=vector 且命中苹果", async () => {
 		const response = await service.search(svcKb.id, "红色的水果是什么", { topK: 3 });
-		assert.equal(response.mode, "vector");
+		assert.equal(response.mode, "hybrid");
 		assert.ok(response.results.length >= 1);
 		assert.ok(response.results[0]!.snippet.includes("苹果"));
-		assert.equal(response.results[0]!.mode, "vector");
+		assert.equal(response.results[0]!.mode, "hybrid");
 	});
 
 	// 换一个“查询时向量化失败”的客户端：库里有向量 → 仍进向量分支 → 失败必须回退关键词
@@ -252,7 +252,7 @@ try {
 	await check("service.searchForSkill：按技能绑定跨库检索", async () => {
 		const response = await service.searchForSkill("skill_pg_svc", "水果", 3);
 		assert.deepEqual(response.kbIds, [svcKb.id]);
-		assert.equal(response.mode, "vector");
+		assert.equal(response.mode, "hybrid");
 	});
 } finally {
 	for (const id of cleaned) {

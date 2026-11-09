@@ -31,6 +31,10 @@ const matches = computed(() => {
 		[item.label, ...(item.aliases ?? [])].some((word) => String(word).toLowerCase().includes(q)),
 	);
 });
+const groups = computed(() => [
+	{ id: "skill", title: "技能", items: matches.value.filter((item) => item.kind === "skill") },
+	{ id: "command", title: "命令", items: matches.value.filter((item) => item.kind !== "skill") },
+].filter((group) => group.items.length));
 
 /** 过滤后条数会变少，高亮可能越界；这里夹回合法范围并回报给父组件 */
 const activeIndex = computed(() => {
@@ -47,19 +51,23 @@ function pick(item) {
 <template>
 	<div class="slash-panel" data-testid="slash-panel">
 		<div v-if="matches.length === 0" class="slash-empty">没有匹配的命令，按 Esc 关闭</div>
-		<button
-			v-for="(item, i) in matches"
-			:key="item.id"
-			type="button"
-			class="slash-item"
-			:class="{ active: i === activeIndex }"
-			data-testid="slash-item"
-			@mousedown.prevent="pick(item)"
-		>
-			<span class="slash-item-slash">/</span>
-			<span class="slash-item-label">{{ item.label }}</span>
-			<span class="slash-item-hint">{{ item.hint ?? "" }}</span>
-		</button>
+		<section v-for="group in groups" :key="group.id" class="slash-group">
+			<h3 class="slash-group-title">{{ group.title }}</h3>
+			<button
+				v-for="item in group.items"
+				:key="item.id"
+				type="button"
+				class="slash-item"
+				:class="{ active: matches.indexOf(item) === activeIndex, 'is-skill': item.kind === 'skill' }"
+				data-testid="slash-item"
+				:data-command-id="item.id"
+				@mousedown.prevent="pick(item)"
+			>
+				<span class="slash-item-label">{{ item.label }}</span>
+				<span class="slash-item-hint">{{ item.hint ?? "" }}</span>
+				<span v-if="item.active" class="slash-item-status">当前</span>
+			</button>
+		</section>
 	</div>
 </template>
 
@@ -81,6 +89,8 @@ function pick(item) {
 	flex-direction: column;
 	gap: 2px;
 }
+.slash-group + .slash-group { border-top: 1px solid var(--border, #e0e0e6); margin-top: 4px; padding-top: 4px; }
+.slash-group-title { margin: 0; padding: 7px 10px 5px; color: var(--text-2, #77808a); font-size: 12px; font-weight: 500; }
 .slash-empty {
 	padding: 10px 12px;
 	font-size: 12px;
@@ -88,33 +98,43 @@ function pick(item) {
 }
 .slash-item {
 	display: flex;
-	align-items: baseline;
-	gap: 8px;
+	align-items: center;
+	gap: 10px;
 	width: 100%;
+	min-width: 0;
+	min-height: 38px;
 	text-align: left;
 	background: none;
 	border: none;
-	border-radius: 8px;
-	padding: 8px 10px;
+	border-radius: 6px;
+	padding: 7px 10px;
 	cursor: pointer;
 	font-size: 13px;
 	color: inherit;
 }
 .slash-item.active {
-	background: var(--brand-soft, #eef1ff);
-}
-.slash-item-slash {
-	opacity: 0.5;
+	background: var(--surface-alt, #f1f3f5);
 }
 .slash-item-label {
-	font-weight: 600;
+	flex: 0 1 auto;
+	min-width: 0;
+	font-weight: 500;
 	white-space: nowrap;
 }
 .slash-item-hint {
+	flex: 1 1 auto;
+	min-width: 0;
 	font-size: 12px;
-	opacity: 0.6;
+	color: var(--text-2, #77808a);
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+.slash-item-status { flex: none; color: var(--text-2, #77808a); font-size: 11px; }
+@media (max-width: 600px) {
+	.slash-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; }
+	.slash-item-label { grid-column: 1; }
+	.slash-item-hint { grid-column: 1 / -1; grid-row: 2; }
+	.slash-item-status { grid-column: 2; grid-row: 1; }
 }
 </style>

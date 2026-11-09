@@ -4,7 +4,7 @@
  *
  * 关键事实（来自后端设计，页面上要说清楚，不能让人误会）：
  *  - API Key 只回掩码，明文只在创建时出现一次；
- *  - 当前模型只存内存，重启回落第一条可用项 —— 这是设计如此，不是 bug；
+ *  - 供应商、模型、当前对话模型和向量模型选择都持久化在存储层；
  *  - 最大上下文（contextWindow，单位 token）存库、重启仍在，空 = 未配置（后端存 null）。
  *
  * 增删改都在这里：新建/编辑走 ModelForm 组件（弹窗表单），删除与测试连通是行内按钮。
@@ -53,15 +53,10 @@ function kindLabel(kind) {
 }
 
 /**
- * token 数按人读的方式显示：131072 → 128k、256000 → 256k、200000 → 200k。
- *
- * 约数是**低精度取整**（128k，不是 131.1k）：这些数字是给人扫一眼用的，
- * 131072 这种精确到个位的 k 值既不比原数好读，还跟行业口径（128k/256k）对不上——
- * 到底存了多少看同一行里的原始数字，这里只负责"大致多大"。
+ * 以 1024 tokens 作为 1k，与输入表单采用同一口径。
  */
 function formatTokens(value) {
-	if (value >= 1000000) return `${trimZero(Math.round(value / 100000) / 10)}M`;
-	if (value >= 1000) return `${trimZero(Math.round(value / 100) / 10)}k`;
+	if (value >= 1024) return `${trimZero(Math.round((value / 1024) * 10) / 10)}k`;
 	return String(value);
 }
 
@@ -86,14 +81,13 @@ const savingContext = ref(false);
 
 function openContextDialog(model) {
 	editing.value = model;
-	draftContext.value = typeof model.contextWindow === "number" ? String(model.contextWindow) : "";
+	draftContext.value = typeof model.contextWindow === "number" ? String(model.contextWindow / 1024) : "";
 	contextOpen.value = true;
 }
 
 /**
  * 保存最大上下文。
- * 空串 = 清空配置（PATCH 传 null，后端落 null）；只写数字不写单位——
- * 「128k」这种带单位的值后端会直接 400，与其在界面上放宽再报错，不如当场说清楚。
+ * 空串 = 清空配置（PATCH 传 null）；表单用 k，API 和存储继续使用精确 token 数。
  */
 async function saveContext() {
 	const model = editing.value;
@@ -102,11 +96,11 @@ async function saveContext() {
 	let contextWindow = null;
 	if (raw.length > 0) {
 		const parsed = Number(raw);
-		if (!Number.isInteger(parsed) || parsed <= 0) {
-			message.warning("最大上下文要填正整数（token 数，例如 131072），留空表示未配置。");
+		if (!Number.isFinite(parsed) || parsed <= 0 || parsed > Number.MAX_SAFE_INTEGER / 1024) {
+			message.warning("最大上下文要填大于 0 的 k 数，例如 128，留空表示未配置。");
 			return;
 		}
-		contextWindow = parsed;
+		contextWindow = Math.round(parsed * 1024);
 	}
 	savingContext.value = true;
 	try {
@@ -393,12 +387,12 @@ onMounted(load);
 				<n-input
 					v-model:value="draftContext"
 					data-testid="model-context-input"
-					placeholder="例如 131072；留空表示未配置"
+					placeholder="例如 128；留空表示未配置"
 				>
-					<template #suffix>token</template>
+					<template #suffix>k</template>
 				</n-input>
 				<p class="ctx-hint">
-					这个模型一次能装下的 token 数（含输入与输出），填正整数；先查供应商文档里的准确数字，别照抄别家。
+					这个模型一次能装下的 token 数（含输入与输出），按 1k = 1024 tokens 输入；支持小数，保存后按 token 四舍五入。
 					留空即清空配置，对话页的上下文用量在没有配置时不显示占比。
 				</p>
 			</div>

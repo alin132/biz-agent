@@ -264,6 +264,12 @@ async function scenarioHealthAndRename(): Promise<void> {
 
 	const session = await createSession("ticket-flow");
 	assert(session.title === null, "新会话初始没有自定义标题（title 为 null）");
+	const piStats = await api<{ sessionId?: string; sessionFile?: string; userMessages: number; assistantMessages: number; toolCalls: number; tokens: { total: number }; cost: number }>("GET", `/api/sessions/${session.id}/pi-stats`);
+	assert(piStats.status === 200 && typeof piStats.data.userMessages === "number" && typeof piStats.data.assistantMessages === "number" && typeof piStats.data.toolCalls === "number" && typeof piStats.data.tokens?.total === "number" && typeof piStats.data.cost === "number", "Pi 原生会话统计返回消息、工具、token 与费用数字（HTTP 200）");
+	assert(!("sessionId" in piStats.data) && !("sessionFile" in piStats.data), "Pi 统计响应不暴露内部会话标识或文件路径");
+	const piTree = await api<{ leafId: string | null; nodes: { id: string; active: boolean; children: unknown[] }[] }>("GET", `/api/sessions/${session.id}/pi-tree`);
+	assert(piTree.status === 200 && Array.isArray(piTree.data.nodes) && (piTree.data.leafId === null || typeof piTree.data.leafId === "string"), "Pi 会话树接口返回节点与活动叶节点（HTTP 200）");
+	assert(!JSON.stringify(piTree.data).includes("sessionFile"), "Pi 会话树视图不暴露内部会话文件字段");
 
 	const customTitle = "报修工单：支付回调超时";
 	const renamed = await patchTitle(session.id, { title: customTitle });
@@ -1381,14 +1387,14 @@ async function scenarioSessionModel(): Promise<void> {
 		`会话的 mode 与实例一致（${String(created.data.mode)} / ${String(models.data.mode)}）`);
 
 	if (models.data.mode === "simulated") {
-		// 模拟实例：没有真实模型可切，接口要如实拒绝（这正是「如实标注模拟模型」的后端一半）
+		// 未配置的模型标识必须拒绝；模拟实例仍可保存模型页中已配置模型的选择状态。
 		const refused = await api<{ error?: string }>("POST", `/api/sessions/${session.id}/model`, {
 			modelId: "whatever-model",
 		});
 		assert(refused.status === 400,
 			`模拟实例上换模型返回 400 而不是假装成功（HTTP ${refused.status}）`);
-		assert(String(refused.data.error ?? "").includes("模拟模型"),
-			`拒绝文案点明是模拟模型（${String(refused.data.error)}）`);
+		assert(String(refused.data.error ?? "").includes("模型当前不可用"),
+			`拒绝文案说明模型不可用（${String(refused.data.error)}）`);
 	} else {
 		// 真实实例：临时建两条独立的对话模型（不复用用户已有模型，也不改它们的启用状态）
 		const provider = models.data.providers.find((item) => item.enabled !== false);
@@ -1508,6 +1514,18 @@ async function scenarioPlugins(): Promise<void> {
 	assert(removed.status === 200 && removed.data.removed === true, "卸载插件成功");
 	const afterRemove = await api<{ id: string }[]>("GET", "/api/skills");
 	assert(!afterRemove.data.some((skill) => skill.id === skillId), "卸载后移除插件技能");
+	const piSkillMarkdown = "---\nname: sales-analysis\ndescription: Analyze sales records and summarize trends\n---\n\nReview relevant sales data, state assumptions, and summarize the observed trends.";
+	const piSkill = await api<{ id?: string; skills?: string[] }>("POST", "/api/plugins/import-pi-skill", { markdown: piSkillMarkdown });
+	assert(piSkill.status === 201 && piSkill.data.id === "pi-skill-sales-analysis" && piSkill.data.skills?.includes("sales-analysis") === true, "Pi SKILL.md 通过 Pi frontmatter 解析并安装成插件技能");
+	const piSkills = await api<{ id: string; name: string; description: string }[]>("GET", "/api/skills");
+	assert(piSkills.status === 200 && piSkills.data.some((skill) => skill.id === "plugin-pi-skill-sales-analysis-sales-analysis" && skill.description === "Analyze sales records and summarize trends"), "Pi 技能元数据进入业务技能目录");
+	const malformedPiSkill = await api<{ error?: string }>("POST", "/api/plugins/import-pi-skill", { markdown: "---\nname: [invalid\ndescription: broken\n---\nbody" });
+	assert(malformedPiSkill.status === 400, "Pi 技能非法 YAML 有明确错误");
+	const longPiSkill = await api<{ error?: string }>("POST", "/api/plugins/import-pi-skill", { markdown: "---\nname: too-long\ndescription: long body test\n---\n\n" + "x".repeat(4001) });
+	assert(longPiSkill.status === 400, "Pi 技能正文超过技能存储上限时拒绝导入");
+	const duplicatePiSkill = await api<{ error?: string }>("POST", "/api/plugins/import-pi-skill", { markdown: piSkillMarkdown });
+	assert(duplicatePiSkill.status === 409, "Pi 技能重复安装返回冲突");
+	await api("DELETE", "/api/plugins/pi-skill-sales-analysis");
 }
 
 async function main(): Promise<void> {

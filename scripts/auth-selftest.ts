@@ -238,7 +238,15 @@ async function testRoles(): Promise<void> {
 		assert.equal(permissionFor("POST", "/api/sessions/s-1/messages"), "session.run");
 		assert.equal(permissionFor("POST", "/api/sessions/s-1/stop"), "session.run");
 		assert.equal(permissionFor("POST", "/api/sessions/s-1/skills"), "session.run");
+		assert.equal(permissionFor("POST", "/api/sessions/s-1/pi-tree/navigate"), "session.run");
+		assert.equal(permissionFor("GET", "/api/pi/settings"), "workflow.read");
+		assert.equal(permissionFor("PUT", "/api/pi/settings"), "settings.write");
 		assert.equal(permissionFor("GET", "/api/sessions/s-1/events"), "session.read");
+		assert.equal(permissionFor("GET", "/api/agent-groups"), "session.read");
+		assert.equal(permissionFor("POST", "/api/agent-groups"), "session.write");
+		assert.equal(permissionFor("GET", "/api/agent-groups/group-1"), "session.read");
+		assert.equal(permissionFor("POST", "/api/agent-groups/group-1/turns"), "session.run");
+		assert.equal(permissionFor("DELETE", "/api/agent-groups/group-1"), "session.write");
 		assert.equal(permissionFor("GET", "/api/audit"), "audit.read");
 		assert.equal(permissionFor("GET", "/api/health"), null, "探针不需要权限点");
 	});

@@ -8,23 +8,35 @@
  * ctx / store 与外层共用，审批事件、审计流水、业务数据都落在同一次会话里。
  */
 
-import type { Agent, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
 import type { Store } from "../store/memory.js";
 import { ToolRegistry } from "./registry.js";
-import { createBusinessAgent } from "./runtime.js";
+import { buildBusinessSystemPrompt } from "./runtime.js";
+import { createWorkflowTurnPolicy } from "./workflowPolicy.js";
 import type { BizContext, WorkflowDef } from "./types.js";
+import type { ToolDef } from "./types.js";
+import type { WorkflowToolResult } from "./workflowPolicy.js";
 import { WorkflowEngine } from "./workflow.js";
 
 export interface SubFlowOptions {
 	workflow: WorkflowDef;
 	store: Store;
 	ctx: BizContext;
-	model: Model<any>;
-	streamFn: StreamFn;
 	/** 要交给这条流程处理的业务请求。 */
 	task: string;
 	maxTurns?: number;
+	/** Host runtime owns agent/session construction; this module supplies only business policy and tools. */
+	createSession(input: {
+		systemPrompt: string;
+		tools: ToolDef[];
+		ctx: BizContext;
+		workflow: {
+			maxTurns: number;
+			startRun(): void;
+			finishTurn(toolResults: WorkflowToolResult[]): { continue: boolean; terminateTools: boolean };
+			nextPrompt(): string;
+			limitReached(): boolean;
+		};
+	}): Promise<{ prompt(text: string): Promise<void>; text(): string; dispose(): void }>;
 }
 
 export interface SubFlowResult {
@@ -33,39 +45,32 @@ export interface SubFlowResult {
 	/** 目标流程是否真的走完了全部步骤。 */
 	done: boolean;
 	engine: WorkflowEngine;
-	agent: Agent;
 }
 
 export async function runSubWorkflow(options: SubFlowOptions): Promise<SubFlowResult> {
-	const { workflow, store, ctx, model, streamFn } = options;
+	const { workflow, store, ctx } = options;
 	const engine = new WorkflowEngine(workflow);
 	const registry = new ToolRegistry().registerAll(workflow.createTools(store));
-	const nested = createBusinessAgent({
-		workflow,
-		registry,
+	const tools = registry.select([...new Set(workflow.steps.flatMap((step) => step.via))]);
+	const maxTurns = options.maxTurns ?? 12;
+	const policy = createWorkflowTurnPolicy(engine, maxTurns);
+
+	const session = await options.createSession({
+		systemPrompt: buildBusinessSystemPrompt(workflow, []),
+		tools,
 		ctx,
-		model,
-		streamFn,
-		engine,
-		maxTurns: options.maxTurns ?? 12,
+		workflow: {
+			maxTurns,
+			startRun: policy.startRun,
+			finishTurn: policy.finishTurn,
+			nextPrompt: policy.nextPrompt,
+			limitReached: policy.limitReached,
+		},
 	});
-
-	await nested.agent.prompt(options.task);
-
-	return { text: lastAssistantTextOf(nested.agent), done: engine.done, engine, agent: nested.agent };
-}
-
-/** 从后往前找最后一条助手文本。 */
-export function lastAssistantTextOf(agent: Agent): string {
-	const messages = agent.state.messages;
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index]!;
-		if (message.role === "assistant") {
-			return message.content
-				.filter((block) => block.type === "text")
-				.map((block) => (block as { text: string }).text)
-				.join("");
-		}
+	try {
+		await session.prompt(options.task);
+		return { text: session.text(), done: engine.done, engine };
+	} finally {
+		session.dispose();
 	}
-	return "";
 }

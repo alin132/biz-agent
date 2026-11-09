@@ -26,7 +26,7 @@ import {
 	useDialog,
 } from "naive-ui";
 import PageShell from "../components/PageShell.vue";
-import { agentsApi, kbApi, modelsApi, skillsApi } from "../api.js";
+import { agentsApi, kbApi, mcpApi, modelsApi, skillsApi } from "../api.js";
 
 import { can } from "../access.js";
 const dialog = useDialog();
@@ -47,6 +47,7 @@ const form = reactive(blankForm());
 const skillOptions = ref([]);
 const kbOptions = ref([]);
 const modelOptions = ref([]);
+const mcpServers = ref([]);
 
 /** 可对话状态：与后端 CHATTABLE 一致（已停用不能聊，这是硬规则不是界面偏好） */
 const CHATTABLE = ["draft", "testing", "published"];
@@ -57,18 +58,27 @@ function chattable(status) {
 /**
  * 开一个新对话，并把它绑定到这个 Agent。
  *
- * Agent 不是"另一个聊天窗口"——它就是一条普通会话加上 model/人格/能力绑定，
- * 所以消息、审批、审计、技能快照全都复用原有链路。
- *
- * 但它**属于这个 Agent**：所以落在 Agent 自己的专属页（/agent-chat/:id），
- * 而不是通用对话页。通用页只留没有绑定 Agent 的会话，多个 Agent 的历史不再挤在一起。
+ * Agent 会话仍是普通会话，只是带有 agentId；打开标准对话页时用它筛选对应 Agent 的历史。
  */
 async function startChat(item) {
 	busy.value = item.id + "chat";
+	const chatWindow = item.status === "published" ? window.open("about:blank", "_blank") : null;
+	if (item.status === "published" && !chatWindow) {
+		busy.value = "";
+		message.warning("浏览器阻止了新窗口，请允许此站点打开新标签页后重试。");
+		return;
+	}
+	if (chatWindow) chatWindow.opener = null;
 	try {
 		const session = await agentsApi.startChat(item.id);
-		router.push({ name: "agent-chat", params: { id: item.id }, query: { session: session.id } });
+		const target = router.resolve({ name: "chat", query: { agentId: item.id, session: session.id, standalone: "1" } });
+		if (chatWindow) {
+			chatWindow.location.replace(`${window.location.origin}/${target.href}`);
+		} else {
+			router.push(target);
+		}
 	} catch (err) {
+		chatWindow?.close();
 		message.error(err?.message ?? "开对话失败");
 	} finally {
 		busy.value = "";
@@ -76,13 +86,13 @@ async function startChat(item) {
 }
 
 /**
- * 打开这个 Agent 的专属对话页（不带 session = 进去自己挑历史 / 新开一条）。
+ * 在标准对话页中查看这个 Agent 的历史会话。
  *
  * 卡片上的「对话」按钮走的是 startChat（先建会话再进去），这条只服务"先看看历史"；
- * 两条入口最终落在同一个路由上，所以"一个 Agent 一个对话入口"这件事在地址栏里是一致的。
+	 * 新对话按钮仍由 startChat 处理；这里仅进入对应 Agent 的会话列表。
  */
 function openAgentChat(item) {
-	router.push({ name: "agent-chat", params: { id: item.id } });
+	router.push({ name: "chat", query: { agentId: item.id } });
 }
 
 const STATUS_META = {
@@ -129,8 +139,8 @@ function blankForm() {
 		topP: 1,
 		maxTokens: 4096,
 		stream: true,
-		shortTermRounds: 10,
-		overflowStrategy: "sliding_window",
+		reserveTokens: 16384,
+		keepRecentTokens: 20000,
 		maxIters: 10,
 		showThinking: true,
 		skillIds: [],
@@ -160,16 +170,18 @@ async function load() {
 
 /** 下拉选项：技能 / 知识库 / 模型，失败就空着（不阻断编辑主表单） */
 async function loadOptions() {
-	const [skills, kbs, models] = await Promise.all([
+	const [skills, kbs, models, mcp] = await Promise.all([
 		skillsApi.list().catch(() => []),
 		kbApi.list().catch(() => []),
 		modelsApi.list().catch(() => null),
+		mcpApi.list().catch(() => []),
 	]);
 	// auto-flow 是默认聊天模式，不是可绑定的技能（与技能页同一规则）
 	skillOptions.value = skills.filter((item) => item.id !== "auto-flow").map((item) => ({ label: item.name, value: item.id }));
 	kbOptions.value = kbs.map((item) => ({ label: item.name, value: item.id }));
 	const chatModels = (models?.models ?? []).filter((item) => item.kind !== "embedding");
 	modelOptions.value = chatModels.map((item) => ({ label: item.name || item.modelId, value: item.id }));
+	mcpServers.value = mcp;
 }
 
 function openCreate() {
@@ -190,8 +202,8 @@ function openEdit(item) {
 		topP: item.modelConfig?.topP ?? 1,
 		maxTokens: item.modelConfig?.maxTokens ?? 4096,
 		stream: item.modelConfig?.stream ?? true,
-		shortTermRounds: item.memoryConfig?.shortTermRounds ?? 10,
-		overflowStrategy: item.memoryConfig?.overflowStrategy ?? "sliding_window",
+		reserveTokens: item.memoryConfig?.reserveTokens ?? 16384,
+		keepRecentTokens: item.memoryConfig?.keepRecentTokens ?? 20000,
 		maxIters: item.advancedConfig?.maxIters ?? 10,
 		showThinking: item.advancedConfig?.showThinking ?? true,
 		skillIds: [...(item.skillIds ?? [])],
@@ -214,7 +226,7 @@ function toPayload() {
 			maxTokens: form.maxTokens,
 			stream: form.stream,
 		},
-		memoryConfig: { shortTermRounds: form.shortTermRounds, overflowStrategy: form.overflowStrategy },
+		memoryConfig: { reserveTokens: form.reserveTokens, keepRecentTokens: form.keepRecentTokens },
 		advancedConfig: { maxIters: form.maxIters, showThinking: form.showThinking },
 		skillIds: form.skillIds,
 		kbIds: form.kbIds,
@@ -393,21 +405,36 @@ onMounted(async () => {
 					</n-tab-pane>
 
 					<n-tab-pane name="memory" tab="记忆">
-						<n-form-item label="短期记忆保留轮数">
-							<n-input-number v-model:value="form.shortTermRounds" :min="1" :max="100" style="width: 100%" />
+						<n-form-item label="自动压缩预留 token 数">
+							<n-input-number v-model:value="form.reserveTokens" :min="0" :max="1000000" :step="1024" style="width: 100%" />
 						</n-form-item>
-						<n-form-item label="超长时的溢出策略">
-							<n-select
-								v-model:value="form.overflowStrategy"
-								:options="[
-									{ label: '滑动窗口（丢弃最早的对话）', value: 'sliding_window' },
-									{ label: '摘要压缩（把旧对话总结成一段）', value: 'summarize' },
-								]"
-							/>
+						<n-form-item label="压缩后保留 token 数">
+							<n-input-number v-model:value="form.keepRecentTokens" :min="0" :max="1000000" :step="1024" style="width: 100%" />
 						</n-form-item>
 					</n-tab-pane>
 
 					<n-tab-pane name="binding" tab="能力绑定">
+						<section class="mcp-capability">
+							<div class="mcp-capability-head">
+								<div>
+									<strong>MCP 工具</strong>
+									<p>已启用的 MCP 工具会自动提供给这个 Agent 的对话；高风险调用需要人工审批。</p>
+								</div>
+								<n-button size="small" @click="router.push({ name: 'mcp' })">管理 MCP</n-button>
+							</div>
+							<div v-if="mcpServers.length" class="mcp-server-list">
+								<div v-for="server in mcpServers" :key="server.id" class="mcp-server-row">
+									<div class="mcp-server-copy">
+										<strong>{{ server.name }}</strong>
+										<span>{{ (server.tools ?? []).filter((tool) => tool.enabled).length }} 个可用工具</span>
+									</div>
+									<n-tag size="small" :bordered="false" :type="server.enabled && server.lastStatus === 'ok' ? 'success' : 'default'">
+										{{ !server.enabled ? '已停用' : server.lastStatus === 'ok' ? '已连接' : server.lastStatus === 'error' ? '连接异常' : '待检查' }}
+									</n-tag>
+								</div>
+							</div>
+							<div v-else class="mcp-empty">尚未配置 MCP 服务</div>
+						</section>
 						<n-form-item label="技能">
 							<n-select v-model:value="form.skillIds" :options="skillOptions" multiple filterable placeholder="选择要挂载的技能" />
 						</n-form-item>
@@ -569,4 +596,30 @@ onMounted(async () => {
 	gap: 8px;
 	margin-left: auto;
 }
+
+.mcp-capability {
+	margin: 0 0 20px;
+	padding: 14px 16px;
+	background: var(--surface-alt);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+}
+
+.mcp-capability-head, .mcp-server-row, .mcp-server-copy {
+	display: flex;
+	align-items: center;
+}
+
+.mcp-capability-head, .mcp-server-row {
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.mcp-capability-head strong, .mcp-server-copy strong { font-size: 13px; font-weight: 600; }
+.mcp-capability-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.mcp-server-list { display: grid; margin-top: 12px; border-top: 1px solid var(--line); }
+.mcp-server-row { padding: 10px 0 0; }
+.mcp-server-copy { gap: 10px; min-width: 0; }
+.mcp-server-copy span, .mcp-empty { color: var(--muted); font-size: 12px; }
+.mcp-empty { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 </style>

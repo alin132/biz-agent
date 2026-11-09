@@ -290,7 +290,7 @@ async function main() {
 			assert.ok(tempText.includes("未配置"), `新模型应显示「未配置」，实际「${tempText.replace(/\n/g, " | ")}」`);
 		});
 
-		// 改一次：输入 131072 → 保存 → 列表显示原始数字 + 人类可读的 131.1k（十进制 k） + 接口回读是同一个数
+		// 改一次：输入 128k → 保存 → 接口按 131072 tokens 精确落库
 		await tempRow.locator('[data-testid="model-context-edit"]').click();
 		await page.waitForTimeout(400);
 		const contextModal = page.locator(".n-modal", { hasText: "最大上下文" });
@@ -300,17 +300,17 @@ async function main() {
 		const contextInput = contextModal.locator('[data-testid="model-context-input"] input');
 		await check("编辑框提到单位是 token（不然没人知道该填什么）", async () => {
 			const modalText = await contextModal.innerText();
-			assert.ok(modalText.includes("token"), `编辑框应写明单位，实际「${modalText.slice(0, 120)}」`);
+			assert.ok(modalText.includes("k"), `编辑框应写明 k 单位，实际「${modalText.slice(0, 120)}」`);
 		});
-		await contextInput.fill("131072");
+		await contextInput.fill("128");
 		await contextModal.locator('[data-testid="model-context-save"]').click();
 		await page.waitForTimeout(1200);
 
 		tempRow = modelPanelRows.filter({ hasText: tempName }).first();
 		tempText = await tempRow.innerText();
 		const contextCell = (await tempRow.locator('[data-testid="model-context-value"]').innerText()).trim();
-		await check("填 131072 保存后，列表这一行只显示 131.1k（用户指定：k 单位，不摆原始数字）", () => {
-			assert.equal(contextCell.trim(), "131.1k", `应只显示 131.1k，实际「${contextCell}」`);
+		await check("填 128k 保存后，列表显示 128k 且接口精确落库", () => {
+			assert.equal(contextCell.trim(), "128k", `应只显示 128k，实际「${contextCell}」`);
 			assert.ok(!tempText.includes("未配置"), "配置之后不该再显示未配置");
 		});
 		const savedContext = await page.evaluate(async (id) => {
@@ -325,17 +325,17 @@ async function main() {
 		await tempRow.locator('[data-testid="model-context-edit"]').click();
 		await page.waitForTimeout(400);
 		const contextInputAgain = page.locator(".n-modal", { hasText: "最大上下文" }).locator('[data-testid="model-context-input"] input');
-		await contextInputAgain.fill("256000");
+		await contextInputAgain.fill("250");
 		await page.locator(".n-modal", { hasText: "最大上下文" }).locator('[data-testid="model-context-save"]').click();
 		await page.waitForTimeout(1200);
 		const onceMore = await page.evaluate(async (id) => {
 			const list = await (await fetch("/api/models")).json();
 			return (list.models ?? []).find((model) => model.id === id)?.contextWindow ?? null;
 		}, tempModelRowId);
-		await check("改第二次也生效（256000 → 显示 256k）", async () => {
+		await check("改第二次也生效（250k → 存为 256000 tokens，列表仍显示 250k）", async () => {
 			assert.equal(onceMore, 256000, `接口应回读 256000，实际 ${onceMore}`);
 			const cell = (await modelPanelRows.filter({ hasText: tempName }).first().locator('[data-testid="model-context-value"]').innerText()).trim();
-			assert.ok(cell.includes("256k"), `应显示 256k，实际「${cell}」`);
+			assert.equal(cell, "250k", `应显示 250k，实际「${cell}」`);
 		});
 
 		// 留空 = 清空配置：列表回到「未配置」，接口回 null（不是 0、也不是留着旧值）
@@ -440,7 +440,7 @@ async function main() {
 
 	// 补齐真字段再保存
 	await formModal.locator('[data-testid="model-form-model-id"] input').fill(newModelId);
-	await formModal.locator('[data-testid="model-form-context"] input').fill("131072");
+	await formModal.locator('[data-testid="model-form-context"] input').fill("128");
 	await formModal.locator('[data-testid="model-form-save"]').click();
 	await page.waitForTimeout(1200);
 
@@ -474,7 +474,7 @@ async function main() {
 
 	const renamedModel = `${newModelName}-已改`;
 	await editModal.locator('[data-testid="model-form-name"] input').fill(renamedModel);
-	await editModal.locator('[data-testid="model-form-context"] input').fill("64000");
+	await editModal.locator('[data-testid="model-form-context"] input').fill("62.5");
 	await editModal.locator('[data-testid="model-form-save"]').click();
 	await page.waitForTimeout(1200);
 
@@ -1304,6 +1304,10 @@ async function main() {
 	}
 
 	const usageBadge = page.locator('[data-testid="context-usage"]');
+	const usageDisplay = async () => {
+		const title = (await usageBadge.getAttribute("aria-label")) ?? "";
+		return title.split("：")[1]?.split("；")[0] ?? "";
+	};
 	await check("用量圆环存在，且在模型选择器旁边（同一 compose 行）", async () => {
 		assert.equal(await usageBadge.count(), 1, "应有且只有一个用量圆环");
 		// 圆环与模型选择器在同一个 compose-actions 行里（用户要求：贴着模型选择放）
@@ -1315,7 +1319,7 @@ async function main() {
 	});
 
 	// 还没发消息时是 0：这条会话确实还没用上下文，界面不该凭空给个数字
-	const usageIdle = (await usageBadge.innerText()).trim();
+	const usageIdle = await usageDisplay();
 	await check("没发消息时显示 0（不凭空编数字）", () => {
 		assert.match(usageIdle, /^0(\/\d+(\.\d+)?k?)?$/, `初始用量应是 0 打头，实际「${usageIdle}」`);
 	});
@@ -1330,7 +1334,7 @@ async function main() {
 	const rowsWithWindow = usageFacts.rows.filter((row) => Number(row.ctx) > 0);
 
 	// hover 说明必须能解释这个数字。两种实例都成立，所以这里按事实分流断言。
-	const usageTitleIdle = (await usageBadge.getAttribute("title")) ?? "";
+	const usageTitleIdle = (await usageBadge.getAttribute("aria-label")) ?? "";
 	await check("用量元素带 hover 说明（说清是「已用 / 总量」还是「未配置窗口」）", () => {
 		assert.ok(usageTitleIdle.includes("上下文用量"), `title 应说明这是上下文用量，实际「${usageTitleIdle}」`);
 		assert.ok(usageTitleIdle.includes("tokens"), `title 应带精确 token 数，实际「${usageTitleIdle}」`);
@@ -1344,18 +1348,18 @@ async function main() {
 
 	// 发一条消息：用量必须真的涨——这是"它是活的、不是个写死的标签"的唯一证据
 	await page.locator(".chat-input textarea").fill("上下文用量用例：请用一句话回答");
-	const beforeUsageSend = (await usageBadge.innerText()).trim();
+	const beforeUsageSend = await usageDisplay();
 	await page.locator(".chat-input button:has-text('发送')").click();
 	await page.waitForTimeout(1500);
-	const usageAfterSend = (await usageBadge.innerText()).trim();
+	const usageAfterSend = await usageDisplay();
 	await check("发出消息后用量立刻增加（用户那条当场计入，不等回复）", () => {
 		assert.notEqual(usageAfterSend, beforeUsageSend, `发送后用量应从「${beforeUsageSend}」涨上去，实际没变`);
 	});
 
 	// 等这一轮跑完（流式与 done 都会继续累加），再断言格式
 	await page.waitForTimeout(6000);
-	const usageAfterTurn = (await usageBadge.innerText()).trim();
-	const usageTitleAfter = (await usageBadge.getAttribute("title")) ?? "";
+	const usageAfterTurn = await usageDisplay();
+	const usageTitleAfter = (await usageBadge.getAttribute("aria-label")) ?? "";
 	await check("用量格式是「已用」或「已用/总量」，k 为千位（如 29k/256k）", () => {
 		assert.match(
 			usageAfterTurn,
@@ -1386,7 +1390,7 @@ async function main() {
 					await page.waitForTimeout(2000);
 				}
 			}
-			const text = (await usageBadge.innerText()).trim();
+		const text = await usageDisplay();
 			assert.ok(text.includes("/"), `配了 contextWindow 就该显示「已用/总量」，实际「${text}」`);
 			// 总量按 k 千位取整：1000 → 1k，256000 → 256k
 			const shown = Number(text.split("/")[1].replace("k", "")) * 1000;
@@ -1400,9 +1404,8 @@ async function main() {
 
 	// hover 的精确数字不能是取整值：k 是给人扫一眼的，光标停上去要看到真实数
 	await check("hover 说明给的是精确 token 数（不是 k 取整值）", () => {
-		const match = usageTitleAfter.match(/(\d[\d,]*)\s*(?:\/|tokens)/);
-		assert.ok(match, `title 里应有精确数字，实际「${usageTitleAfter}」`);
-		assert.ok(!/k\b/.test(usageTitleAfter.split("：")[1] ?? ""), `title 里不该出现 k 取整值，实际「${usageTitleAfter}」`);
+		const match = usageTitleAfter.match(/精确数值 (\d+)(?: \/ (\d+))? tokens/);
+		assert.ok(match, `title 里应有精确 token 数，实际「${usageTitleAfter}」`);
 	});
 
 	// 切换与刷新都应恢复目标会话自己的上下文快照。
@@ -1415,7 +1418,8 @@ async function main() {
 			const response = await fetch(`/api/sessions/${id}`);
 			return response.json();
 		}, usageSessionId);
-		const sessionText = (await page.locator('[data-testid="context-usage"]').first().innerText()).trim();
+		const sessionTitle = (await page.locator('[data-testid="context-usage"]').first().getAttribute("aria-label")) ?? "";
+		const sessionText = sessionTitle.split("：")[1]?.split("；")[0] ?? "";
 		await check("切换会话后显示该会话快照中的上下文用量", () => {
 			assert.ok(usageSessionId, "URL 应包含当前会话 id");
 			assert.equal(sessionText.split("/")[0], formatTokensForTest(usageSnapshot.contextTokens));
@@ -1425,7 +1429,8 @@ async function main() {
 		await check("刷新后恢复同一会话的上下文用量", async () => {
 			const restoredId = new URL(page.url()).hash.match(/session=([^&]+)/)?.[1];
 			assert.equal(restoredId, usageSessionId);
-			assert.equal((await page.locator('[data-testid="context-usage"]').first().innerText()).trim().split("/")[0], formatTokensForTest(usageSnapshot.contextTokens));
+			const restoredTitle = (await page.locator('[data-testid="context-usage"]').first().getAttribute("aria-label")) ?? "";
+			assert.equal(restoredTitle.split("：")[1]?.split("；")[0].split("/")[0], formatTokensForTest(usageSnapshot.contextTokens));
 		});
 	} else {
 		console.log("  （只有一条会话，跳过切换会话快照断言）");
@@ -1604,7 +1609,7 @@ async function main() {
 	// 那是正确行为，不是缺陷；在这里硬断言"变少"等于逼实现去撒谎。
 	// 于是分两路，**两边都是有意义的断言**：
 	//   模拟实例 → 断言"拒绝被如实呈现给用户"（提示里说明原因、历史一条不动）；
-	//   真实模型 → 断言"提示条出现且**不含摘要正文**"（摘要只在后端上下文里，界面不该展示）。
+	//   真实模型 → 断言摘要正文作为压缩记录显示，旧消息仍保留在原会话。
 	for (let round = 0; round < 6; round += 1) {
 		const box = page.locator(".chat-input textarea");
 		await box.fill(`压缩用例第 ${round + 1} 轮：请记住锚点 E2E-CM-${round + 1}`);
@@ -1642,6 +1647,7 @@ async function main() {
 		)
 		.catch(() => {});
 	const beforeCompact = await page.locator(".chat-bubble").count();
+	const compactSessionId = new URLSearchParams(new URL(page.url()).hash.split("?")[1] ?? "").get("session");
 	await check("压缩前已经攒够足够的消息", () => {
 		assert.ok(beforeCompact >= 6, `应有若干条消息供压缩，实际 ${beforeCompact} 条`);
 	});
@@ -1661,14 +1667,13 @@ async function main() {
 	// 诊断信息进断言消息：失败时能看到压缩请求的状态与界面的错误条
 	const compactNet = await page.evaluate(() => window.__e2eCompactLog ?? "无记录");
 	const afterCompact = await page.locator(".chat-bubble").count();
-	const compactBanner = page.locator('[data-testid="compacted-notice"]');
+	const compactRecord = page.locator('[data-testid="compaction-record"]');
 	const alertText = await page.locator(".chat-alert").innerText().catch(() => "");
 	console.log(`  [诊断] 会话气泡 ${beforeCompact} → ${afterCompact}，压缩请求=${compactNet}，错误条=${alertText || "无"}`);
 
 	if (compactSimulated) {
 		await check("模拟实例上 /compact 如实报错，且历史一条不动（不假装压成功）", async () => {
-			const banner = await compactBanner.count();
-			assert.equal(banner, 0, "压缩没成功就不该显示「已压缩」提示，否则是在骗用户");
+			assert.equal(await compactRecord.count(), 0, "压缩未成功时不应新增摘要记录");
 			const simText = await page.locator(".chat-alert").innerText().catch(() => "");
 			assert.ok(
 				simText.includes("真实模型") || simText.includes("压缩"),
@@ -1677,28 +1682,25 @@ async function main() {
 			assert.equal(afterCompact, beforeCompact, `拒绝压缩时消息不能变（${beforeCompact} → ${afterCompact}）`);
 		});
 	} else {
-		// live 上压缩成败看真实模型脸色（限流/空回都会走失败路径）。成败不该动摇界面契约：
-		// "提示条长什么样"和"消息列表绝不出现摘要"是完成品对用户的承诺，所以两路都要钉。
+		// live 上压缩成败看真实模型脸色（限流/空回都会走失败路径）。
 		const summarySeen = await findSummaryEcho(page);
 
-		if ((await compactBanner.count()) === 1) {
-			await check("live 实例：压缩成功——提示条在、含「已压缩」，且不展示摘要正文", async () => {
-				const text = await compactBanner.innerText();
-				assert.ok(text.includes("压缩"), `提示文案应含「压缩」，实际「${text}」`);
-				assert.ok(text.includes("上下文"), `提示条应说明上下文被压过，实际「${text}」`);
-				assert.equal(
-					await compactBanner.locator(".chat-compacted-body").count(),
-					0,
-					"提示条里不该再有摘要正文段落（chat-compacted-body）——用户要的就是别看见摘要",
-				);
-				assert.ok(!summarySeen, `消息列表里出现了摘要正文，用户不该看见它：${summarySeen}`);
+		if ((await compactRecord.count()) === 1) {
+			await check("live 实例：压缩成功后留在原会话，摘要追加且旧消息保留", async () => {
+				const text = await compactRecord.innerText();
+				assert.ok(text.includes("压缩") && text.includes("摘要"), `摘要记录标题不清楚：「${text.slice(0, 80)}」`);
+				assert.match(text, /上下文已(?:自动)?压缩/, "压缩完成后应显示持久的上下文压缩标记");
+				assert.ok(summarySeen, "时间线摘要记录应显示摘要正文");
+				assert.ok(await page.getByText(/E2E-CM-1/, { exact: false }).count() > 0, "压缩前的早期消息仍应留在时间线");
+				assert.equal(new URLSearchParams(new URL(page.url()).hash.split("?")[1] ?? "").get("session"), compactSessionId, "压缩不得切换到新会话");
+				assert.equal(await compactRecord.evaluate((node) => node.parentElement.lastElementChild === node), true, "摘要应追加在历史末尾");
 			});
 		} else {
 			await check("live 实例：压缩未成功时如实报错，且没伪造「已压缩」提示", async () => {
 				assert.equal(
-					await compactBanner.count(),
+					await compactRecord.count(),
 					0,
-					"压缩没成功就不该显示「已压缩」提示，否则是在骗用户",
+					"压缩没成功就不应显示摘要记录",
 				);
 				const failText = await page.locator(".chat-alert").innerText().catch(() => "");
 				assert.ok(failText.trim().length > 0, "压缩没成功也没有任何错误提示——界面在装没事，这不行");
@@ -1711,17 +1713,12 @@ async function main() {
 	// 上面 fresh 会话那段当初就是提前删了，才让这整段挂死在「发送按钮 disabled」上。
 	await page.evaluate(async (id) => { await fetch("/api/sessions/" + id, { method: "DELETE" }); }, leakyFreshId);
 
-	// 事件路径盖完再盖快照恢复路径：刷新后摘要仍由后端快照带回前端（后端契约没动），
-	// 但界面照样一个字符都不渲染它。
+	// 刷新后摘要应仍由后端快照带回，并作为时间线节点显示。
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await page.waitForTimeout(1500);
-	await check("刷新后：快照里的摘要不落到提示条正文，也不变成一条助手气泡", async () => {
-		assert.equal(
-			await page.locator(".chat-compacted-body").count(),
-			0,
-			"刷新后提示条同样不该有摘要正文段落",
-		);
-		assert.ok(!(await findSummaryEcho(page)), "刷新后也不该有摘要气泡——摘要只用来判定这条会话压过");
+	await check("刷新后：压缩摘要仍显示在时间线记录中", async () => {
+		assert.equal(await page.locator('[data-testid="compaction-record"]').count(), 1, "刷新后摘要节点应保留");
+		assert.ok(await findSummaryEcho(page), "刷新后摘要正文应仍可见");
 	});
 
 	console.log("\n── Agent 专属对话页（模型选择 / 斜杠面板） ──────────");

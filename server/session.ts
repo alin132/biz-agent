@@ -6,15 +6,21 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { flowToolDescription, flowToolName, flowToolParameters } from "../src/core/flowTools.js";
 import { ToolRegistry } from "../src/core/registry.js";
-import { createBusinessAgent } from "../src/core/runtime.js";
-import type { BusinessAgent } from "../src/core/runtime.js";
+import { createBusinessRuntime } from "../src/core/runtime.js";
+import type { BusinessRuntime } from "../src/core/runtime.js";
 import { findSkill, SKILL_TOOL_NAME, skillToolDescription, skillToolParameters } from "../src/core/skill.js";
 import type { SkillDef } from "../src/core/skill.js";
-import { lastAssistantTextOf, runSubWorkflow } from "../src/core/subFlow.js";
+import { runSubWorkflow } from "../src/core/subFlow.js";
 import type { AuditEntry, ApprovalRequest, BizContext, ToolDef, WorkflowDef, WorkflowState } from "../src/core/types.js";
 import { WorkflowEngine } from "../src/core/workflow.js";
 import { createStore } from "../src/store/memory.js";
@@ -24,15 +30,37 @@ import type { AgentModelConfig, AgentMemoryConfig, AgentAdvancedConfig } from ".
 import { AgentError } from "./agents/service.js";
 import { createSimulatedRuntime } from "./demoScripts.js";
 import { getKb } from "./kb/index.js";
-import { KB_SEARCH_TOOL_NAME, createKbSearchTool } from "./kb/tool.js";
+import { KB_SEARCH_TOOL_NAME, createKbPiExtension, createKbSearchTool } from "./kb/tool.js";
 import { resolveLlm } from "./llm.js";
 import type { LlmRuntime } from "./llm.js";
 import { isMcpToolName } from "./mcp/names.js";
+import { createMcpExtension } from "@earendil-works/pi-coding-agent";
+import { createPiMcpTransport } from "./mcp/piTransport.js";
+import type { McpRegistry } from "./mcp/registry.js";
 import { estimateTokens, summarizeArgs } from "./observability/trace.js";
 import type { Observability } from "./observability/collector.js";
 import type { WorkflowRepo } from "./workflows.js";
+import { createPiBusinessRuntime, createPiBusinessSession } from "./piRuntimeAdapter.js";
+import type { PiRuntimeAdapter, PiSessionStats } from "./piRuntimeAdapter.js";
+import { createPiSessionHistory, derivePiSessionHistory, piSessionLeafIdOf, piSessionTreeView, serializePiSessionBranch, serializePiSessionHistory } from "./piSessionHistory.js";
 
 export type PermissionMode = "full" | "readonly";
+
+export class PiSessionError extends Error {
+	constructor(message: string, readonly status: number, readonly code: string) {
+		super(message);
+		this.name = "PiSessionError";
+	}
+}
+
+const PI_BUSINESS_STATE_TYPE = "biz-agent.runtime-state.v1";
+
+interface PiBusinessState {
+	workflowId: string;
+	activeSkillId: string | null;
+	workflowState: WorkflowState;
+	baseWorkflowState: WorkflowState;
+}
 
 export interface SessionAgent {
 	id: string;
@@ -43,6 +71,30 @@ export interface SessionAgent {
 	modelConfig?: AgentModelConfig;
 	memoryConfig?: AgentMemoryConfig;
 	advancedConfig?: AgentAdvancedConfig;
+}
+
+function piSkillsFromPlugins(db: Storage): Array<{ name: string; description: string; instructions: string; files?: Array<{ path: string; contentBase64: string }> }> {
+	const skills: Array<{ name: string; description: string; instructions: string; files?: Array<{ path: string; contentBase64: string }> }> = [];
+	for (const plugin of db.listPlugins()) {
+		if (!plugin.enabled || !plugin.id.startsWith("pi-skill-")) continue;
+		const manifest = plugin.manifest as { skills?: unknown };
+		if (!Array.isArray(manifest.skills)) continue;
+		for (const value of manifest.skills) {
+			if (!value || typeof value !== "object") continue;
+			const skill = value as Record<string, unknown>;
+			if (typeof skill.id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill.id)) continue;
+			if (typeof skill.description !== "string" || typeof skill.instructions !== "string" || !skill.instructions.trim()) continue;
+			const files = Array.isArray(skill.files) ? skill.files.flatMap((file) => {
+				if (!file || typeof file !== "object") return [];
+				const item = file as Record<string, unknown>;
+				return typeof item.path === "string" && typeof item.contentBase64 === "string"
+					? [{ path: item.path, contentBase64: item.contentBase64 }]
+					: [];
+			}) : [];
+			skills.push({ name: skill.id, description: skill.description, instructions: skill.instructions, ...(files.length ? { files } : {}) });
+		}
+	}
+	return skills;
 }
 
 /**
@@ -77,11 +129,14 @@ export type WireEvent =
 	| { type: "done"; text: string; traceId?: string }
 	| { type: "error"; message: string; traceId?: string }
 	| { type: "busy"; running: boolean }
+	| { type: "queue"; followUp: string[] }
 	| { type: "context_usage"; tokens: number; estimated: boolean }
+	| { type: "compacting"; automatic: boolean; at: number }
 	/** 上下文压缩完成：前端据此把消息列表换成「摘要 + 最近 N 条」 */
-	| { type: "compacted"; summary: string; before: number; after: number; kept: number; at: number }
+	| { type: "compacted"; summary: string; before: number; after: number; kept: number; automatic: boolean; at: number; transcript: TranscriptEntry[] }
 	/** 计划模式开关变化：前端据此显示/隐藏「计划模式」标记 */
-	| { type: "plan"; planMode: boolean; at: number };
+	| { type: "plan"; planMode: boolean; at: number }
+	| { type: "thinking_level"; thinkingLevel: ThinkingLevel; at: number };
 
 export interface StepView {
 	id: string;
@@ -126,6 +181,7 @@ export interface SessionView {
 	skills: SkillView[];
 	/** 当前加载的技能 id；null = 跑会话自己的流程 */
 	activeSkillId: string | null;
+	queuedFollowUps: string[];
 	/** 最近 20 条调用链 id（倒序，最新的在前）；每轮用户消息一条 */
 	traceIds: string[];
 	/**
@@ -134,8 +190,10 @@ export interface SessionView {
 	 * 会话级开关，落进 payload；前端据此显示标记并允许关闭。
 	 */
 	planMode: boolean;
+	thinkingLevel: ThinkingLevel;
 	/** 最近一次上下文压缩的时间戳；null = 还没压缩过 */
 	compactedAt: number | null;
+	compactedAutomatically: boolean;
 	/** 最近一次压缩生成的摘要原文（前端要能把它显示回消息列表里） */
 	summary: string | null;
 	/** 这条对话对应的 Agent id；null = 普通对话 */
@@ -237,6 +295,54 @@ function estimateContextMessages(messages: unknown, systemPrompt?: unknown): num
 	return estimateTokens(parts.join("\n"));
 }
 
+function transcriptText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } => Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string"))
+		.map((part) => part.text)
+		.join("");
+}
+
+function transcriptOfPiBranch(entries: ReturnType<ReturnType<typeof createPiSessionHistory>["getBranch"]>): TranscriptEntry[] {
+	const transcript: TranscriptEntry[] = [];
+	const tools = new Map<string, NonNullable<TranscriptEntry["tools"]>[number]>();
+	for (const entry of entries) {
+		if (entry.type === "compaction" || entry.type === "branch_summary") {
+			transcript.push({ role: "compaction", text: entry.summary, at: Date.parse(entry.timestamp), automatic: entry.type === "compaction" });
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		const message = entry.message as AgentMessage & { role: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: boolean };
+		const at = Date.parse(entry.timestamp) || Date.now();
+		if (message.role === "user") {
+			transcript.push({ role: "user", text: transcriptText(message.content), at, tools: [] });
+		} else if (message.role === "assistant") {
+			const userTurn = [...transcript].reverse().find((item) => item.role === "user");
+			if (userTurn && Array.isArray(message.content)) {
+				for (const part of message.content) {
+					if (!part || typeof part !== "object" || (part as { type?: unknown }).type !== "toolCall") continue;
+					const call = part as { id?: unknown; name?: unknown; arguments?: unknown };
+					if (typeof call.id !== "string" || typeof call.name !== "string") continue;
+					const item = { id: call.id, name: call.name, args: call.arguments ?? {} };
+					userTurn.tools ??= [];
+					userTurn.tools.push(item);
+					tools.set(call.id, item);
+				}
+			}
+			const text = transcriptText(message.content);
+			if (text) transcript.push({ role: "assistant", text, at });
+		} else if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+			const call = tools.get(message.toolCallId);
+			if (call) {
+				call.ok = !message.isError;
+				call.result = transcriptText(message.content);
+			}
+		}
+	}
+	return transcript;
+}
+
 /**
  * 规范化用户输入的会话标题：控制字符转空格、折叠连续空白、截断超长。
  * 规范化后为空返回 null —— 表示清除自定义标题，前端恢复「用首条消息派生」。
@@ -292,6 +398,7 @@ function viewFromRecord(record: PersistedSession, repo: WorkflowRepo): SessionVi
 	// 加载技能时会话的步骤条显示的是技能的步骤
 	const stepsOf = skill?.workflow ?? workflow;
 	const current = record.workflow?.stepIndex ?? 0;
+	const piState = piBranchState(record);
 	return {
 		id: record.id,
 		workflowId: record.workflowId,
@@ -303,8 +410,10 @@ function viewFromRecord(record: PersistedSession, repo: WorkflowRepo): SessionVi
 		contextTokens: Math.max(0, Math.round(record.contextTokens ?? estimateContextMessages(record.agentMessages))),
 		contextTokensEstimated: record.contextTokensEstimated ?? true,
 		planMode: record.planMode ?? false,
-		compactedAt: record.compactedAt ?? null,
-		summary: record.summary ?? null,
+		thinkingLevel: record.thinkingLevel ?? "medium",
+		compactedAt: piState ? (piState.compaction ? Date.parse(piState.compaction.timestamp) || null : null) : record.compactedAt ?? null,
+		compactedAutomatically: piState ? piState.compaction?.type === "compaction" : record.compactedAutomatically ?? false,
+		summary: piState ? piState.compaction?.summary ?? null : record.summary ?? null,
 		permissionMode: record.permissionMode,
 		title: record.title ?? null,
 		archived: record.archived ?? false,
@@ -312,9 +421,10 @@ function viewFromRecord(record: PersistedSession, repo: WorkflowRepo): SessionVi
 		steps: stepsFor(stepsOf, current),
 		current,
 		done: record.done,
-		tools: toolNamesFor(workflow, repo, skill),
+		tools: [...toolNamesFor(workflow, repo, skill), "tool_search"],
 		skills: skillViewsFor(repo, activeSkillId),
 		activeSkillId,
+		queuedFollowUps: [],
 		traceIds: [...(record.traceIds ?? [])],
 		agentId: record.agentId ?? null,
 		// 名字直接落库：恢复时只为了显示个名字就再查一次 Agent 不值得，而且 Agent 可能已被删
@@ -322,9 +432,81 @@ function viewFromRecord(record: PersistedSession, repo: WorkflowRepo): SessionVi
 		createdAt: record.createdAt,
 		updatedAt: record.updatedAt,
 		audit: record.audit ?? [],
-		transcript: record.transcript ?? [],
+		transcript: transcriptFromPersistedRecord(record),
 		restored: true,
 	};
+}
+
+/** Older records may have a model summary without a visible compaction entry. */
+function transcriptWithCompaction(record: PersistedSession): TranscriptEntry[] {
+	const transcript = record.transcript ?? [];
+	if (!record.summary || transcript.some((entry) => entry.role === "compaction")) return transcript;
+	return [
+		...transcript,
+		{ role: "compaction", text: record.summary, at: record.compactedAt ?? Date.now(), automatic: record.compactedAutomatically ?? false },
+	];
+}
+
+/** Pi's active branch is the conversation source; merge only business timing metadata from the legacy UI projection. */
+function transcriptFromPersistedRecord(record: PersistedSession): TranscriptEntry[] {
+	const legacy = transcriptWithCompaction(record);
+	if (!record.piSessionEntries?.length) return legacy;
+
+	const history = createPiSessionHistory({
+		sessionId: record.id,
+		piSessionEntries: record.piSessionEntries,
+		piSessionLeafId: record.piSessionLeafId,
+	});
+	const branch = history.getBranch();
+	if (!branch.some((entry) => entry.type === "message")) return legacy;
+
+	const legacyUsers = new Map<string, TranscriptEntry[]>();
+	const legacyCompactions = new Map<string, TranscriptEntry[]>();
+	const legacyTools = new Map<string, NonNullable<TranscriptEntry["tools"]>[number]>();
+	for (const entry of legacy) {
+		if (entry.role === "user") {
+			const queue = legacyUsers.get(entry.text) ?? [];
+			queue.push(entry);
+			legacyUsers.set(entry.text, queue);
+			for (const tool of entry.tools ?? []) legacyTools.set(tool.id, tool);
+		} else if (entry.role === "compaction") {
+			const queue = legacyCompactions.get(entry.text) ?? [];
+			queue.push(entry);
+			legacyCompactions.set(entry.text, queue);
+		}
+	}
+
+	return transcriptOfPiBranch(branch).map((entry) => {
+		if (entry.role === "user") {
+			const metadata = legacyUsers.get(entry.text)?.shift();
+			if (!metadata) return entry;
+			return {
+				...entry,
+				...(metadata.durationMs !== undefined ? { durationMs: metadata.durationMs } : {}),
+				tools: entry.tools?.map((tool) => {
+					const timing = legacyTools.get(tool.id);
+					return timing?.durationMs === undefined ? tool : { ...tool, durationMs: timing.durationMs };
+				}),
+			};
+		}
+		if (entry.role === "compaction") {
+			const metadata = legacyCompactions.get(entry.text)?.shift();
+			return metadata ? { ...entry, before: metadata.before, after: metadata.after, kept: metadata.kept } : entry;
+		}
+		return entry;
+	});
+}
+
+function piBranchState(record: PersistedSession) {
+	if (!record.piSessionEntries?.length) return null;
+	const history = createPiSessionHistory({
+		sessionId: record.id,
+		piSessionEntries: record.piSessionEntries,
+		piSessionLeafId: record.piSessionLeafId,
+	});
+	const branch = history.getBranch();
+	if (!branch.some((entry) => entry.type === "message")) return null;
+	return { compaction: [...branch].reverse().find((entry) => entry.type === "compaction" || entry.type === "branch_summary") ?? null };
 }
 
 /**
@@ -413,48 +595,6 @@ export function planModePromptOf(enabled: boolean): string {
 	].join("\n");
 }
 
-/** 压缩后至少保留多少条最近消息（防止把本轮对话也压没了）。 */
-export const COMPACT_KEEP_MIN = 2;
-
-/**
- * 压缩时保留的最近消息条数：按当前消息数取一个"够用但不多"的窗口。
- *
- * 固定保留 6 条对短会话没意义（还没几条就压不了），对长会话又留太少；
- * 这里取 min(8, max(2, floor(总数 / 3)))，让"被压掉的"永远多于"保留的"。
- */
-export function compactKeepCount(total: number): number {
-	return Math.min(8, Math.max(COMPACT_KEEP_MIN, Math.floor(total / 3)));
-}
-
-/** 把一条 AgentMessage 渲染成用于总结的纯文本行（摘要模型只吃文本，不认工具块）。 */
-function messageForSummary(message: unknown): string {
-	if (!message || typeof message !== "object") {
-		return "";
-	}
-	const typed = message as { role?: string; content?: unknown };
-	const role = typed.role === "user" ? "用户" : typed.role === "assistant" ? "助手" : "系统";
-	if (typeof typed.content === "string") {
-		return role + "：" + typed.content;
-	}
-	if (!Array.isArray(typed.content)) {
-		return "";
-	}
-	const parts: string[] = [];
-	for (const block of typed.content) {
-		if (!block || typeof block !== "object") {
-			continue;
-		}
-		const item = block as { type?: string; text?: unknown; name?: unknown; input?: unknown };
-		if ((item.type === "text" || item.type === "thinking") && typeof item.text === "string" && item.text.trim()) {
-			parts.push(item.text.trim());
-		} else if (item.type === "tool_use" || item.type === "tool-call") {
-			// 工具调用只记名字与参数摘要：结果可能上万字，塞进总结请求纯属浪费
-			parts.push("[调用工具 " + String(item.name ?? "") + " 参数 " + summarizeArgs(item.input) + "]");
-		}
-	}
-	return parts.length > 0 ? role + "：" + parts.join("\n") : "";
-}
-
 /** 换技能后仍然保留的工具：技能加载器 + 知识库检索 + 其他流程的 flow_xxx + MCP 工具。 */
 function keepToolNamesFor(workflow: WorkflowDef, repo: WorkflowRepo): string[] {
 	const flowTools = repo
@@ -508,23 +648,28 @@ export class Session {
 	modelKey: string | null = null;
 	readonly createdAt: number;
 	readonly restored: boolean;
+	readonly internalGroupSession: boolean;
 	readonly auditLog: AuditEntry[] = [];
 	readonly transcript: TranscriptEntry[] = [];
 
 	private readonly db: Storage;
 	private readonly repo: WorkflowRepo;
-	/** 换模型/切计划模式/压缩都会重建，所以不是 readonly（见 rebuildAgent） */
-	private agent: Agent;
-	/** 运行时装配结果（技能加载 / 退出要改它的工具集与状态机） */
-	private built!: BusinessAgent;
+	/** Pi Agent/AgentSession 生命周期由 piRuntime 持有。 */
+	private built!: BusinessRuntime;
 	private unsubscribeAgent?: () => void;
-	private runtime!: { model: Model<any>; streamFn: StreamFn };
+	private piRuntime: PiRuntimeAdapter | null = null;
+	private piResourceReload: Promise<{ session: SessionView; piSkills: string[] }> | null = null;
+	private readonly piHistory: ReturnType<typeof createPiSessionHistory>;
+	private compactionStartedAt = 0;
+	private compactionMessagesBefore = 0;
+	private runtime!: { model: Model<any>; streamFn: StreamFn; modelRuntime?: LlmRuntime["modelRuntime"] };
 	private readonly agentConfig: NonNullable<PersistedSession["agentConfig"]>;
 	private readonly ctx: BizContext;
 	private readonly registry: ToolRegistry;
 	/** 换模型要重建 agent，靠它重新解析运行时（见 setModel） */
 	private readonly resolveModel: SessionModelResolver | undefined;
 	private readonly resolveModelKeyFn: SessionModelKeyResolver | undefined;
+	private readonly mcpRegistry: McpRegistry | undefined;
 	/** 当前暴露给模型的工具名；加载/退出技能会整体更换 */
 	private toolNames: string[];
 	/** 可加载的技能目录（内置 + 自定义流程，构造时快照，`refreshSkills()` 可就地刷新） */
@@ -538,9 +683,12 @@ export class Session {
 	private archived = false;
 	/** 计划模式开关：会话级，落进 payload（见 planModePromptOf） */
 	private planMode = false;
+	private thinkingLevel: ThinkingLevel = "medium";
+	private autoCompactionEnabled = true;
 	/** 最近一次压缩的时间戳与摘要（进视图，前端据此渲染「已压缩」卡片） */
 	private compactedAt: number | null = null;
 	private summary: string | null = null;
+	private compactedAutomatically = false;
 	private contextTokens = 0;
 	private contextTokensEstimated = true;
 	private currentTurnEntry: TranscriptEntry | null = null;
@@ -549,6 +697,10 @@ export class Session {
 	private readonly pendingApprovals = new Map<string, (approved: boolean) => void>();
 	private approvalSeq = 0;
 	private running = false;
+	private compacting = false;
+	private stopRequested = false;
+	private queuedFollowUps: string[] = [];
+	private disposed = false;
 	private updatedAt: number;
 	/** P9 调用链采集器：不传时行为与 P9 之前完全一致（终端 demo / 单元测试） */
 	private readonly obs?: Observability;
@@ -591,10 +743,13 @@ export class Session {
 			db: Storage;
 			repo: WorkflowRepo;
 			modelId?: string;
+			internalGroupSession?: boolean;
 			restore?: PersistedSession;
+			newlyDerived?: boolean;
 			resolveModel?: SessionModelResolver;
 			/** 把 modelId / 模型行 id 归一成模型行 id（会话级模型要记住「选的是哪一行」） */
 			resolveModelKey?: SessionModelKeyResolver;
+			mcpRegistry?: McpRegistry;
 			/** P9：调用链采集器（可选） */
 			observability?: Observability;
 			/** P9：建会话的用户 id（落进 payload，监控据此收窄权限） */
@@ -615,6 +770,7 @@ export class Session {
 		this.obs = options.observability;
 		this.resolveModel = options.resolveModel;
 		this.resolveModelKeyFn = options.resolveModelKey;
+		this.mcpRegistry = options.mcpRegistry;
 		const restored = options.restore;
 		const resolveModelKey = options.resolveModelKey;
 		this.createdBy = restored?.createdBy ?? options.ownerId ?? null;
@@ -628,6 +784,19 @@ export class Session {
 			memoryConfig: options.agent?.memoryConfig ?? {},
 			advancedConfig: options.agent?.advancedConfig ?? {},
 		});
+		this.autoCompactionEnabled = restored?.piAutoCompactionEnabled ?? true;
+		if (!restored && !options.agent) {
+			const stored = this.db.getModelSetting("pi.settings.v1");
+			if (stored) {
+				try {
+					const settings = JSON.parse(stored) as { compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number } };
+					this.agentConfig.memoryConfig = { reserveTokens: settings.compaction?.reserveTokens, keepRecentTokens: settings.compaction?.keepRecentTokens };
+					this.autoCompactionEnabled = settings.compaction?.enabled ?? true;
+				} catch {
+					throw new Error("已保存的 Pi 压缩设置格式无效");
+				}
+			}
+		}
 		if (restored?.traceIds) {
 			this.traceIds.push(...restored.traceIds.slice(0, 20));
 		}
@@ -635,9 +804,17 @@ export class Session {
 	this.contextTokensEstimated = restored?.contextTokensEstimated ?? true;
 
 		this.id = restored?.id ?? randomUUID().slice(0, 8);
+		this.piHistory = createPiSessionHistory({
+			sessionId: this.id,
+			cwd: process.cwd(),
+			agentMessages: restored?.agentMessages,
+			piSessionEntries: restored?.piSessionEntries,
+			piSessionLeafId: restored?.piSessionLeafId,
+		});
 		this.createdAt = restored?.createdAt ?? Date.now();
 		this.updatedAt = restored?.updatedAt ?? this.createdAt;
-		this.restored = Boolean(restored);
+		this.restored = Boolean(restored && !options.newlyDerived);
+		this.internalGroupSession = restored?.internalGroupSession ?? options.internalGroupSession ?? false;
 
 		this.store = restored?.store ?? createStore();
 		this.engine = new WorkflowEngine(workflow, restored?.workflow);
@@ -694,9 +871,8 @@ export class Session {
 		this.mode = live ? "live" : "simulated";
 		this.modeLabel = live?.label ?? "模拟模型";
 		this.modelId = live?.modelId ?? null;
-		// 模型行 id 只在「这条会话确实用着库里某条模型」时才算数：
-		// 模拟模式下没有真实模型，记下来只会让界面显示一个并没在答话的模型名。
-		this.modelKey = live ? (resolveModelKey?.(preferredModel) ?? null) : null;
+		// 即使当前没有真实运行时，也保留用户选中的模型行；mode 仍明确表示回复来自模拟模型。
+		this.modelKey = resolveModelKey?.(preferredModel) ?? null;
 
 		// 流程即工具：把其他流程也装成工具，由模型自己挑；不装自己，天然不递归
 		const flowTools = this.buildFlowTools(options.repo);
@@ -710,10 +886,13 @@ export class Session {
 			this.archived = restored.archived ?? false;
 			// 计划模式与压缩结果都要能跨刷新/重启恢复：否则用户会以为开关自己关了、摘要凭空消失
 			this.planMode = restored.planMode ?? false;
-			this.compactedAt = restored.compactedAt ?? null;
-			this.summary = restored.summary ?? null;
+			this.thinkingLevel = restored.thinkingLevel ?? "medium";
+			const piState = piBranchState(restored);
+			this.compactedAt = piState ? (piState.compaction ? Date.parse(piState.compaction.timestamp) || null : null) : restored.compactedAt ?? null;
+			this.summary = piState ? piState.compaction?.summary ?? null : restored.summary ?? null;
+			this.compactedAutomatically = piState ? piState.compaction?.type === "compaction" : restored.compactedAutomatically ?? false;
 			this.auditLog.push(...(restored.audit ?? []));
-			this.transcript.push(...(restored.transcript ?? []));
+			this.transcript.push(...transcriptFromPersistedRecord(restored));
 		}
 
 		const ctx: BizContext = {
@@ -731,9 +910,7 @@ export class Session {
 		this.ctx = ctx;
 		this.applyPermissionMode(this.permissionMode);
 
-		const built = this.createAgent(runtime, restored?.agentMessages as AgentMessage[] | undefined, restored?.baseWorkflowState);
-		this.agent = built.agent;
-		this.built = built;
+		this.built = this.createBusinessRuntime(runtime, restored?.baseWorkflowState);
 
 		// 恢复上次加载的技能：技能进度也存在 payload 里（workflow 字段就是当时的状态机）
 		if (restored?.activeSkillId) {
@@ -752,16 +929,21 @@ export class Session {
 			this.applyAgentSkill(options.agent?.skillIds ?? []);
 		}
 
-		if (!restored) {
+		if (!restored || options.newlyDerived) {
 			this.persist();
 		}
 
-		this.bindAgentEvents();
 	}
 
 	private bindAgentEvents(): void {
 		this.unsubscribeAgent?.();
-		this.unsubscribeAgent = this.agent.subscribe((event) => {
+		this.unsubscribeAgent = this.piRuntime?.subscribe((event) => {
+			this.handlePiSessionEvent(event);
+			if (event.type === "queue_update") {
+				this.queuedFollowUps = [...event.followUp];
+				this.emit({ type: "queue", followUp: [...this.queuedFollowUps] });
+				this.persist();
+			}
 			switch (event.type) {
 				case "message_update":
 					if (event.assistantMessageEvent.type === "text_delta") {
@@ -777,29 +959,124 @@ export class Session {
 					break;
 				case "message_end":
 					// 每轮 LLM 调用结束：模型名 + token（真实 usage 优先，否则按内容估算）+ 耗时
-					this.recordLlmEvent(event.message);
+					if (event.message.role === "assistant") this.recordLlmEvent(event.message);
+					else this.persist();
 					break;
 				case "tool_execution_start":
 					this.toolArgs.set(event.toolCallId, event.args);
-					this.currentTurnEntry?.tools?.push({ id: event.toolCallId, name: event.toolName, args: event.args });
-					this.emit({ type: "tool_start", id: event.toolCallId, name: event.toolName, args: event.args });
+					this.currentTurnEntry?.tools?.push({ id: event.toolCallId, name: this.piRuntime?.canonicalToolName(event.toolName) ?? event.toolName, args: event.args });
+					this.emit({ type: "tool_start", id: event.toolCallId, name: this.piRuntime?.canonicalToolName(event.toolName) ?? event.toolName, args: event.args });
 					break;
 				case "tool_execution_end":
-					this.recordToolEvent(event.toolCallId, event.toolName, !event.isError, event.durationMs, toolResultText(event.result));
+					this.recordToolEvent(event.toolCallId, this.piRuntime?.canonicalToolName(event.toolName) ?? event.toolName, !event.isError, event.durationMs, toolResultText(event.result));
 					this.emit({
 						type: "tool_end",
 						id: event.toolCallId,
-						name: event.toolName,
+						name: this.piRuntime?.canonicalToolName(event.toolName) ?? event.toolName,
 						ok: !event.isError,
 						result: toolResultText(event.result),
 						durationMs: event.durationMs,
 					});
 					this.emitWorkflow();
+					this.persist();
 					break;
 				default:
 					break;
 			}
 		});
+	}
+
+	private async ensurePiRuntime(): Promise<PiRuntimeAdapter> {
+		if (this.piRuntime) return this.piRuntime;
+		const runtime = await createPiBusinessRuntime({
+			business: this.built,
+			registry: this.registry,
+			ctx: this.ctx,
+			model: this.runtime.model,
+			streamFn: this.runtime.streamFn,
+			messages: this.piHistory.buildSessionContext().messages as AgentMessage[],
+			sessionManager: this.piHistory,
+			extensions: [
+				createKbPiExtension({
+					getActiveSkillId: () => this.activeSkillId,
+					getAgentKbIds: () => this.agentKbIds,
+				}),
+				createMcpExtension({
+					loadConfig: () => this.mcpRegistry?.piConfigSnapshot() ?? { servers: [], errors: [] },
+					createTransport: createPiMcpTransport,
+				}),
+			],
+			nativeToolNames: [KB_SEARCH_TOOL_NAME, ...this.registry.all().filter((tool) => isMcpToolName(tool.name)).map((tool) => tool.name)],
+			toolNameAliases: this.mcpRegistry?.piToolAliases() ?? {},
+			isToolAvailable: (name) => !isMcpToolName(name) || (this.mcpRegistry?.isToolEnabled(name) ?? false),
+			cwd: process.cwd(),
+			reserveTokens: this.agentConfig.memoryConfig.reserveTokens,
+			keepRecentTokens: this.agentConfig.memoryConfig.keepRecentTokens,
+			autoCompactionEnabled: this.autoCompactionEnabled,
+			modelRuntime: this.liveRuntimeFor()?.modelRuntime,
+			piSkills: piSkillsFromPlugins(this.db),
+			alwaysActiveToolNames: ["tool_search"],
+			skill: {
+				name: SKILL_TOOL_NAME,
+				description: () => skillToolDescription(this.refreshSkills()),
+				contextMessage: () => {
+					const active = this.built.skillContext();
+					return active ? {
+						role: "user",
+						timestamp: Date.now(),
+						content: `当前技能「${active.name}」的作业指导书：\n\n${active.instructions}`,
+					} : null;
+				},
+				load: (skillId) => {
+					const skill = this.activateSkill(skillId);
+					return `已加载技能「${skill.name}」（${skill.id}）。接下来按下面的说明执行：\n\n${skill.instructions}`;
+				},
+			},
+			workflow: {
+				maxTurns: this.agentConfig.advancedConfig.maxIters ?? 12,
+				startRun: this.built.startRun,
+				finishTurn: this.built.finishTurn,
+				nextPrompt: this.built.nextPrompt,
+				limitReached: this.built.limitReached,
+				onStateChange: () => this.persistPiBusinessState(),
+			},
+		});
+		this.piRuntime = runtime;
+		this.bindAgentEvents();
+		runtime.setActiveToolsByName(this.built.toolNames());
+		runtime.setThinkingLevel?.(this.thinkingLevel);
+		return runtime;
+	}
+
+	private handlePiSessionEvent(event: AgentSessionEvent): void {
+		if (event.type === "compaction_start") {
+			this.compacting = true;
+			this.compactionStartedAt = Date.now();
+			this.compactionMessagesBefore = this.piHistory.buildSessionContext().messages.length;
+			this.emit({ type: "compacting", automatic: event.reason !== "manual", at: this.compactionStartedAt });
+			return;
+		}
+		if (event.type !== "compaction_end") return;
+
+		this.compacting = false;
+		if (!event.result) {
+			// Automatic failures are finalized by Pi's prompt/overflow recovery lifecycle;
+			// emitting an error here could be followed by a successful done for the same turn.
+			return;
+		}
+		const at = Date.now();
+		const summary = event.result.summary;
+		const messages = this.piHistory.buildSessionContext().messages;
+		const before = this.compactionMessagesBefore;
+		const after = messages.length;
+		const kept = Math.max(0, after - 1);
+		const automatic = event.reason !== "manual";
+		this.compactedAt = at;
+		this.summary = summary;
+		this.compactedAutomatically = automatic;
+		this.transcript.push({ role: "compaction", text: summary, at, before, after, kept, automatic });
+		this.persist();
+		this.emit({ type: "compacted", summary, before, after, kept, automatic, at, transcript: [...this.transcript] });
 	}
 
 	subscribe(listener: (event: WireEvent) => void): () => void {
@@ -827,23 +1104,24 @@ export class Session {
 
 	/** 从后往前找最后一条助手文本；子 agent 取结果也用它。 */
 	private lastAssistantText(): string {
-		return lastAssistantTextOf(this.agent);
+		return this.piRuntime?.lastAssistantText() ?? "";
 	}
 	private lastAssistantMessage(): { stopReason?: string; errorMessage?: string } | undefined {
-		const messages = this.agent.state.messages;
-		for (let index = messages.length - 1; index >= 0; index--) {
-			const message = messages[index]!;
-			if (message.role === "assistant") {
-				return message as { stopReason?: string; errorMessage?: string };
-			}
-		}
-		return undefined;
+		return this.piRuntime?.lastAssistantMessage() as { stopReason?: string; errorMessage?: string } | undefined;
+	}
+
+	private runtimeMessages(): AgentMessage[] {
+		return this.piRuntime?.messages() ?? this.piHistory.buildSessionContext().messages as AgentMessage[];
+	}
+
+	private runtimeSystemPrompt(): string {
+		return this.piRuntime?.systemPrompt() ?? this.built.systemPrompt;
 	}
 
 	private refreshEstimatedContext(): void {
 		this.contextTokens = Math.max(0, Math.round(estimateContextMessages(
-			this.agent.state.messages,
-			this.agent.state.systemPrompt,
+			this.runtimeMessages(),
+			this.runtimeSystemPrompt(),
 		)));
 		this.contextTokensEstimated = true;
 		this.emit({ type: "context_usage", tokens: this.contextTokens, estimated: true });
@@ -877,8 +1155,8 @@ export class Session {
 			this.contextTokensEstimated = false;
 		} else {
 			this.contextTokens = Math.max(0, Math.round(estimateContextMessages(
-				this.agent.state.messages,
-				this.agent.state.systemPrompt,
+				this.runtimeMessages(),
+				this.runtimeSystemPrompt(),
 			)));
 			this.contextTokensEstimated = true;
 		}
@@ -964,10 +1242,18 @@ export class Session {
 							workflow: target,
 							store: this.store,
 							ctx: this.ctx,
-							model: this.runtime.model,
-							streamFn: this.runtime.streamFn,
 							maxTurns: this.agentConfig.advancedConfig.maxIters,
 							task: String(args.task ?? target.name),
+							createSession: (input) => createPiBusinessSession({
+								...input,
+								model: this.runtime.model,
+								streamFn: this.runtime.streamFn,
+								sessionManager: createPiSessionHistory({ sessionId: `flow-${randomUUID()}` }),
+								cwd: process.cwd(),
+								reserveTokens: this.agentConfig.memoryConfig.reserveTokens,
+								keepRecentTokens: this.agentConfig.memoryConfig.keepRecentTokens,
+								modelRuntime: this.liveRuntimeFor()?.modelRuntime,
+							}),
 						});
 						const status = result.done ? "流程走完" : "提前结束";
 						return { content: `「${target.name}」执行完成（${status}）：\n${result.text || "（没有产出文本）"}` };
@@ -983,7 +1269,7 @@ export class Session {
 	 * `use_skill` 工具：由模型自己决定加载哪条技能。
 	 *
 	 * 工具结果就是技能正文——进上下文等于把"作业指导书"交给模型；
-	 * 真正的工具集切换在 `activateSkill` 里（改 agent.state.tools，不重建 agent）。
+	 * 真正的活动工具集由 Pi AgentSession 切换；会话层只提供业务技能定义与权限边界。
 	 */
 	private buildSkillTool(): ToolDef {
 		const skills = this.repo.skills();
@@ -1059,6 +1345,9 @@ export class Session {
 	 * 控制台右上角"用这个技能"与模型的 `use_skill` 工具走的是同一条路径。
 	 */
 	activateSkill(skillId: string): SkillDef {
+		if (this.compacting) {
+			throw new Error("这条对话正在压缩上下文，等它完成后再切换技能");
+		}
 		// 先刷新目录：技能可能是会话开着的时候才建的
 		const skill = findSkill(this.refreshSkills(), skillId);
 		if (!skill) {
@@ -1068,6 +1357,7 @@ export class Session {
 		const applied = this.built.activateSkill(skill);
 		this.activeSkillId = skill.id;
 		this.toolNames = this.built.toolNames();
+		this.piRuntime?.setActiveToolsByName(this.toolNames);
 		this.applyPermissionMode(this.permissionMode);
 		this.refreshEstimatedContext();
 		this.emit({ type: "skill", skillId: skill.id, name: skill.name, description: skill.description });
@@ -1078,12 +1368,15 @@ export class Session {
 			payload: { action: "load", name: skill.name },
 		});
 		this.emitWorkflow();
-		this.persist();
+		this.persistPiBusinessState();
 		return applied;
 	}
 
 	/** 退出技能，回到会话自己的流程（进度按加载前的快照恢复）。 */
 	clearSkill(): void {
+		if (this.compacting) {
+			throw new Error("这条对话正在压缩上下文，等它完成后再切换技能");
+		}
 		if (this.activeSkillId === null) {
 			return;
 		}
@@ -1091,6 +1384,7 @@ export class Session {
 		this.built.clearSkill();
 		this.activeSkillId = null;
 		this.toolNames = this.built.toolNames();
+		this.piRuntime?.setActiveToolsByName(this.toolNames);
 		this.applyPermissionMode(this.permissionMode);
 		this.refreshEstimatedContext();
 		this.emit({ type: "skill", skillId: null, name: this.workflow.name, description: "已退出技能，回到会话自己的流程" });
@@ -1101,7 +1395,63 @@ export class Session {
 			payload: { action: "exit" },
 		});
 		this.emitWorkflow();
+		this.persistPiBusinessState();
+	}
+
+	private piBusinessState(): PiBusinessState {
+		return {
+			workflowId: this.engine.definition.id,
+			activeSkillId: this.activeSkillId,
+			workflowState: structuredClone(this.engine.state),
+			baseWorkflowState: this.built.baseWorkflowState(),
+		};
+	}
+
+	private persistPiBusinessState(): void {
+		const state = this.piBusinessState();
+		const previous = [...this.piHistory.getBranch()].reverse().find((entry) =>
+			entry.type === "custom" && entry.customType === PI_BUSINESS_STATE_TYPE,
+		);
+		if (previous?.type === "custom" && JSON.stringify(previous.data) === JSON.stringify(state)) {
+			this.persist();
+			return;
+		}
+		this.piHistory.appendCustomEntry(PI_BUSINESS_STATE_TYPE, state);
 		this.persist();
+	}
+
+	private restorePiBusinessState(): void {
+		const branch = this.piHistory.getBranch();
+		const hasAnyState = this.piHistory.getEntries().some((entry) =>
+			entry.type === "custom" && entry.customType === PI_BUSINESS_STATE_TYPE,
+		);
+		const saved = [...branch].reverse().find((entry) =>
+			entry.type === "custom" && entry.customType === PI_BUSINESS_STATE_TYPE,
+		);
+		if (!hasAnyState) return;
+
+		const data = saved?.type === "custom" ? saved.data as Partial<PiBusinessState> : undefined;
+		const skill = data?.activeSkillId ? findSkill(this.refreshSkills(), data.activeSkillId) : undefined;
+		const workflow = skill?.workflow ?? this.workflow;
+		const initialState: WorkflowState = { workflowId: this.workflow.id, stepIndex: 0, completed: [], calls: [] };
+		const baseState = data?.baseWorkflowState?.workflowId === this.workflow.id
+			? structuredClone(data.baseWorkflowState)
+			: initialState;
+		const activeState = data?.workflowId === workflow.id && data.workflowState?.workflowId === workflow.id
+			? structuredClone(data.workflowState)
+			: workflow.id === this.workflow.id ? baseState : { workflowId: workflow.id, stepIndex: 0, completed: [], calls: [] };
+
+		this.engine.reset(this.workflow, baseState);
+		this.built = this.createBusinessRuntime(this.runtime, baseState);
+		this.activeSkillId = null;
+		if (skill) {
+			this.built.activateSkill(skill);
+			this.activeSkillId = skill.id;
+		}
+		this.engine.reset(workflow, activeState);
+		this.toolNames = this.built.toolNames();
+		this.piRuntime?.setActiveToolsByName(this.toolNames);
+		this.applyPermissionMode(this.permissionMode);
 	}
 
 	/** 只读观察：技能被删时 Hub 要找出"还挂着这条技能"的会话。 */
@@ -1183,7 +1533,8 @@ export class Session {
 			this.ctx.allow = this.registry
 				.select(this.toolNames)
 				.filter((tool) => tool.risk === "low")
-				.map((tool) => tool.name);
+				.map((tool) => tool.name)
+				.concat("tool_search");
 		}
 	}
 
@@ -1205,6 +1556,7 @@ export class Session {
 	 */
 	setTitle(title: string): string | null {
 		this.title = normalizeTitle(title);
+		this.piHistory.appendSessionInfo(this.title ?? "");
 		this.persist();
 		return this.title;
 	}
@@ -1219,18 +1571,12 @@ export class Session {
 		return this.archived;
 	}
 
-	/**
-	 * 按一份运行时装配 agent（构造与换模型共用）。
-	 *
-	 * 会话里跟「当前这份运行时」有关的东西都在这里落地：模型、三段运行时提示片段、工具集。
-	 * `messages` 传 undefined = 不带历史（新会话）；换模型时传历史，对话不中断。
-	 */
-	private createAgent(
-		runtime: { model: LlmRuntime["model"]; streamFn: LlmRuntime["streamFn"] },
-		messages: AgentMessage[] | undefined,
+	/** Build business policy and model request options; Pi owns Agent construction. */
+	private createBusinessRuntime(
+		runtime: { model: LlmRuntime["model"]; streamFn: LlmRuntime["streamFn"]; modelRuntime?: LlmRuntime["modelRuntime"] },
 		baseWorkflowState: WorkflowState | undefined = this.built?.baseWorkflowState(),
-	): BusinessAgent {
-		const { modelConfig, memoryConfig, advancedConfig } = this.agentConfig;
+	): BusinessRuntime {
+		const { modelConfig, advancedConfig } = this.agentConfig;
 		const streamFn: StreamFn = (model, context, options) => runtime.streamFn(model, context, {
 			...options,
 			...(modelConfig.temperature !== undefined ? { temperature: modelConfig.temperature } : {}),
@@ -1248,18 +1594,13 @@ export class Session {
 				return body;
 			},
 		});
-		this.runtime = { model: runtime.model, streamFn };
-		return createBusinessAgent({
+		this.runtime = { model: runtime.model, streamFn, modelRuntime: runtime.modelRuntime };
+		return createBusinessRuntime({
 			workflow: this.workflow,
 			registry: this.registry,
-			ctx: this.ctx,
-			model: runtime.model,
-			streamFn,
 			engine: this.engine,
 			baseWorkflowState,
 			maxTurns: advancedConfig.maxIters ?? 12,
-			maxContextRounds: memoryConfig.shortTermRounds ?? (memoryConfig.overflowStrategy ? 10 : undefined),
-			messages,
 			toolNames: this.toolNames,
 			skills: this.skills,
 			keepToolNames: keepToolNamesFor(this.workflow, this.repo),
@@ -1282,10 +1623,9 @@ export class Session {
 	 * 为什么不能只改全局：全局 current 回答的是「新建会话用哪条模型」，一旦被当成「切换模型」用，
 	 * 用户在这条对话里点一下，别的会话下一轮也跟着换——那是串台，不是切换。
 	 *
-	 * 实现上必须**重建 agent**（与换技能不同）：技能只换工具集，而模型是 Agent 的构造参数
-	 * （`initialState.model` / `streamFn`），就地改字段的话模型下一次请求用的还是老那套。
-	 * 重建时把 `agent.state.messages` 交回去，历史对话一条不丢；技能按原样重放；
-	 * 审批挂起挂在会话对象上（不在 agent 里），也不受重建影响。
+	 * Pi 原生模型运行时可直接切换；其它模型通过更新业务运行配置并让 Pi adapter 懒重建会话。
+	 * 历史由 Pi SessionManager 持有，切换模型不会复制 transcript；技能按原样重放。
+	 * 审批挂起挂在会话对象上，也不受重建影响。
 	 *
 	 * 上一轮还在跑时拒绝：半路换模型会让同一轮里前后两次请求用不同模型。
 	 */
@@ -1293,121 +1633,124 @@ export class Session {
 	/**
 	 * 计划模式开关：会话级，落进 payload 才能跨重启保持。
 	 *
-	 * 为什么必须重建 agent：那段约束是拼进**系统提示**的（见 createAgent 的 systemPromptExtras），
-	 * 而 AgentState.systemPrompt 是只读的构造产物——就地改字段下一次请求用的还是老提示。
-	 * 历史消息交回去，对话不中断；审批与 SSE 挂在会话对象上，不受重建影响。
+	 * 计划约束属于业务运行时 system prompt；变更后释放当前 Pi runtime，下一轮由 Pi adapter 用同一历史树重建。
+	 * 审批与 SSE 挂在会话对象上，不受重建影响。
 	 */
 	setPlanMode(enabled: boolean): SessionView {
 		if (this.running) {
 			throw new Error("这条对话正在执行中，等它跑完再切换计划模式");
 		}
 		this.planMode = enabled;
-		this.rebuildAgent();
+		this.rebuildBusinessRuntime();
 		this.emit({ type: "plan", planMode: this.planMode, at: Date.now() });
 		this.persist();
 		return this.view();
 	}
 
-	/**
-	 * 压缩上下文：把旧消息交给当前模型总结成一段，历史替换成「摘要 + 最近 N 条」。
-	 *
-	 * 为什么用一条 assistant 消息承载摘要而不是 system：摘要属于「对话里发生过什么」，
-	 * 是要跟着历史往后走的内容；塞进 system 会被当成恒定指令，也可能与流程提示打架。
-	 *
-	 * 压缩后重建 agent（摘要 + 保留的消息就是新历史）并把摘要落库，
-	 * 否则刷新一次历史又变回压缩前的模样。
-	 */
-	async compact(): Promise<{ before: number; after: number; kept: number; summary: string }> {
-		// before/after/kept 都是**条数**（不是消息数组）：事件与返回值只上报规模
+	async setThinkingLevel(level: ThinkingLevel): Promise<SessionView> {
+		const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+		if (!levels.includes(level)) throw new Error("不支持的推理强度");
+		if (this.running) throw new Error("这条对话正在执行中，等它跑完再调整推理强度");
+		const pi = await this.ensurePiRuntime();
+		if (this.disposed) throw new Error("会话已销毁");
+		if (!pi.setThinkingLevel) throw new Error("当前 Pi 会话不支持调整推理强度");
+		pi.setThinkingLevel(level);
+		this.thinkingLevel = level;
+		this.persist();
+		this.emit({ type: "thinking_level", thinkingLevel: level, at: Date.now() });
+		return this.view();
+	}
+
+	async piStats(): Promise<PiSessionStats> {
+		const pi = await this.ensurePiRuntime();
+		const { userMessages, assistantMessages, toolCalls, toolResults, totalMessages, tokens, cost, contextUsage } = pi.stats();
+		return { userMessages, assistantMessages, toolCalls, toolResults, totalMessages, tokens, cost, ...(contextUsage ? { contextUsage } : {}) };
+	}
+
+	piTree() {
+		return piSessionTreeView(this.piHistory);
+	}
+
+	derivePiHistory(mode: "fork" | "clone", sessionId: string, entryId?: string) {
+		if (this.running || this.pendingApprovals.size > 0) {
+			throw new PiSessionError("对话正在执行或等待审批，暂时不能创建 Pi 分支", 409, "pi_session_derivation_busy");
+		}
+		try {
+			return derivePiSessionHistory(this.piHistory, mode, sessionId, entryId);
+		} catch (error) {
+			throw new PiSessionError(error instanceof Error ? error.message : String(error), 400, "pi_session_derivation_invalid");
+		}
+	}
+
+	async navigatePiTree(entryId: string): Promise<{ tree: ReturnType<Session["piTree"]>; editorText?: string; session: SessionView }> {
+		if (this.running || this.pendingApprovals.size > 0) {
+			throw new PiSessionError("对话正在执行或等待审批，暂时不能切换 Pi 分支", 409, "pi_tree_navigation_busy");
+		}
+		if (!this.piHistory.getEntry(entryId)) {
+			throw new PiSessionError("Pi 会话节点不存在", 404, "pi_tree_entry_not_found");
+		}
+		const pi = await this.ensurePiRuntime();
+		const result = await pi.navigateTree(entryId);
+		if (result.cancelled) throw new PiSessionError("Pi 分支切换已取消", 409, "pi_tree_navigation_cancelled");
+		this.restorePiBusinessState();
+		this.transcript.splice(0, this.transcript.length, ...transcriptOfPiBranch(this.piHistory.getBranch()));
+		const latestSummary = [...this.piHistory.getBranch()].reverse().find((entry) => entry.type === "compaction" || entry.type === "branch_summary");
+		this.summary = latestSummary?.summary ?? null;
+		this.compactedAt = latestSummary ? Date.parse(latestSummary.timestamp) || null : null;
+		this.compactedAutomatically = latestSummary?.type === "compaction";
+		this.refreshEstimatedContext();
+		this.persist();
+		return { tree: this.piTree(), ...(result.editorText !== undefined ? { editorText: result.editorText } : {}), session: this.view() };
+	}
+
+	isRunning(): boolean {
+		return this.running;
+	}
+
+	setPiTreeLabel(entryId: string, label: string | null) {
+		if (this.running) throw new Error("这条对话正在执行中，等它完成后再编辑会话标签");
+		if (typeof entryId !== "string" || !this.piHistory.getEntry(entryId)) {
+			throw new Error("Pi 会话节点不存在");
+		}
+		if (label !== null && typeof label !== "string") throw new Error("标签必须是文本或空值");
+		const normalized = label?.trim() ?? "";
+		if (normalized.length > 80) throw new Error("标签不能超过 80 个字符");
+		this.piHistory.appendLabelChange(entryId, normalized || undefined);
+		this.persist();
+		return this.piTree();
+	}
+
+	/** Run Pi's native manual compaction against the current session branch. */
+	async compact(): Promise<{ before: number; after: number; kept: number; summary: string; automatic: boolean }> {
 		if (this.running) {
 			throw new Error("这条对话正在执行中，等它跑完再压缩");
 		}
-		return this.compactHistory();
-	}
-
-	private async compactHistory(keepCount?: number): Promise<{ before: number; after: number; kept: number; summary: string }> {
-		const messages = this.agent.state.messages as unknown[];
-		const before = messages.length;
-		const keep = keepCount ?? compactKeepCount(before);
-		// 没几条就别压：压完摘要比原文还长，纯亏
-		if (before <= keep + 1) {
-			throw new Error("对话还太短，不用压缩");
+		if (!this.liveRuntimeFor()) {
+			throw new Error("当前会话没有可用的真实模型，无法执行 Pi 上下文压缩");
 		}
-		const old = messages.slice(0, before - keep);
-		// kept 只用来数条数 + 拼回历史，类型统一成 AgentMessage 免得混着 unknown[]
-		const kept = messages.slice(before - keep) as AgentMessage[];
-
-		const lines = old.map(messageForSummary).filter((text) => text.length > 0);
-		const source = lines.join("\n\n");
-		if (source.trim().length === 0) {
-			throw new Error("旧对话里没有可总结的文字内容");
-		}
-
-		const summary = await this.summarize(source);
-		const summaryMessage = {
-			role: "assistant" as const,
-			content: [{ type: "text" as const, text: "【以下是之前对话的摘要】\n\n" + summary }],
-		};
-		const next = [summaryMessage, ...kept] as unknown as AgentMessage[];
-		// after = 压缩后的历史条数（摘要本身算一条），供事件与返回值如实上报
-		const after = next.length;
-		this.compactedAt = Date.now();
-		this.summary = summary;
-		this.rebuildAgent(next);
-		this.persist();
-		this.emit({ type: "compacted", summary, before, after, kept: kept.length, at: this.compactedAt });
-		return { before, after, kept: kept.length, summary };
-	}
-
-	/**
-	 * 用一段提示问当前模型要摘要；拿不到真实运行时就直接报错，不假装成功。
-	 *
-	 * 为什么另起一个临时 agent 而不是复用会话自己的：`agent.prompt()` 会把这一问一答写进
-	 * 会话历史、还会推进流程状态机——而压缩请求本身不属于用户的对话内容。
-	 * 用完即弃的 agent 只借同一个模型运行时，历史与状态机都不受影响。
-	 */
-	private async summarize(source: string): Promise<string> {
-		const live = this.liveRuntimeFor();
-		if (!live) {
-			throw new Error("当前是模拟模型，压缩对话需要接入真实模型");
-		}
-		const prompt = [
-			"把下面这段对话压缩成一段摘要，供后续对话当背景使用。要求：",
-			"- 保留关键事实、决定、结论、数字、人名与未完成的事项；",
-			"- 丢掉寒暄与重复；",
-			"- 用自然段，不要分点罗列，不要加任何开场白；",
-			"- 直接输出摘要正文。",
-			"" ,
-			"对话如下：",
-			source,
-		].join("\n");
-
-		// 临时 agent：不装工具（摘要不需要动手），只吃一轮提示
-		const scratch = createBusinessAgent({
-			workflow: this.workflow,
-			registry: new ToolRegistry(),
-			ctx: this.ctx,
-			model: live.model,
-			streamFn: live.streamFn,
-			engine: new WorkflowEngine(this.workflow),
-			maxTurns: 1,
-			toolNames: [],
-		});
-		let text = "";
-		const unsubscribe = scratch.agent.subscribe((event) => {
-			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-			text += event.assistantMessageEvent.delta;
-			}
-		});
+		this.running = true;
+		this.emit({ type: "busy", running: true });
 		try {
-			await scratch.agent.prompt(prompt);
+			const pi = await this.ensurePiRuntime();
+			if (this.stopRequested || this.disposed) {
+				await pi.abort();
+				throw new Error(this.disposed ? "会话已销毁" : "压缩已取消");
+			}
+			const before = this.piHistory.buildSessionContext().messages.length;
+			const result = await pi.compact();
+			const after = this.piHistory.buildSessionContext().messages.length;
+			return {
+				before,
+				after,
+				kept: Math.max(0, after - 1),
+				summary: result.summary,
+				automatic: false,
+			};
 		} finally {
-			unsubscribe();
+			this.running = false;
+			this.persist();
+			this.emit({ type: "busy", running: false });
 		}
-		if (text.trim().length === 0) {
-			throw new Error("模型没有返回摘要内容");
-		}
-		return text.trim();
 	}
 
 	/** 当前会话真实生效的运行时；模拟模式返回 null。 */
@@ -1420,25 +1763,73 @@ export class Session {
 		return resolved === undefined ? resolveLlm(selected) : resolved;
 	}
 
-	/** 重建 agent（保留历史与技能）；返回重建后的历史条数。取不到运行时就不动，返回原条数。 */
-	private rebuildAgent(messages?: AgentMessage[]): number {
-		const live = this.liveRuntimeFor();
-		if (!live) {
-			return this.agent.state.messages.length;
+	private disposePiRuntime(): void {
+		this.unsubscribeAgent?.();
+		this.unsubscribeAgent = undefined;
+		this.piRuntime?.dispose();
+		this.piRuntime = null;
+	}
+
+	dispose(): void {
+		this.disposed = true;
+		for (const requestId of this.pendingApprovals.keys()) {
+			this.resolveApproval(requestId, false);
 		}
-		const rebuilt = this.createAgent(live, messages ?? (this.agent.state.messages as AgentMessage[]));
-		this.built = rebuilt;
-		this.agent = rebuilt.agent;
-		this.bindAgentEvents();
+		if (this.piRuntime) void this.piRuntime.abort();
+		this.disposePiRuntime();
+	}
+
+	async shutdown(): Promise<void> {
+		this.disposed = true;
+		for (const requestId of this.pendingApprovals.keys()) {
+			this.resolveApproval(requestId, false);
+		}
+		this.unsubscribeAgent?.();
+		this.unsubscribeAgent = undefined;
+		const runtime = this.piRuntime;
+		this.piRuntime = null;
+		if (!runtime) return;
+		await runtime.abort().catch(() => {});
+		await runtime.shutdown();
+	}
+
+	async reloadPiResources(): Promise<{ session: SessionView; piSkills: string[] }> {
+		if (this.running || this.compacting) throw new Error("这条对话正在执行中，等它完成后再刷新 Pi 资源");
+		if (this.piResourceReload) return this.piResourceReload;
+		this.piResourceReload = (async () => {
+			this.refreshSkills();
+			const runtime = this.piRuntime;
+			this.piRuntime = null;
+			this.unsubscribeAgent?.();
+			this.unsubscribeAgent = undefined;
+			if (runtime) await runtime.shutdown();
+			const refreshed = await this.ensurePiRuntime();
+			this.persist();
+			return { session: this.view(), piSkills: refreshed.piSkills() };
+		})();
+		try {
+			return await this.piResourceReload;
+		} finally {
+			this.piResourceReload = null;
+		}
+	}
+
+	/** Rebuild business policy and let the Pi adapter recreate its runtime from the same session tree. */
+	private rebuildBusinessRuntime(messages?: AgentMessage[]): number {
+		const runtime = this.mode === "live" ? this.liveRuntimeFor() : this.runtime;
+		if (!runtime) return this.runtimeMessages().length;
+		const count = (messages ?? this.runtimeMessages()).length;
+		this.disposePiRuntime();
+		this.built = this.createBusinessRuntime(runtime);
 		this.refreshEstimatedContext();
 		if (this.activeSkillId !== null) {
 			const state = structuredClone(this.engine.state);
 			this.activateSkill(this.activeSkillId);
 			this.engine.reset(this.engine.definition, state);
 		}
-		return rebuilt.agent.state.messages.length;
+		return count;
 	}
-	setModel(modelId: string): SessionView {
+	async setModel(modelId: string): Promise<SessionView> {
 		const key = modelId.trim();
 		if (key.length === 0) {
 			throw new Error("modelId 不能为空");
@@ -1451,19 +1842,52 @@ export class Session {
 		const injected = this.resolveModel?.(key);
 		const live = injected === undefined ? resolveLlm(key) : injected;
 		if (!live) {
-			// 模拟模式、或模型/供应商已停用：不假装换成功——agent 仍由模拟模型驱动，如实报错
-			throw new Error(
-				this.mode === "simulated"
-					? "当前是模拟模型（服务端未接入真实模型），选不了模型"
-					: "这个模型当前不可用（可能已停用，或供应商配置不完整）",
-			);
+			// 模拟模式下仍保存用户选择，方便查看对应上下文配置并在接入真实运行时后生效。
+			// 会话的 mode/modeLabel 保持 simulated，不能让选择状态冒充真实模型已经接入。
+			const selectedKey = this.resolveModelKeyFn?.(key) ?? null;
+			if (this.mode === "simulated" && selectedKey) {
+				this.modelKey = selectedKey;
+				this.persist();
+				return this.view();
+			}
+			throw new Error("这个模型当前不可用（可能已停用，或供应商配置不完整）");
 		}
 
-		// 重建 agent：历史消息交回去，技能在它构造完成之后重放（换技能要改的正是 agent 内部状态）
-		const rebuilt = this.createAgent(live, this.agent.state.messages as AgentMessage[]);
-		this.built = rebuilt;
-		this.agent = rebuilt.agent;
-		this.bindAgentEvents();
+		const preparedModel = live.prepareModel ? await live.prepareModel : live.model;
+		if (this.mode === "live" && this.modelId === live.modelId && this.runtime.model.provider === preparedModel.provider) {
+			this.modelKey = this.resolveModelKeyFn?.(key) ?? this.modelKey;
+			this.modelId = live.modelId;
+			this.modeLabel = live.label;
+			this.persist();
+			return this.view();
+		}
+		if (live.modelRuntime && live.prepareModel) {
+			const pi = await this.ensurePiRuntime();
+			await pi.setModel(preparedModel);
+			this.runtime = { ...live, model: preparedModel };
+			this.modelId = live.modelId;
+			this.mode = "live";
+			this.modeLabel = live.label;
+			this.modelKey = this.resolveModelKeyFn?.(key) ?? null;
+			this.thinkingLevel = pi.getThinkingLevel?.() ?? this.thinkingLevel;
+			this.persist();
+			return this.view();
+		}
+		const sameRuntime = this.mode === "live" && this.runtime.model.id === live.modelId && this.runtime.model.provider === live.provider;
+		if (sameRuntime) {
+			this.modelKey = this.resolveModelKeyFn?.(key) ?? this.modelKey;
+			this.modelId = live.modelId;
+			this.modeLabel = live.label;
+			this.persist();
+			return this.view();
+		}
+		// Rebuild business configuration; Pi recreates the AgentSession from the persisted tree on demand.
+		const previousProvider = this.runtime.model.provider;
+		this.built = this.createBusinessRuntime(live);
+		if (this.piHistory.getHeader() && this.modelId && (this.modelId !== live.modelId || previousProvider !== live.provider)) {
+			this.piHistory.appendModelChange(live.provider, live.modelId);
+		}
+		this.disposePiRuntime();
 		this.refreshEstimatedContext();
 		if (this.activeSkillId !== null) {
 			const state = structuredClone(this.engine.state);
@@ -1481,9 +1905,11 @@ export class Session {
 
 	/** 写入存储层（SQLite 或 Postgres，由 openStore 决定）。 */
 	private persist(): void {
+		if (this.disposed) return;
 		this.updatedAt = Date.now();
 		this.db.save({
 			id: this.id,
+			internalGroupSession: this.internalGroupSession,
 			workflowId: this.workflow.id,
 			modelId: this.modelId,
 			modelKey: this.modelKey,
@@ -1499,7 +1925,8 @@ export class Session {
 			audit: this.auditLog,
 			workflow: this.engine.state,
 			store: this.store,
-			agentMessages: this.agent.state.messages as unknown[],
+			piSessionEntries: serializePiSessionHistory(this.piHistory) as unknown[],
+			piSessionLeafId: piSessionLeafIdOf(this.piHistory),
 			activeSkillId: this.activeSkillId,
 			baseWorkflowState: this.built.baseWorkflowState(),
 			createdBy: this.createdBy,
@@ -1507,8 +1934,11 @@ export class Session {
 			agentId: this.agentId,
 			agentName: this.agentName,
 			agentConfig: this.agentConfig,
+			piAutoCompactionEnabled: this.autoCompactionEnabled,
 			planMode: this.planMode,
+			thinkingLevel: this.thinkingLevel,
 			compactedAt: this.compactedAt,
+			compactedAutomatically: this.compactedAutomatically,
 			summary: this.summary,
 			contextTokens: this.contextTokens,
 			contextTokensEstimated: this.contextTokensEstimated,
@@ -1523,7 +1953,11 @@ export class Session {
 
 	stop(): boolean {
 		if (!this.running) return false;
-		this.agent.abort();
+		this.stopRequested = true;
+		for (const requestId of this.pendingApprovals.keys()) {
+			this.resolveApproval(requestId, false);
+		}
+		if (this.piRuntime) void this.piRuntime.abort();
 		return true;
 	}
 
@@ -1533,11 +1967,22 @@ export class Session {
 			return;
 		}
 		if (this.running) {
-			this.emit({ type: "error", message: "上一轮还在执行中，请稍候" });
+			if (!this.piRuntime || this.compacting || this.stopRequested || this.disposed) {
+				this.emit({ type: "error", message: "当前会话暂时不能排队，请稍后重试" });
+				return;
+			}
+			try {
+				await this.piRuntime.followUp(text);
+				this.transcript.push({ role: "user", text, at: Date.now(), tools: [] });
+				this.persist();
+			} catch (error) {
+				this.emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
+			}
 			return;
 		}
 
 		this.running = true;
+		this.stopRequested = false;
 		this.currentTurnStartedAt = Date.now();
 		this.emit({ type: "busy", running: true });
 		// 往归档会话里发消息 = 它又活过来了，自动取消归档（落库在 finally 里统一做）
@@ -1565,16 +2010,13 @@ export class Session {
 		let failure: string | null = null;
 
 		try {
-			const { shortTermRounds = 10, overflowStrategy } = this.agentConfig.memoryConfig;
-			if (overflowStrategy === "summarize") {
-				const messages = this.agent.state.messages;
-				const starts = messages.flatMap((message, index) => message.role === "user" ? [index] : []);
-				const boundary = starts[starts.length - Math.max(0, shortTermRounds - 1)];
-				if (starts.length >= shortTermRounds) {
-					await this.compactHistory(boundary === undefined ? 0 : messages.length - boundary);
-				}
+			const pi = await this.ensurePiRuntime();
+			if (this.stopRequested || this.disposed) {
+				await pi.abort();
+				failure = this.disposed ? "会话已销毁" : "请求被中断";
+				return;
 			}
-			await this.agent.prompt(text);
+			await pi.prompt(text);
 			if (this.built.limitReached()) {
 				throw new Error(`已达到最大推理轮数（${this.agentConfig.advancedConfig.maxIters ?? 12}），本轮已停止，请缩小任务范围后重试`);
 			}
@@ -1628,14 +2070,17 @@ export class Session {
 			archived: this.archived,
 			running: this.running,
 			...this.workflowView(),
-			tools: this.toolNames,
+			tools: [...this.toolNames, "tool_search"],
 			skills: skillViewsFor(this.repo, this.activeSkillId),
 			activeSkillId: this.activeSkillId,
+		queuedFollowUps: this.piRuntime?.session.getFollowUpMessages().slice() ?? [...this.queuedFollowUps],
 			traceIds: [...this.traceIds],
 			agentId: this.agentId,
 			agentName: this.agentName,
 			planMode: this.planMode,
+			thinkingLevel: this.thinkingLevel,
 			compactedAt: this.compactedAt,
+			compactedAutomatically: this.compactedAutomatically,
 			summary: this.summary,
 			createdAt: this.createdAt,
 			updatedAt: this.updatedAt,
@@ -1643,6 +2088,27 @@ export class Session {
 			transcript: this.transcript,
 			restored: this.restored,
 		};
+	}
+
+	exportPiJsonl(): string {
+		return `${serializePiSessionBranch(this.piHistory).map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	}
+
+	async exportPiHtml(): Promise<string> {
+		const directory = await mkdtemp(join(tmpdir(), "biz-agent-pi-html-"));
+		const sessionPath = join(directory, "session.jsonl");
+		const outputPath = join(directory, "session.html");
+		try {
+			const jsonl = serializePiSessionBranch(this.piHistory).map((entry) => JSON.stringify(entry)).join("\n");
+			await writeFile(sessionPath, `${jsonl}\n`, "utf8");
+			const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+			const exportModulePath = join(dirname(packageEntry), "core", "export-html", "index.js");
+			const { exportFromFile } = await import(pathToFileURL(exportModulePath).href) as { exportFromFile(inputPath: string, outputPath: string): Promise<string> };
+			await exportFromFile(sessionPath, outputPath);
+			return await readFile(outputPath, "utf8");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	}
 }
 
@@ -1663,12 +2129,14 @@ export class SessionHub {
 		 * 第二个参数含义（`smoke` / `scripts` 里有直接 `new SessionHub(db, repo, resolveModel, obs)` 的写法）。
 		 */
 		private readonly resolveModelKeyFn?: SessionModelKeyResolver,
+		private readonly mcpRegistry?: McpRegistry,
 	) {}
 
 	create(
 		workflowId: string,
 		options: {
 			modelId?: string;
+			internalGroupSession?: boolean;
 			ownerId?: string | null;
 			agent?: SessionAgent;
 		} = {},
@@ -1682,14 +2150,61 @@ export class SessionHub {
 			db: this.db,
 			repo: this.repo,
 			modelId: options.modelId,
+			internalGroupSession: options.internalGroupSession,
 			ownerId: options.ownerId,
 			agent: options.agent,
 			observability: this.observability,
 			resolveModel: this.resolveModel,
 			resolveModelKey: this.resolveModelKeyFn,
+			mcpRegistry: this.mcpRegistry,
 		});
 		this.sessions.set(session.id, session);
 		return session;
+	}
+
+	derive(
+		sourceId: string,
+		mode: "fork" | "clone",
+		options: { entryId?: string; ownerId?: string | null } = {},
+	): { session: Session; editorText?: string } {
+		const source = this.get(sourceId);
+		const record = this.db.load(sourceId);
+		if (!source || !record) throw new Error("session not found");
+		const id = randomUUID().slice(0, 8);
+		const history = source.derivePiHistory(mode, id, options.entryId);
+		const createdAt = Date.now();
+		const derived: PersistedSession = {
+			...record,
+			id,
+			title: null,
+			archived: false,
+			createdAt,
+			updatedAt: createdAt,
+			done: false,
+			transcript: [],
+			audit: [],
+			traceIds: [],
+			createdBy: options.ownerId ?? null,
+			piSessionEntries: history.entries,
+			piSessionLeafId: history.leafId,
+			contextTokens: 0,
+			contextTokensEstimated: true,
+		};
+		const workflow = this.repo.get(record.workflowId);
+		if (!workflow) throw new Error(`unknown workflow: ${record.workflowId}`);
+		const session = new Session(workflow, {
+			db: this.db,
+			repo: this.repo,
+			restore: derived,
+			newlyDerived: true,
+			agent: this.agentOf(record.agentId),
+			observability: this.observability,
+			resolveModel: this.resolveModel,
+			resolveModelKey: this.resolveModelKeyFn,
+			mcpRegistry: this.mcpRegistry,
+		});
+		this.sessions.set(session.id, session);
+		return { session, ...(history.editorText !== undefined ? { editorText: history.editorText } : {}) };
 	}
 
 	/**
@@ -1734,6 +2249,9 @@ export class SessionHub {
 	 * 别拿它当"删除会话"用，那走 remove()。
 	 */
 	drop(id: string): boolean {
+		const session = this.sessions.get(id);
+		if (!session) return false;
+		session.dispose();
 		return this.sessions.delete(id);
 	}
 
@@ -1762,12 +2280,14 @@ export class SessionHub {
 			observability: this.observability,
 			resolveModel: this.resolveModel,
 			resolveModelKey: this.resolveModelKeyFn,
+			mcpRegistry: this.mcpRegistry,
 		});
 		this.sessions.set(id, session);
 		return session;
 	}
 
 	remove(id: string): boolean {
+		this.sessions.get(id)?.dispose();
 		this.sessions.delete(id);
 		return this.db.remove(id);
 	}
@@ -1777,6 +2297,7 @@ export class SessionHub {
 		let removed = 0;
 		for (const record of this.db.list()) {
 			if (record.workflowId === workflowId) {
+				this.sessions.get(record.id)?.dispose();
 				this.sessions.delete(record.id);
 				if (this.db.remove(record.id)) {
 					removed += 1;
@@ -1809,8 +2330,16 @@ export class SessionHub {
 	}
 
 	clear(): number {
+		for (const session of this.sessions.values()) session.dispose();
 		this.sessions.clear();
 		return this.db.clear();
+	}
+
+	/** Release live Pi sessions without deleting their persisted conversation history. */
+	async shutdown(): Promise<void> {
+		const sessions = [...this.sessions.values()];
+		this.sessions.clear();
+		await Promise.all(sessions.map((session) => session.shutdown()));
 	}
 
 	count(): number {
@@ -1851,12 +2380,14 @@ export class SessionHub {
 	list(): SessionView[] {
 		const views = new Map<string, SessionView>();
 		for (const record of this.db.list()) {
+			if (record.internalGroupSession) continue;
 			const view = viewFromRecord(record, this.repo);
 			if (view) {
 				views.set(view.id, view);
 			}
 		}
 		for (const session of this.sessions.values()) {
+			if (session.internalGroupSession) continue;
 			views.set(session.id, session.view());
 		}
 		return [...views.values()].sort((a, b) => a.updatedAt - b.updatedAt);

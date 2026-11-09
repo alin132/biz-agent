@@ -12,7 +12,9 @@
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { builtinModels, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { processPiModelRuntime } from "./piModelRuntime.js";
 
 interface ProviderSpec {
 	/** pi-ai 内置的 provider id */
@@ -57,6 +59,8 @@ export interface LlmRuntime {
 	label: string;
 	provider: string;
 	modelId: string;
+	modelRuntime?: Promise<ModelRuntime>;
+	prepareModel?: Promise<Model<any>>;
 }
 
 /** 目前支持哪些 key，用于启动日志和错误提示。 */
@@ -189,19 +193,30 @@ function buildRuntime(spec: ProviderSpec, forcedModel: string | undefined, custo
 	}
 
 	// model 级 baseUrl 优先于 provider 端点
-	const model: Model<any> = customBaseUrl ? { ...base, baseUrl: customBaseUrl } : base;
+	const model: Model<any> = customBaseUrl ? { ...base, baseUrl: customBaseUrl } : { ...base };
 
 	// 包一层传输策略：超时 + 重试，避免单次抖动把整轮跑挂
 	const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
 	const maxRetries = Number(process.env.LLM_MAX_RETRIES ?? DEFAULT_MAX_RETRIES);
-	const baseStream = models.streamSimple.bind(models);
-	const streamFn: StreamFn = (requestModel, context, options) =>
-		baseStream(requestModel, context, {
+	const runtimeProviderId = `biz_env_${spec.id}`;
+	model.provider = runtimeProviderId;
+	const prepareModel = processPiModelRuntime.register({
+		model,
+		providerId: runtimeProviderId,
+		providerName: spec.label,
+		apiKey: (process.env[spec.keyEnv] ?? process.env.LLM_API_KEY)?.trim(),
+	});
+	const modelRuntime = processPiModelRuntime.runtime();
+	const streamFn: StreamFn = async (requestModel, context, options) => {
+		const piRuntime = await modelRuntime;
+		await prepareModel;
+		return piRuntime.streamSimple(requestModel, context, {
 			...options,
 			timeoutMs,
 			maxRetries,
 			maxRetryDelayMs: 15_000,
 		});
+	};
 
 	return {
 		model,
@@ -209,5 +224,7 @@ function buildRuntime(spec: ProviderSpec, forcedModel: string | undefined, custo
 		label: `${spec.label} · ${model.id}`,
 		provider: spec.id,
 		modelId: model.id,
+		modelRuntime,
+		prepareModel,
 	};
 }

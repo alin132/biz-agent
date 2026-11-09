@@ -235,11 +235,11 @@ function sanitizeAdvancedConfig(input: AgentRecord["advancedConfig"] | undefined
 function sanitizeMemoryConfig(input: AgentRecord["memoryConfig"] | undefined): AgentRecord["memoryConfig"] {
 	if (!input) return {};
 	const result: AgentRecord["memoryConfig"] = {};
-	if (typeof input.shortTermRounds === "number" && Number.isFinite(input.shortTermRounds)) {
-		result.shortTermRounds = Math.round(clampNumber(input.shortTermRounds, 1, 100));
-	}
-	if (input.overflowStrategy === "sliding_window" || input.overflowStrategy === "summarize") {
-		result.overflowStrategy = input.overflowStrategy;
+	for (const key of ["reserveTokens", "keepRecentTokens"] as const) {
+		const value = input[key];
+		if (typeof value === "number" && Number.isFinite(value)) {
+			result[key] = Math.round(clampNumber(value, 0, 1_000_000));
+		}
 	}
 	return result;
 }

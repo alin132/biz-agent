@@ -5,12 +5,16 @@
  * 换成真实模型只需把 model / streamFn 换成 models.getModel("deepseek", ...) 即可。
  */
 
-import type { Agent, StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
 import type { BizContext } from "../src/core/types.js";
+import type { ToolRegistry } from "../src/core/registry.js";
+import type { BusinessRuntime } from "../src/core/runtime.js";
+import { createPiBusinessAgent, createPiRuntimeAdapter } from "../server/piRuntimeAdapter.js";
+import { createPiSessionHistory } from "../server/piSessionHistory.js";
 
 export interface FauxRuntime {
 	model: Model<any>;
@@ -27,6 +31,34 @@ export function createFauxRuntime(steps: FauxResponseStep[]): FauxRuntime {
 		model: faux.getModel(),
 		streamFn: models.streamSimple.bind(models) as StreamFn,
 	};
+}
+
+
+export function createWorkflowPiSession(
+	built: BusinessRuntime,
+	options: { registry: ToolRegistry; ctx: BizContext; runtime: FauxRuntime; maxTurns?: number },
+) {
+	const agent = createPiBusinessAgent({
+		business: built,
+		registry: options.registry,
+		ctx: options.ctx,
+		model: options.runtime.model,
+		streamFn: options.runtime.streamFn,
+	});
+	const maxTurns = options.maxTurns ?? 20;
+	return createPiRuntimeAdapter({
+		agent,
+		tools: agent.state.tools,
+		cwd: process.cwd(),
+		sessionManager: createPiSessionHistory({ sessionId: `demo-${Date.now().toString(36)}` }),
+		workflow: {
+			maxTurns,
+			startRun: built.startRun,
+			finishTurn: built.finishTurn,
+			nextPrompt: built.nextPrompt,
+			limitReached: built.limitReached,
+		},
+	});
 }
 
 /** 一步"模型发起工具调用"。 */
@@ -62,18 +94,8 @@ export function createCtx(overrides: Partial<BizContext> = {}): BizContext {
 }
 
 /** 取最后一条 assistant 消息的纯文本。 */
-export function lastAssistantText(agent: Agent): string {
-	const messages = agent.state.messages;
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index]!;
-		if (message.role === "assistant") {
-			return message.content
-				.filter((block) => block.type === "text")
-				.map((block) => (block as { text: string }).text)
-				.join("");
-		}
-	}
-	return "";
+export function lastAssistantText(session: Awaited<ReturnType<typeof createPiRuntimeAdapter>>): string {
+	return session.lastAssistantText();
 }
 
 export function title(text: string): void {

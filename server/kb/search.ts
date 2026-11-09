@@ -1,8 +1,8 @@
 /**
- * 检索：两种模式，返回结构统一，`mode` 如实反映实际走的是哪条路
- * （页面要显示「语义检索 / 关键词检索」，不能假装有向量）。
+ * 检索：向量、关键词和混合三种模式，返回结构统一，`mode` 如实反映实际召回路径。
  *
- * 有 embedding：查询向量化 → 按库取候选块（>5000 块先用 LIKE 预筛）→ 余弦相似度 → 阈值 → topK。
+ * 有 embedding：向量与关键词分别取候选，再用 RRF 融合，避免未向量化块漏召回。
+ * 向量候选按后端余弦相似度与阈值排名（Postgres 下推 pgvector）。
  * 无 embedding（或向量化失败）：关键词检索 —— 分词 + `LIKE` 命中 + 词频打分，中文用 2-gram 兜底。
  *
  * 打分/切片都是纯函数，方便单测；只有 `searchInKnowledgeBase` 碰 DAO。
@@ -26,7 +26,7 @@ export const SNIPPET_LENGTH = 180;
 /** 查询词切出的 token 上限：太多会让打分分母虚高、排序失真。 */
 const MAX_QUERY_TOKENS = 24;
 
-export type SearchMode = "vector" | "keyword";
+export type SearchMode = "vector" | "keyword" | "hybrid";
 
 export interface SearchResult {
 	chunkId: number;
@@ -208,6 +208,26 @@ export function rankKeywordChunks(
 	}));
 }
 
+/** Reciprocal-rank fusion combines semantic and lexical candidates without comparing unlike scores. */
+function fuseHybridResults(vector: SearchResult[], keyword: SearchResult[], topK: number): SearchResult[] {
+	const fused = new Map<number, { result: SearchResult; score: number }>();
+	const addRanked = (items: SearchResult[]) => {
+		items.forEach((result, index) => {
+			const rankScore = 1 / (60 + index + 1);
+			const existing = fused.get(result.chunkId);
+			if (existing) existing.score += rankScore;
+			else fused.set(result.chunkId, { result, score: rankScore });
+		});
+	};
+	addRanked(vector);
+	addRanked(keyword);
+	const maxScore = 2 / 61;
+	return [...fused.values()]
+		.sort((left, right) => right.score - left.score || left.result.chunkId - right.result.chunkId)
+		.slice(0, topK)
+		.map(({ result, score }) => ({ ...result, score: round4(score / maxScore), mode: "hybrid" as const }));
+}
+
 /** 余弦相似度候选 → 结果（纯函数部分）。 */
 export function rankVectorChunks(
 	chunks: { chunk: KbChunkRow; vector: number[] }[],
@@ -296,14 +316,14 @@ export async function searchInKnowledgeBase(input: {
 				throw badRequest("向量化服务返回了空向量");
 			}
 			// 排名下推给存储后端：SQLite 本地算余弦，Postgres 交给 pgvector（只回命中行）
+			const topK = clampTopK(options.topK);
+			const candidateLimit = Math.min(MAX_TOP_K, topK * 3);
 			const hits = input.store.searchByEmbedding(input.kbId, queryVector, {
-				topK: clampTopK(options.topK),
+				topK: candidateLimit,
 				// 没传 threshold 就用库上配置的相似度阈值
 				threshold: options.threshold ?? knowledgeBase.similarityThreshold,
 			});
-			return {
-				mode: "vector",
-				results: hits.map((hit) => ({
+			const vectorResults = hits.map((hit) => ({
 					chunkId: hit.chunk.id,
 					docId: hit.chunk.docId,
 					kbId: hit.chunk.kbId,
@@ -312,7 +332,16 @@ export async function searchInKnowledgeBase(input: {
 					snippet: buildSnippet(hit.chunk.content, []),
 					score: hit.score,
 					mode: "vector" as const,
-				})),
+			}));
+			const keywordResults = keywordSearch({
+				store: input.store,
+				kbId: input.kbId,
+				tokens,
+				options: { topK: candidateLimit, threshold: options.threshold },
+			}).results;
+			return {
+				mode: "hybrid",
+				results: fuseHybridResults(vectorResults, keywordResults, topK),
 			};
 		} catch (error) {
 			// 向量化失败不能让检索不可用：退回关键词，并把原因如实带回去

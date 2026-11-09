@@ -20,16 +20,21 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router";
 import MessageBody from "../components/MessageBody.vue";
 import SessionActivity from "../components/SessionActivity.vue";
-import SessionToolbar from "../components/SessionToolbar.vue";
+import SessionContextMenu from "../components/SessionContextMenu.vue";
+import PiSessionTree from "../components/PiSessionTree.vue";
+import PiSessionStats from "../components/PiSessionStats.vue";
 import { useSessionActivity } from "../sessionActivity.js";
+import { readPinnedSessionIds, sortPinnedSessions, togglePinnedSession } from "../sessionPins.js";
 import { can } from "../access.js";
 import { NAlert, NButton, NEmpty, NInput, NSpin, NTag, useMessage } from "naive-ui";
 import PageShell from "../components/PageShell.vue";
 import ModelPicker from "../components/ModelPicker.vue";
 import SlashCommandPanel from "../components/SlashCommandPanel.vue";
-import { agentsApi, http, modelsApi, sessionApi, sessionEvents } from "../api.js";
-import { createSlashCommands, slashQueryOf } from "../slashCommands.js";
-import { formatTokens } from "../contextUsage.js";
+import { agentsApi, http, modelsApi, pluginsApi, sessionApi, sessionEvents } from "../api.js";
+import { createSlashCommands, piSkillsFromPlugins, slashQueryOf } from "../slashCommands.js";
+import { downloadPiSession, downloadPiSessionHtml } from "../piSessionDownload.js";
+import { copyText, lastAssistantText } from "../clipboard.js";
+import { contextRingDash, formatTokens } from "../contextUsage.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -41,16 +46,28 @@ const agentError = ref("");
 
 const activity = useSessionActivity();
 const showSessions=ref(false),sessionQuery=ref("");
+const pinRevision = ref(0);
 async function removed() { closeStream();current.value=null;messages.value=[];streamText.value="";streamThinking.value="";sending.value=false;activity.hydrate({});await router.replace({name:"agent-chat",params:{id:agentId.value},query:{}});await refreshList(); }
 const sessions = ref([]);
-const visibleSessions=computed(()=>sessions.value.filter(s=>titleOf(s).toLowerCase().includes(sessionQuery.value.toLowerCase())));
+const pinnedIds = computed(() => { pinRevision.value; return readPinnedSessionIds(agentId.value); });
+const visibleSessions=computed(()=>sortPinnedSessions(sessions.value.filter(s=>titleOf(s).toLowerCase().includes(sessionQuery.value.toLowerCase())),pinnedIds.value));
 const current = ref(null);
+const piSkills = ref([]);
+const piTreeOpen = ref(false);
+const piStatsOpen = ref(false);
+const piStats = ref(null);
+const modelPickerRef = ref(null);
+const contextSession = ref(null);
+const sessionContextMenuRef = ref(null);
+const contextX = ref(0);
+const contextY = ref(0);
 const messages = ref([]);
 const draft = ref("");
 const attachments = ref([]);
 const attachmentBusy = ref(false);
 const fileInput = ref(null);
 const sending = ref(false);
+const queuedFollowUps = ref([]);
 const toolbarBusy = ref(false);
 const loading = ref(true);
 const busy = ref(false);
@@ -60,6 +77,7 @@ const streamThinking = ref("");
 const showThinking = ref(false);
 
 let events = null;
+let openSessionSequence = 0;
 const scrollBox = ref(null);
 
 const STATUS_META = {
@@ -79,6 +97,37 @@ function titleOf(item) {
 	return first?.text?.slice(0, 40) || "新对话";
 }
 
+function toggleSessionPin(item) {
+	if (!item) return;
+	togglePinnedSession(item.id, agentId.value);
+	pinRevision.value += 1;
+}
+
+function openSessionContextMenu(item, event) {
+	if (!can("session.read") && !can("session.write")) return;
+	const rect = event.currentTarget.getBoundingClientRect();
+	contextSession.value = item;
+	contextX.value = event.clientX || rect.left + 16;
+	contextY.value = event.clientY || rect.top + rect.height / 2;
+}
+
+function onSessionContextKeydown(item, event) {
+	if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+	event.preventDefault();
+	openSessionContextMenu(item, event);
+}
+
+async function onContextSessionRemoved(id) {
+	contextSession.value = null;
+	if (current.value?.id === id) await removed();
+	else await refreshList();
+}
+
+function onContextSessionUpdated(view) {
+	if (current.value?.id === view.id) current.value = view;
+	refreshList();
+}
+
 async function scrollToEnd() {
 	await nextTick();
 	const box = scrollBox.value;
@@ -87,15 +136,57 @@ async function scrollToEnd() {
 
 /** 把会话快照灌进消息列表。transcript 是唯一真相。 */
 function hydrate(view) {
- activity.hydrate(view);
- sending.value=Boolean(view.running);
+	messages.value = (view.transcript ?? []).map((entry) => ({ ...entry, tools: entry.tools ?? [] }));
+	activity.hydrate(view, messages.value);
+	sending.value = Boolean(view.running);
+	queuedFollowUps.value = view.queuedFollowUps ?? [];
 	usedTokens.value = Math.max(0, Number(view.contextTokens ?? 0));
 	contextEstimated.value = Boolean(view.contextTokensEstimated ?? true);
-	messages.value = (view.transcript ?? []).map((entry) => ({
-		role: entry.role,
-		text: entry.text,
-		at: entry.at,
-	}));
+	scrollToEnd();
+}
+
+function onPiTreeNavigate(result) {
+	current.value = result.session;
+	draft.value = result.editorText ?? "";
+	hydrate(result.session);
+}
+
+async function onPiTreeFork(result) {
+	await refreshList();
+	await openSession(result.session.id);
+	draft.value = result.editorText ?? "";
+}
+
+async function onContextSessionCreated(view) {
+	contextSession.value = null;
+	await refreshList();
+	await openSession(view.id);
+}
+
+async function cloneCurrentSession() {
+	if (!current.value || sending.value) return;
+	try {
+		const result = await sessionApi.clone(current.value.id);
+		await refreshList();
+		await openSession(result.session.id);
+		message.success("已复制为独立对话");
+	} catch (cause) {
+		message.error(cause?.message ?? "复制对话失败");
+	}
+}
+
+function applyCompressedTranscript(entries) {
+	const previous = messages.value;
+	const active = activity.activeTurn.value;
+	messages.value = (entries ?? []).map((entry) => {
+		const old = [...previous].reverse().find((item) => item.role === entry.role &&
+			(item.at === entry.at || (entry.role === "user" && item.text === entry.text)));
+		return { ...(old ?? {}), ...entry, tools: entry.tools ?? old?.tools ?? [] };
+	});
+	if (active) {
+		activity.activeTurn.value = [...messages.value].reverse().find((item) => item.role === "user" &&
+			(item.at === active.at || item.text === active.text)) ?? null;
+	}
 	scrollToEnd();
 }
 
@@ -127,6 +218,10 @@ function subscribe(id) {
 				contextEstimated.value = Boolean(payload.estimated);
 				if (current.value) current.value = { ...current.value, contextTokens: usedTokens.value, contextTokensEstimated: contextEstimated.value };
 				break;
+			case "compacting":
+				compacting.value = true;
+				startCompactingTimer();
+				break;
 			case "workflow":
 				if(current.value) current.value={...current.value,steps:payload.steps,current:payload.current,done:payload.done};
 				break;
@@ -145,6 +240,9 @@ function subscribe(id) {
 			case "busy":
 				sending.value = payload.running;
 				break;
+			case "queue":
+				queuedFollowUps.value = payload.followUp ?? [];
+				break;
 			case "done":
 				if (!streamText.value && payload.text) streamText.value = payload.text;
 				if (streamText.value.trim()) {
@@ -159,14 +257,17 @@ function subscribe(id) {
 				// 计划模式开关变了（本页或别的入口切的）：跟着会话状态走
 				if (current.value) current.value.planMode = Boolean(payload.planMode);
 				break;
+			case "thinking_level":
+				if (current.value) current.value.thinkingLevel = payload.thinkingLevel;
+				break;
 			case "compacted":
-				// 压缩完成：只点亮提示条。摘要收下但不显示（与对话页同款）——
-				// 消息列表保持"保留的最近 N 条"原消息，别凭空插一条用户没见过的助手回复。
-				// 这里不整表重载：openSession 会重来一遍，用户正盯着的那屏会白闪一下。
-				compactedInfo.value = { summary: payload.summary, kept: Number(payload.kept ?? 0) };
-				compactedDismissed.value = false;
+				compacting.value = false;
+				stopCompactingTimer();
+				applyCompressedTranscript(payload.transcript);
 				break;
 			case "error":
+				compacting.value = false;
+				stopCompactingTimer();
 				error.value = payload.message;
 				sending.value = false;
 				break;
@@ -192,12 +293,21 @@ function syncRoute(sessionId) {
 }
 
 async function openSession(id) {
+ const sequence = ++openSessionSequence;
+ const requestedAgentId = agentId.value;
  showSessions.value=false;
 	error.value = "";
 	attachments.value = [];
-	const view = await http.get(`/api/sessions/${id}`);
+	let view;
+	try {
+		view = await http.get(`/api/sessions/${id}`);
+	} catch (cause) {
+		if (sequence !== openSessionSequence || requestedAgentId !== agentId.value) return;
+		throw cause;
+	}
+	if (sequence !== openSessionSequence || requestedAgentId !== agentId.value) return;
 	// 路由串了 Agent 的被拒会话：如实说明，不硬把它显示成本 Agent 的历史
-	if ((view.agentId ?? null) !== agentId.value) {
+	if ((view.agentId ?? null) !== requestedAgentId) {
 		error.value = "这条会话不属于当前 Agent，已回到本 Agent 的对话列表。";
 		current.value = null;
 		messages.value = [];
@@ -209,9 +319,6 @@ async function openSession(id) {
 	selectedModel.value = view?.modelKey ?? null;
 	// 上下文用量是这条会话的累计值：换会话必须清零，否则数字会串到别的对话上
 	resetUsage();
-	// 快照里的摘要只用来判定"这条会话压过"，正文不再渲染（后端仍落库，契约不动）
-	compactedInfo.value = view?.summary ? { summary: view.summary, kept: null } : null;
-	compactedDismissed.value = false;
 	subscribe(id);
 	syncRoute(id);
 }
@@ -277,12 +384,15 @@ async function bootstrap() {
 
 async function send() {
 	const text = draft.value.trim();
-	if ((!text && attachments.value.length === 0) || !current.value || sending.value) return;
+	if ((!text && attachments.value.length === 0) || !current.value || toolbarBusy.value) return;
+	const alreadyRunning = sending.value;
 	const outgoing = buildOutgoingText(text, attachments.value);
 	draft.value = "";
 	error.value = "";
 	attachments.value = [];
-	messages.value.push({ role: "user", text: outgoing, at: Date.now() });
+	const turn = { role: "user", text: outgoing, at: Date.now(), tools: [], durationMs: 0 };
+	messages.value.push(turn);
+	activity.beginTurn(turn);
 	// 用户这条立刻计入：只在轮末结算的话，敲完一条会先看到数字纹丝不动
 	sending.value = true;
 	scrollToEnd();
@@ -290,7 +400,8 @@ async function send() {
 		await http.post(`/api/sessions/${current.value.id}/messages`, { text: outgoing });
 	} catch (cause) {
 		error.value = cause?.message ?? "发送失败";
-		sending.value = false;
+		activity.event({ type: "error" });
+		sending.value = alreadyRunning;
 	}
 }
 
@@ -350,7 +461,7 @@ function onKeydown(event) {
 	}
 }
 
-const canChat = computed(() => Boolean(current.value) && canStart.value && !sending.value && !toolbarBusy.value);
+const canChat = computed(() => Boolean(current.value) && canStart.value && !toolbarBusy.value);
 const modeBadge = computed(() => current.value?.modeLabel ?? null);
 
 /* ── 以下与对话页（Chat.vue）同款：模型选择 / 斜杠命令 / 计划模式 / 压缩 ──────────
@@ -361,9 +472,17 @@ const message = useMessage();
 
 const planModeOn = computed(() => Boolean(current.value?.planMode));
 const compacting = ref(false);
-const compactedInfo = ref(null);
-/** 用户手动收起提示；换会话或再次压缩时复位（新结果要让人看见） */
-const compactedDismissed = ref(false);
+const compactingElapsed = ref(0);
+let compactingTimer = null;
+const compactingText = computed(() => compactingElapsed.value < 8 ? "正在压缩上下文：总结旧对话…" : "对话较长，仍在压缩中，可能需要几分钟…");
+function startCompactingTimer() {
+	stopCompactingTimer();
+	compactingElapsed.value = 0;
+	compactingTimer = setInterval(() => { compactingElapsed.value += 1; }, 1000);
+}
+function stopCompactingTimer() {
+	if (compactingTimer) { clearInterval(compactingTimer); compactingTimer = null; }
+}
 
 // 模型选择（会话级；Agent 会话换模型走同一个接口）
 const modelOptions = ref([]);
@@ -474,12 +593,14 @@ const usageTitle = computed(() => {
 	const total = contextWindow.value;
 	const source = contextEstimated.value ? "估算" : "模型返回";
 	return total > 0
-		? "上下文用量（" + source + "）：" + used + " / " + total + " tokens"
-		: "上下文用量（" + source + "）：" + used + " tokens（未配置上下文窗口）";
+		? "上下文用量（" + source + "）：" + usageText.value + "；精确数值 " + used + " / " + total + " tokens"
+		: "上下文用量（" + source + "）：" + usageText.value + "；精确数值 " + used + " tokens（未配置上下文窗口）";
 });
+const usagePercent = computed(() => contextWindow.value > 0 ? Math.round((usedTokens.value / contextWindow.value) * 100) : null);
 
 /** 用掉超过 80% 换警示色：这个量再聊几轮就要压缩了 */
 const usageWarn = computed(() => contextWindow.value > 0 && usedTokens.value / contextWindow.value > 0.8);
+const ctxRingDash = computed(() => contextRingDash(usedTokens.value, contextWindow.value));
 
 async function onModelChange(modelId) {
 	if (!modelId) return;
@@ -498,8 +619,8 @@ async function onModelChange(modelId) {
 		selectedModel.value = current.value.modelKey ?? null;
 		// 后端可能拒绝（例如模拟模式选不了模型）：上面已按用户点选的行记了 pickedModelKey，
 		// 那是界面自己的账，不受接口成败影响。
-		if (Array.isArray(result?.models) && result.models.length > 0) {
-			modelRows.value = result.models; // 行清单进翻译表，别覆盖 options（命名空间不同，见 Chat.vue 同款注释）
+		if (Array.isArray(result?.modelRows) && result.modelRows.length > 0) {
+			modelRows.value = result.modelRows;
 		}
 		message.success(`已切换这条对话的模型：${current.value.modeLabel || "模拟模型"}`);
 	} catch (err) {
@@ -516,10 +637,70 @@ const slashOpen = ref(false);
  * 不包 .value 就取不到，slashFiltered 里 slashCommands.value 会是 undefined（实测踩过：面板永远弹不出）。 */
 const slashCommands = computed(() =>
 	createSlashCommands({
+		...(canStart.value ? { new: () => createSession() } : {}),
 		compact: () => compactContext(),
 		plan: () => togglePlanMode(),
+		thinking: () => cycleThinkingLevel(),
+		name: () => openRenameDialog(),
+		reload: () => reloadPiResources(),
+		copy: () => copyLatestAssistant(),
+		session: () => showPiStats(),
+		resume: () => { showSessions.value = true; },
+		settings: () => router.push({ name: "settings" }),
+		...(current.value && can("session.read") ? { export: () => exportPiSession() } : {}),
+		...(current.value && can("session.read") ? { "export-html": () => exportPiSessionHtml() } : {}),
+		tree: () => { piTreeOpen.value = true; },
+		fork: () => { piTreeOpen.value = true; },
+		...(current.value && can("session.write") ? { clone: () => cloneCurrentSession() } : {}),
+		model: () => modelPickerRef.value?.open(),
+		piSkills: piSkills.value,
+		piSkill: (name) => {
+			draft.value = `/skill:${name} `;
+			nextTick(() => document.querySelector(".chat-input textarea")?.focus());
+		},
+		skills: current.value?.skills ?? [],
+		skill: (skillId) => selectSkill(skillId),
 	}),
 );
+
+async function exportPiSession() {
+	if (!current.value || !can("session.read")) return;
+	try {
+		await downloadPiSession(current.value.id);
+	} catch (cause) {
+		message.error(cause?.message ?? "导出 Pi 会话失败");
+	}
+}
+
+async function copyLatestAssistant() {
+	try {
+		await copyText(lastAssistantText(messages.value));
+		message.success("已复制最近一条助手回复");
+	} catch (cause) {
+		message.error(cause?.message ?? "复制失败，请手动选择文本复制");
+	}
+}
+
+async function reloadPiResources() {
+	if (!current.value) return;
+	try {
+		const result = await sessionApi.reloadPiResources(current.value.id);
+		current.value = result.session;
+		hydrate(result.session);
+		message.success(`Pi 资源已刷新：${result.piSkills.length} 个原生技能`);
+	} catch (cause) {
+		message.error(cause?.message ?? "刷新 Pi 资源失败");
+	}
+}
+
+async function exportPiSessionHtml() {
+	if (!current.value || !can("session.read")) return;
+	try {
+		await downloadPiSessionHtml(current.value.id);
+	} catch (cause) {
+		message.error(cause?.message ?? "导出 Pi HTML 会话失败");
+	}
+}
 const slashQuery = ref("");
 /** 面板要显示的项：按输入框里的过滤词筛（与对话页同一套规则） */
 const slashFiltered = computed(() => {
@@ -545,11 +726,49 @@ function onDraftInput() {
 
 function onSlashPick(command) {
 	slashOpen.value = false;
+	if (command?.kind === "pi-skill") {
+		command.run();
+		return;
+	}
 	draft.value = "";
-	if (command?.id === "plan") {
-		togglePlanMode();
-	} else if (command?.id === "compact") {
-		compactContext();
+	command?.run?.();
+}
+
+function openRenameDialog() {
+	if (!current.value) {
+		error.value = "先打开一个对话，再设置会话名称。";
+		return;
+	}
+	if (!can("session.write")) {
+		error.value = "没有重命名会话的权限。";
+		return;
+	}
+	sessionContextMenuRef.value?.openRenameFor(current.value);
+}
+
+async function showPiStats() {
+	if (!current.value) return;
+	try {
+		piStats.value = await sessionApi.piStats(current.value.id);
+		piStatsOpen.value = true;
+	} catch (cause) {
+		message.error(cause?.message ?? "读取 Pi 会话统计失败");
+	}
+}
+
+async function selectSkill(skillId) {
+	if (!current.value || !can("session.run")) return;
+	const sessionId = current.value.id;
+	try {
+		await http.post(`/api/sessions/${sessionId}/skills`, { skillId });
+		const view = await http.get(`/api/sessions/${sessionId}`);
+		if (current.value?.id !== sessionId) return;
+		current.value = view;
+		hydrate(view);
+		await refreshList();
+		message.success(skillId ? `已加载技能：${view.skills.find((skill) => skill.id === skillId)?.name ?? "技能"}` : "已退出当前技能");
+	} catch (cause) {
+		error.value = cause?.message ?? "切换技能失败";
 	}
 }
 
@@ -593,7 +812,23 @@ async function togglePlanMode() {
 	}
 }
 
-/** /compact：压缩这条对话的上下文（成功后只点亮「已压缩」提示条，不展示摘要） */
+async function cycleThinkingLevel() {
+	if (!current.value) {
+		error.value = "先打开一个对话，再调整推理强度。";
+		return;
+	}
+	const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+	const index = levels.indexOf(current.value.thinkingLevel ?? "medium");
+	const thinkingLevel = levels[(index + 1) % levels.length];
+	try {
+		current.value = await sessionApi.setThinking(current.value.id, thinkingLevel);
+		message.success(`Pi 推理强度：${thinkingLevel}`);
+	} catch (err) {
+		error.value = err?.message ?? "调整推理强度失败";
+	}
+}
+
+/** /compact：压缩上下文，并把摘要记录放入对话时间线。 */
 async function compactContext() {
 	if (!current.value) {
 		error.value = "先打开一个对话，再压缩。";
@@ -604,25 +839,35 @@ async function compactContext() {
 		return;
 	}
 	compacting.value = true;
+	startCompactingTimer();
 	error.value = "";
+	const sessionId = current.value.id;
 	try {
-		const result = await sessionApi.compact(current.value.id);
-		compactedInfo.value = { summary: result?.summary ?? "", kept: Number(result?.kept ?? 0) };
-		compactedDismissed.value = false;
-		await openSession(current.value.id);
+		await sessionApi.compact(sessionId);
+		const view = await http.get(`/api/sessions/${sessionId}`);
+		if (current.value?.id === sessionId) {
+			current.value = view;
+			applyCompressedTranscript(view.transcript);
+		}
 	} catch (err) {
 		error.value = err?.message ?? "压缩失败";
 	} finally {
 		compacting.value = false;
+		stopCompactingTimer();
 	}
 }
 
 onMounted(() => {
 	bootstrap();
+	pluginsApi.list().then((plugins) => { piSkills.value = piSkillsFromPlugins(plugins); }).catch((cause) => { error.value = cause?.message ?? "读取 Pi 技能失败"; });
 	// Agent 专属页同样需要模型选择器：模型列表不拉，控件会一直置灰（实测踩过）
 	loadModels();
 });
-onBeforeUnmount(closeStream);
+onBeforeUnmount(() => {
+	openSessionSequence += 1;
+	closeStream();
+	stopCompactingTimer();
+});
 
 /**
  * 换 Agent：/agent-chat/A → /agent-chat/B 命中的是同一条路由记录，Vue 会复用同一个组件实例，
@@ -632,6 +877,7 @@ onBeforeUnmount(closeStream);
  */
 watch(agentId, async (next, previous) => {
 	if (!next || next === previous) return;
+	openSessionSequence += 1;
 	current.value = null;
 	messages.value = [];
 	sessions.value = [];
@@ -659,6 +905,7 @@ watch(() => route.query.session, async (id) => {
 	<PageShell wide :title="agent ? agent.name : 'Agent 对话'" :subtitle="agent?.description || '这个 Agent 的专属对话；它的历史不会混进通用对话页'">
 		<template #actions>
 <n-button class="chat-list-toggle" @click="showSessions=!showSessions">会话列表</n-button>
+			<n-button v-if="current" size="small" @click="piTreeOpen=true">Pi 会话树</n-button>
 			<n-button size="small" @click="router.push({ name: 'agents' })">返回 Agent 列表</n-button>
 			<n-button type="primary" size="small" :loading="busy" :disabled="!canStart" @click="createSession">
 				新对话
@@ -701,9 +948,14 @@ watch(() => route.query.session, async (id) => {
 							class="chat-session"
 							:class="{ active: item.id === current?.id }"
 							@click="openSession(item.id)"
- role="button" tabindex="0" @keydown.enter="openSession(item.id)" @keydown.space.prevent="openSession(item.id)"
+							role="button" tabindex="0"
+							@keydown.enter="openSession(item.id)"
+							@keydown.space.prevent="openSession(item.id)"
+							@keydown="onSessionContextKeydown(item, $event)"
+							@contextmenu.prevent.stop="openSessionContextMenu(item, $event)"
 						>
 							<div class="chat-session-title">{{ titleOf(item) }}</div>
+							<span v-if="pinnedIds.includes(item.id)" class="chat-session-pin">置顶</span>
 							<div class="chat-session-meta">
 								<n-tag v-if="item.archived" size="tiny" :bordered="false">已归档</n-tag>
 							</div>
@@ -713,7 +965,9 @@ watch(() => route.query.session, async (id) => {
 				</aside>
 
 				<section class="chat-main">
-<div style="padding:12px 16px 0"><SessionToolbar :session="current" :busy="sending" @busy="value=>toolbarBusy=value" @updated="view=>{current=view;hydrate(view);refreshList()}" @removed="removed" /></div>
+					<PiSessionTree v-model:show="piTreeOpen" :session-id="current?.id" :can-fork="Boolean(current && !sending && !current.pendingApprovals?.length)" :can-navigate="Boolean(current && !sending && !current.pendingApprovals?.length)" @navigate="onPiTreeNavigate" @fork="onPiTreeFork" />
+					<PiSessionStats v-model:show="piStatsOpen" :stats="piStats" />
+					<SessionContextMenu ref="sessionContextMenuRef" :session="contextSession" :x="contextX" :y="contextY" :busy="toolbarBusy || (sending && contextSession?.id === current?.id)" :pinned="contextSession ? pinnedIds.includes(contextSession.id) : false" @close="contextSession=null" @pin="toggleSessionPin(contextSession)" @busy="toolbarBusy=$event" @updated="onContextSessionUpdated" @removed="onContextSessionRemoved" @created="onContextSessionCreated" />
 					<header v-if="current" class="chat-head">
 						<div class="chat-head-title">{{ titleOf(current) }}</div>
 						<div class="chat-head-tags">
@@ -727,21 +981,18 @@ watch(() => route.query.session, async (id) => {
 					</header>
 
 					<div ref="scrollBox" class="chat-scroll">
-<SessionActivity :session-id="current?.id" :tools="activity.tools.value" :pending="activity.pending.value" :steps="current?.steps??[]" :elapsed-ms="activity.elapsedMs.value" :running="sending" @resolved="activity.resolved"/>
-						<!-- 压缩提示：与对话页同款，只有标题行 + 收起，不显示摘要正文；滑入动画尊重 prefers-reduced-motion -->
-						<Transition name="notice">
-							<div v-if="compactedInfo && !compactedDismissed" class="chat-compacted" data-testid="compacted-notice">
-								<div class="chat-compacted-head">
-									<span>已压缩上下文{{ compactedInfo.kept !== null ? `（保留了最近 ${compactedInfo.kept} 条）` : "" }}</span>
-									<button type="button" class="chat-compacted-close" @click="compactedDismissed = true">收起</button>
-								</div>
-							</div>
-						</Transition>
 						<n-empty v-if="!current" description="点「新对话」开始跟这个 Agent 说话" />
-						<div v-for="(msg, index) in messages" :key="index" class="chat-msg" :class="msg.role">
-							<div class="chat-role">{{ msg.role === "user" ? "我" : "助手" }}</div>
-							<div class="chat-bubble"><MessageBody :text="msg.text" :markdown="msg.role==='assistant'"/></div>
-						</div>
+						<template v-for="(msg, index) in messages" :key="`${msg.role}-${msg.at}-${index}`">
+							<article v-if="msg.role === 'compaction'" class="chat-compaction-record" data-testid="compaction-record">
+								<header><span class="chat-compaction-badge">{{ msg.automatic ? "上下文已自动压缩" : "上下文已压缩" }}</span><span>前序对话摘要</span></header>
+								<div class="chat-compaction-summary"><MessageBody :text="msg.text" :markdown="true"/></div>
+							</article>
+							<div v-else class="chat-msg" :class="[msg.role, { 'with-activity': msg.role==='user' && (msg.startedAt || msg.durationMs > 0 || msg.tools?.length || activity.pending.value.length && activity.activeTurn.value===msg) }]">
+								<div v-if="msg.role === 'user'" class="chat-role">我</div>
+								<div class="chat-bubble"><MessageBody :text="msg.text" :markdown="msg.role==='assistant'"/></div>
+								<SessionActivity v-if="msg.role==='user' && (msg.startedAt || msg.durationMs > 0 || msg.tools?.length || activity.pending.value.length && activity.activeTurn.value===msg)" :session-id="current?.id" :turn="msg" :pending="activity.activeTurn.value===msg ? activity.pending.value : []" :elapsed-ms="activity.activeTurn.value===msg ? activity.elapsedMs.value : msg.durationMs" :running="sending && activity.activeTurn.value===msg" @resolved="activity.resolved"/>
+							</div>
+						</template>
 
 						<div v-if="streamThinking" class="chat-thinking">
 							<button class="chat-thinking-head" @click="showThinking = !showThinking">
@@ -751,9 +1002,16 @@ watch(() => route.query.session, async (id) => {
 						</div>
 
 						<div v-if="streamText" class="chat-msg assistant">
-							<div class="chat-role">助手</div>
 							<div class="chat-bubble"><MessageBody :text="streamText"/></div>
 						</div>
+
+						<Transition name="notice">
+							<div v-if="compacting" class="chat-compacting" data-testid="compacting-indicator">
+								<span class="chat-compacting-spin" aria-hidden="true"></span>
+								<span>{{ compactingText }}</span>
+								<div class="chat-compacting-bar" aria-hidden="true"><span class="chat-compacting-bar-fill"></span></div>
+							</div>
+						</Transition>
 					</div>
 
 					<footer class="chat-input">
@@ -792,30 +1050,43 @@ watch(() => route.query.session, async (id) => {
 							@input="onDraftInput"
 						/>
 						<div class="chat-compose-actions">
-							<n-button quaternary :loading="attachmentBusy" :disabled="attachmentBusy || sending || !current" @click="fileInput?.click()">附加文件</n-button>
+						<n-button quaternary :loading="attachmentBusy" :disabled="attachmentBusy || toolbarBusy || !current" @click="fileInput?.click()">附加文件</n-button>
+						<span v-if="queuedFollowUps.length" class="queue-status">已排队 {{ queuedFollowUps.length }} 条</span>
 							<!--
 								上下文用量圆环：输入框左下角，同对话页（SVG 占比 + 中心 k 数 + 警示色）。
 							-->
-							<div
-								class="ctx-ring"
-								:class="{ warn: usageWarn }"
-								data-testid="context-usage"
-								:title="usageTitle"
-							>
-								<svg viewBox="0 0 36 36" class="ctx-ring-svg" aria-hidden="true">
-									<circle class="ctx-ring-track" cx="18" cy="18" r="15.5" />
-									<circle
-										v-if="contextWindow > 0"
-										class="ctx-ring-fill"
-										cx="18" cy="18" r="15.5"
-										:stroke-dasharray="ctxRingDash"
-									/>
-								</svg>
-								<span class="ctx-ring-text" data-testid="context-usage-text">{{ usageText }}</span>
-							</div>
-							<div class="chat-model-picker">
+							<div class="chat-compose-main-actions">
+								<div
+									class="ctx-ring"
+									:class="{ warn: usageWarn }"
+									data-testid="context-usage"
+									:aria-label="usageTitle"
+									:aria-describedby="`context-usage-tooltip-${current?.id ?? 'empty'}`"
+									role="img"
+									tabindex="0"
+								>
+									<div :id="`context-usage-tooltip-${current?.id ?? 'empty'}`" class="ctx-ring-tooltip" role="tooltip">
+										<strong>背景信息窗口：</strong>
+										<span v-if="usagePercent !== null">{{ usagePercent }}% 已用</span>
+										<span v-else>总量未配置</span>
+										<b v-if="contextWindow > 0">已用 {{ formatTokens(usedTokens) }} 标记，共 {{ formatTokens(contextWindow) }}</b>
+										<b v-else>已用 {{ formatTokens(usedTokens) }} 标记</b>
+									</div>
+									<svg viewBox="0 0 36 36" class="ctx-ring-svg" aria-hidden="true">
+										<circle class="ctx-ring-track" cx="18" cy="18" r="15.5" />
+										<circle
+											v-if="contextWindow > 0"
+											class="ctx-ring-fill"
+											cx="18" cy="18" r="15.5"
+											:stroke-dasharray="ctxRingDash"
+										/>
+									</svg>
+									<span class="ctx-ring-text" data-testid="context-usage-text">{{ usageText }}</span>
+								</div>
+								<div class="chat-model-picker">
 								<!-- Codex 风格模型选择器：与对话页同款，会话级切换 -->
 								<ModelPicker
+									ref="modelPickerRef"
 									:options="modelOptions"
 									:value="modelValueAsOptionId"
 									:current-label="currentModelTitle"
@@ -823,13 +1094,12 @@ watch(() => route.query.session, async (id) => {
 									:disabled="modelOptions.length === 0"
 									@choose="onModelChange"
 								/>
+								</div>
+				<n-button class="chat-send-button" type="primary" aria-label="发送" title="发送" :loading="attachmentBusy" :disabled="!canChat || (!draft.trim() && !attachments.length) || attachmentBusy || !can('session.run')" @click="send">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+				</n-button>
+				<n-button v-if="sending" type="warning" class="chat-send-button" aria-label="停止" title="停止" :disabled="!can('session.run')" @click="stopGeneration">停止</n-button>
 							</div>
-							<n-button v-if="sending" type="warning" :disabled="!can('session.run')" @click="stopGeneration">
-								停止
-							</n-button>
-							<n-button v-else type="primary" :loading="attachmentBusy" :disabled="!canChat || (!draft.trim() && !attachments.length) || attachmentBusy || !can('session.run')" @click="send">
-								发送
-							</n-button>
 						</div>
 					</footer>
 				</section>
@@ -850,6 +1120,33 @@ watch(() => route.query.session, async (id) => {
 	background: #fef3c7;
 	border: 1px solid #fcd34d;
 }
+.chat-compaction-record {
+	margin: 0 0 14px;
+	padding: 12px 14px;
+	border: 1px solid #cbdde3;
+	border-radius: 8px;
+	background: #f5fafb;
+	color: #344b50;
+}
+.chat-compaction-record > header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+.chat-compaction-badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 3px 8px;
+	border-radius: 5px;
+	background: #e2f0f2;
+	color: #245d65;
+	font-size: 12px;
+	font-weight: 600;
+}
+.chat-compaction-record > header > span:last-child { color: #65777b; font-size: 12px; }
+.chat-compaction-summary { margin-top: 9px; padding-top: 9px; border-top: 1px solid #dce8ea; }
 .chat-compacted {
 	margin: 0 0 12px;
 	padding: 10px 14px;
@@ -858,6 +1155,44 @@ watch(() => route.query.session, async (id) => {
 	border-radius: 10px;
 	font-size: 13px;
 }
+.chat-compacting {
+	display: grid;
+	grid-template-columns: 14px minmax(0, 1fr);
+	align-items: center;
+	gap: 8px;
+	padding: 10px 12px;
+	color: #4b5268;
+	background: #f6f7fb;
+	border: 1px solid #e4e8f2;
+	border-radius: 8px;
+	font-size: 13px;
+}
+.chat-compacting-spin {
+	width: 13px;
+	height: 13px;
+	border: 2px solid #d9deeb;
+	border-top-color: #5267d8;
+	border-radius: 50%;
+	animation: compacting-rotate .9s linear infinite;
+}
+.chat-compacting-bar {
+	grid-column: 1 / -1;
+	position: relative;
+	height: 2px;
+	overflow: hidden;
+	background: #e4e8f2;
+}
+.chat-compacting-bar-fill {
+	position: absolute;
+	left: -35%;
+	width: 35%;
+	height: 100%;
+	background: #5267d8;
+	animation: compacting-flow 1.6s ease-in-out infinite;
+}
+@keyframes compacting-rotate { to { transform: rotate(360deg); } }
+@keyframes compacting-flow { to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .chat-compacting-spin, .chat-compacting-bar-fill { animation: none; } }
 .chat-compacted-head {
 	display: flex;
 	align-items: center;
@@ -874,7 +1209,17 @@ watch(() => route.query.session, async (id) => {
 }
 
 /* 上下文用量圆环：同对话页 */
-.ctx-ring { position: relative; width: 32px; height: 32px; flex: none; cursor: default; }
+.ctx-ring { position: relative; width: 18px; height: 18px; flex: none; cursor: default; }
+.ctx-ring-tooltip {
+	position: absolute; left: 50%; bottom: calc(100% + 8px); z-index: 40; display: grid; gap: 4px;
+	width: max-content; max-width: min(280px, calc(100vw - 32px)); padding: 8px 10px; border-radius: 8px;
+	background: #191b1e; color: #f5f5f5; box-shadow: 0 8px 24px rgba(0,0,0,.22); font-size: 12px;
+	line-height: 1.35; text-align: center; white-space: normal; opacity: 0; visibility: hidden;
+	transform: translate(-50%,4px); transition: opacity .14s ease,transform .14s ease,visibility .14s ease; pointer-events: none;
+}
+.ctx-ring-tooltip::after { position: absolute; top: 100%; left: 50%; border: 5px solid transparent; border-top-color: #191b1e; content: ""; transform: translateX(-50%); }
+.ctx-ring-tooltip b { font-weight: 600; }
+.ctx-ring:hover .ctx-ring-tooltip,.ctx-ring:focus-visible .ctx-ring-tooltip { opacity: 1; visibility: visible; transform: translate(-50%,0); }
 .chat-file-input { display: none; }
 .chat-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .chat-attachment { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 7px; border: 1px solid #d9dee8; border-radius: 6px; font-size: 12px; }
@@ -882,10 +1227,9 @@ watch(() => route.query.session, async (id) => {
 .ctx-ring-track { fill: none; stroke: rgba(108,124,255,.15); stroke-width: 5; }
 .ctx-ring-fill { fill: none; stroke: #6c7cff; stroke-width: 5; stroke-linecap: round; transition: stroke-dasharray .6s ease, stroke .3s ease; }
 .ctx-ring.warn .ctx-ring-fill { stroke: #e08a3c; }
-.ctx-ring.warn .ctx-ring-text { color: #b45309; }
 .ctx-ring-text {
-	position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-	font-size: 8px; font-weight: 700; color: #4b5268; line-height: 1; text-align: center;
+	position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+	white-space: nowrap; visibility: hidden; pointer-events: none;
 }
 @media (prefers-reduced-motion: reduce) { .ctx-ring-fill { transition: none; } }
 .chat-model-label { font-size: 12px; color: #8a90a5; }
@@ -934,7 +1278,7 @@ watch(() => route.query.session, async (id) => {
 	display: grid;
 	grid-template-columns: 260px minmax(0, 1fr);
 	gap: 16px;
-	min-height: 560px;
+	min-height: 0;
 }
 .chat-list {
 	display: flex;
@@ -979,6 +1323,7 @@ watch(() => route.query.session, async (id) => {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+.chat-session-pin { margin-left: 6px; color: var(--text-2); font-size: 11px; white-space: nowrap; }
 .chat-session-meta {
 	margin-top: 4px;
 	display: flex;
@@ -1041,6 +1386,10 @@ watch(() => route.query.session, async (id) => {
 	align-self: flex-end;
 	align-items: flex-end;
 }
+.chat-msg.user.with-activity { width: 100%; max-width: 100%; align-self: stretch; align-items: stretch; }
+.chat-msg.user.with-activity > .chat-role,
+.chat-msg.user.with-activity > .chat-bubble { align-self: flex-end; }
+.chat-msg.user.with-activity :deep(.turn-timing) { align-self: stretch; width: 100%; }
 .chat-role {
 	font-size: 11px;
 	opacity: 0.6;
@@ -1087,9 +1436,13 @@ watch(() => route.query.session, async (id) => {
 .chat-compose-actions {
 	display: flex;
 	align-items: center;
-	justify-content: space-between; /* 与对话页同款：圆环最左、模型居中、发送最右 */
+	justify-content: flex-start;
 	gap: 10px;
 }
+.chat-compose-main-actions { display: flex; align-items: center; gap: 16px; min-width: 0; margin-left: auto; }
+.chat-compose-main-actions :deep(.chat-send-button) { width: 34px; height: 34px; padding: 0; border-radius: 50%; }
+.queue-status { color: var(--text-muted); font-size: 12px; }
+.chat-compose-main-actions :deep(.chat-send-button svg) { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .chat-compose-actions .chat-model-label {
 	white-space: nowrap;
 	max-width: 220px;
