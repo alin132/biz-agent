@@ -14,6 +14,7 @@ import { runMigrations, SCHEMA_MIGRATIONS_DDL } from "./migrations.js";
 import type { Migration } from "./migrations.js";
 import { SyncWorkerBridge } from "./syncBridge.js";
 import {
+	type AgentGroupConversationRecord,
 	type AgentGroupMemberRecord,
 	type AgentGroupMessageRecord,
 	type AgentGroupRecord,
@@ -1401,16 +1402,16 @@ export class PostgresStorage implements Storage {
 	}
 
 	listAgentGroups(): AgentGroupRecord[] {
-		return this.rows("SELECT id, name, created_by, created_at, updated_at FROM agent_groups WHERE workspace_id = $1 ORDER BY updated_at DESC, id", [this.workspaceId]).map(toAgentGroupRecord);
+		return this.rows("SELECT id, name, created_by, created_at, updated_at, collaboration FROM agent_groups WHERE workspace_id = $1 ORDER BY updated_at DESC, id", [this.workspaceId]).map(toAgentGroupRecord);
 	}
 
 	getAgentGroup(id: string): AgentGroupRecord | undefined {
-		const row = this.rows("SELECT id, name, created_by, created_at, updated_at FROM agent_groups WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
+		const row = this.rows("SELECT id, name, created_by, created_at, updated_at, collaboration FROM agent_groups WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
 		return row ? toAgentGroupRecord(row) : undefined;
 	}
 
 	createAgentGroup(group: AgentGroupRecord): AgentGroupRecord {
-		this.exec("INSERT INTO agent_groups (id, workspace_id, name, created_by, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)", [group.id, this.workspaceId, group.name, group.createdBy, group.createdAt, group.updatedAt]);
+		this.exec("INSERT INTO agent_groups (id, workspace_id, name, created_by, created_at, updated_at, collaboration) VALUES ($1, $2, $3, $4, $5, $6, $7)", [group.id, this.workspaceId, group.name, group.createdBy, group.createdAt, group.updatedAt, group.collaboration ? JSON.stringify(group.collaboration) : null]);
 		return this.getAgentGroup(group.id)!;
 	}
 
@@ -1419,6 +1420,17 @@ export class PostgresStorage implements Storage {
 		if (!current) return undefined;
 		this.exec("UPDATE agent_groups SET name = $1, updated_at = $2 WHERE id = $3 AND workspace_id = $4", [patch.name ?? current.name, patch.updatedAt ?? Date.now(), id, this.workspaceId]);
 		return this.getAgentGroup(id);
+	}
+
+	saveAgentGroupConfig(id: string, name: string, members: AgentGroupMemberRecord[], collaboration?: AgentGroupRecord["collaboration"]): void {
+		this.bridge.transaction([
+			{ sql: "UPDATE agent_groups SET name = $1, updated_at = $2, collaboration = $5 WHERE id = $3 AND workspace_id = $4", params: [name, Date.now(), id, this.workspaceId, collaboration ? JSON.stringify(collaboration) : null] },
+			{ sql: "DELETE FROM agent_group_members WHERE group_id = $1 AND workspace_id = $2", params: [id, this.workspaceId] },
+			...members.map((member) => ({
+				sql: "INSERT INTO agent_group_members (id, workspace_id, group_id, agent_id, agent_name, position, session_id, added_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+				params: [member.id, this.workspaceId, id, member.agentId, member.agentName, member.position, member.sessionId, member.addedAt],
+			})),
+		]);
 	}
 
 	deleteAgentGroup(id: string): boolean {
@@ -1449,37 +1461,58 @@ export class PostgresStorage implements Storage {
 		return this.rowCount("DELETE FROM agent_group_members WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId]) > 0;
 	}
 
+	listAgentGroupConversations(groupId: string): AgentGroupConversationRecord[] {
+		return this.rows("SELECT * FROM agent_group_conversations WHERE group_id = $1 AND workspace_id = $2 ORDER BY updated_at DESC, id", [groupId, this.workspaceId]).map(toAgentGroupConversationRecord);
+	}
+
+	getAgentGroupConversation(id: string): AgentGroupConversationRecord | undefined {
+		const row = this.rows("SELECT * FROM agent_group_conversations WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
+		return row ? toAgentGroupConversationRecord(row) : undefined;
+	}
+
+	createAgentGroupConversation(record: AgentGroupConversationRecord): AgentGroupConversationRecord {
+		this.exec("INSERT INTO agent_group_conversations (id, workspace_id, group_id, title, created_at, updated_at, workers) VALUES ($1, $2, $3, $4, $5, $6, $7)", [record.id, this.workspaceId, record.groupId, record.title, record.createdAt, record.updatedAt, JSON.stringify(record.workers)]);
+		return this.getAgentGroupConversation(record.id)!;
+	}
+
+	updateAgentGroupConversation(id: string, patch: Partial<Pick<AgentGroupConversationRecord, "title" | "updatedAt" | "workers">>): AgentGroupConversationRecord | undefined {
+		const current = this.getAgentGroupConversation(id);
+		if (!current) return undefined;
+		this.exec("UPDATE agent_group_conversations SET title = $1, updated_at = $2, workers = $3 WHERE id = $4 AND workspace_id = $5", [patch.title ?? current.title, patch.updatedAt ?? current.updatedAt, JSON.stringify(patch.workers ?? current.workers), id, this.workspaceId]);
+		return this.getAgentGroupConversation(id);
+	}
+
 	listAgentGroupTurns(groupId: string): AgentGroupTurnRecord[] {
-		return this.rows("SELECT id, group_id, sequence, user_message, status, created_at, completed_at FROM agent_group_turns WHERE group_id = $1 AND workspace_id = $2 ORDER BY sequence, id", [groupId, this.workspaceId]).map(toAgentGroupTurnRecord);
+		return this.rows("SELECT id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id FROM agent_group_turns WHERE group_id = $1 AND workspace_id = $2 ORDER BY sequence, id", [groupId, this.workspaceId]).map(toAgentGroupTurnRecord);
 	}
 
 	getAgentGroupTurn(id: string): AgentGroupTurnRecord | undefined {
-		const row = this.rows("SELECT id, group_id, sequence, user_message, status, created_at, completed_at FROM agent_group_turns WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
+		const row = this.rows("SELECT id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id FROM agent_group_turns WHERE id = $1 AND workspace_id = $2", [id, this.workspaceId])[0];
 		return row ? toAgentGroupTurnRecord(row) : undefined;
 	}
 
 	createAgentGroupTurn(turn: AgentGroupTurnRecord): AgentGroupTurnRecord {
-		this.exec("INSERT INTO agent_group_turns (id, workspace_id, group_id, sequence, user_message, status, created_at, completed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", [turn.id, this.workspaceId, turn.groupId, turn.sequence, turn.userMessage, turn.status, turn.createdAt, turn.completedAt]);
+		this.exec("INSERT INTO agent_group_turns (id, workspace_id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", [turn.id, this.workspaceId, turn.groupId, turn.sequence, turn.userMessage, turn.status, turn.createdAt, turn.completedAt, turn.discussion ? JSON.stringify(turn.discussion) : null, turn.conversationId ?? null]);
 		return this.getAgentGroupTurn(turn.id)!;
 	}
 
-	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt">>): AgentGroupTurnRecord | undefined {
+	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt" | "discussion">>): AgentGroupTurnRecord | undefined {
 		const current = this.getAgentGroupTurn(id);
 		if (!current) return undefined;
-		this.exec("UPDATE agent_group_turns SET status = $1, completed_at = $2 WHERE id = $3 AND workspace_id = $4", [patch.status ?? current.status, patch.completedAt === undefined ? current.completedAt : patch.completedAt, id, this.workspaceId]);
+		this.exec("UPDATE agent_group_turns SET status = $1, completed_at = $2, discussion = $5 WHERE id = $3 AND workspace_id = $4", [patch.status ?? current.status, patch.completedAt === undefined ? current.completedAt : patch.completedAt, id, this.workspaceId, JSON.stringify(patch.discussion ?? current.discussion) ?? null]);
 		return this.getAgentGroupTurn(id);
 	}
 
 	listAgentGroupMessages(groupId: string): AgentGroupMessageRecord[] {
-		return this.rows("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at FROM agent_group_messages WHERE group_id = $1 AND workspace_id = $2 ORDER BY created_at, id", [groupId, this.workspaceId]).map(toAgentGroupMessageRecord);
+		return this.rows("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata FROM agent_group_messages WHERE group_id = $1 AND workspace_id = $2 ORDER BY created_at, id", [groupId, this.workspaceId]).map(toAgentGroupMessageRecord);
 	}
 
 	listAgentGroupTurnMessages(turnId: string): AgentGroupMessageRecord[] {
-		return this.rows("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at FROM agent_group_messages WHERE turn_id = $1 AND workspace_id = $2 ORDER BY created_at, id", [turnId, this.workspaceId]).map(toAgentGroupMessageRecord);
+		return this.rows("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata FROM agent_group_messages WHERE turn_id = $1 AND workspace_id = $2 ORDER BY created_at, id", [turnId, this.workspaceId]).map(toAgentGroupMessageRecord);
 	}
 
 	appendAgentGroupMessage(message: AgentGroupMessageRecord): AgentGroupMessageRecord {
-		this.exec("INSERT INTO agent_group_messages (id, workspace_id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", [message.id, this.workspaceId, message.groupId, message.turnId, message.role, message.agentId, message.agentName, message.content, message.isError, message.createdAt]);
+		this.exec("INSERT INTO agent_group_messages (id, workspace_id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)", [message.id, this.workspaceId, message.groupId, message.turnId, message.role, message.agentId, message.agentName, message.content, message.isError, message.createdAt, message.metadata ? JSON.stringify(message.metadata) : null]);
 		return this.listAgentGroupTurnMessages(message.turnId).find((entry) => entry.id === message.id)!;
 	}
 
@@ -1532,19 +1565,23 @@ function toAgentRecord(row: Record<string, unknown>): AgentRecord {
 }
 
 function toAgentGroupRecord(row: Record<string, unknown>): AgentGroupRecord {
-	return { id: String(row.id), name: String(row.name), createdBy: row.created_by == null ? null : String(row.created_by), createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at) };
+	return { id: String(row.id), name: String(row.name), createdBy: row.created_by == null ? null : String(row.created_by), createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at), ...(row.collaboration == null ? {} : { collaboration: typeof row.collaboration === "string" ? JSON.parse(row.collaboration) : row.collaboration as AgentGroupRecord["collaboration"] }) };
 }
 
 function toAgentGroupMemberRecord(row: Record<string, unknown>): AgentGroupMemberRecord {
 	return { id: String(row.id), groupId: String(row.group_id), agentId: String(row.agent_id), agentName: String(row.agent_name), position: asNumber(row.position), sessionId: row.session_id == null ? null : String(row.session_id), addedAt: asNumber(row.added_at) };
 }
 
+function toAgentGroupConversationRecord(row: Record<string, unknown>): AgentGroupConversationRecord {
+	return { id: String(row.id), groupId: String(row.group_id), title: String(row.title), createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at), workers: typeof row.workers === "string" ? JSON.parse(row.workers) : row.workers as Record<string, string> };
+}
+
 function toAgentGroupTurnRecord(row: Record<string, unknown>): AgentGroupTurnRecord {
-	return { id: String(row.id), groupId: String(row.group_id), sequence: asNumber(row.sequence), userMessage: String(row.user_message), status: String(row.status) as AgentGroupTurnRecord["status"], createdAt: asNumber(row.created_at), completedAt: row.completed_at == null ? null : asNumber(row.completed_at) };
+	return { ...(row.conversation_id == null ? {} : { conversationId: String(row.conversation_id) }), id: String(row.id), groupId: String(row.group_id), sequence: asNumber(row.sequence), userMessage: String(row.user_message), status: String(row.status) as AgentGroupTurnRecord["status"], createdAt: asNumber(row.created_at), completedAt: row.completed_at == null ? null : asNumber(row.completed_at), ...(row.discussion == null ? {} : { discussion: typeof row.discussion === "string" ? JSON.parse(row.discussion) : row.discussion as AgentGroupTurnRecord["discussion"] }) };
 }
 
 function toAgentGroupMessageRecord(row: Record<string, unknown>): AgentGroupMessageRecord {
-	return { id: String(row.id), groupId: String(row.group_id), turnId: String(row.turn_id), role: String(row.role) as AgentGroupMessageRecord["role"], agentId: row.agent_id == null ? null : String(row.agent_id), agentName: row.agent_name == null ? null : String(row.agent_name), content: String(row.content), isError: row.is_error === true, createdAt: asNumber(row.created_at) };
+	return { id: String(row.id), groupId: String(row.group_id), turnId: String(row.turn_id), role: String(row.role) as AgentGroupMessageRecord["role"], agentId: row.agent_id == null ? null : String(row.agent_id), agentName: row.agent_name == null ? null : String(row.agent_name), content: String(row.content), isError: row.is_error === true, createdAt: asNumber(row.created_at), ...(row.metadata == null ? {} : { metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata as AgentGroupMessageRecord["metadata"] }) };
 }
 
 /* ---------------- 监控与可观测（P9）的行映射 ---------------- */

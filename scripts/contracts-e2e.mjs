@@ -28,7 +28,8 @@ async function start(mode) {
 	});
 	children.push(child);
 	const base = `http://127.0.0.1:${port}`;
-	for (let n = 0; n < 100; n++) {
+	// Pi 的首次模块加载在 Windows 冷启动时可能超过 20 秒。
+	for (let n = 0; n < 450; n++) {
 		if (child.exitCode !== null) throw new Error(`隔离服务启动失败：${child.exitCode}`);
 		try { if ((await fetch(base + "/api/health")).ok) return base; } catch { /* 等待监听 */ }
 		await delay(200);

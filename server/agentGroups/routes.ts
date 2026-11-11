@@ -44,7 +44,7 @@ export async function handleAgentGroups(
 			if (method === "GET") { json(res, 200, { items: service.list() }); return true; }
 			if (method === "POST") {
 				const body = await bodyOf(req);
-				json(res, 201, service.create({ name: body.name, agentIds: body.agentIds, createdBy: auth.userOf(req)?.id ?? null }));
+				json(res, 201, service.create({ name: body.name, agentIds: body.agentIds, collaboration: body.collaboration, createdBy: auth.userOf(req)?.id ?? null }));
 				return true;
 			}
 			json(res, 405, { error: "这个接口只支持 GET / POST" });
@@ -55,15 +55,23 @@ export async function handleAgentGroups(
 		if (extra.length > 0 || !id) { json(res, 404, { error: "接口不存在" }); return true; }
 		if (action === "turns" && method === "POST") {
 			const body = await bodyOf(req);
-			json(res, 200, await service.send(id, body.message));
+			json(res, 200, await service.send(id, body.message, body.agentIds, body.conversationId));
 			return true;
 		}
+		if (action === "conversations" && method === "POST") { json(res, 201, service.createConversation(id)); return true; }
 		if (action === "cancel" && method === "POST") {
-			const cancelled = service.cancel(id);
-			json(res, cancelled ? 202 : 409, { cancelled, group: service.get(id) });
+			const body = await bodyOf(req);
+			const view = service.get(id, body.conversationId);
+			const cancelled = view.running && service.cancel(id);
+			json(res, cancelled ? 202 : 409, { cancelled, group: service.get(id, body.conversationId) });
 			return true;
 		}
-		if (!action && method === "GET") { json(res, 200, service.get(id)); return true; }
+		if (!action && method === "GET") { json(res, 200, service.get(id, url.searchParams.get("conversationId") ?? undefined)); return true; }
+		if (!action && method === "PATCH") {
+			const body = await bodyOf(req);
+			json(res, 200, service.update(id, { name: body.name, agentIds: body.agentIds, collaboration: body.collaboration }));
+			return true;
+		}
 		if (!action && method === "DELETE") { json(res, 200, { removed: service.delete(id) }); return true; }
 		json(res, 405, { error: "不支持的群聊操作" });
 		return true;

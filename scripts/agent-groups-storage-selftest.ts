@@ -188,6 +188,7 @@ try {
 	for (let n = 0; n < 20 && !cleanupService.get(cleanupGroup.id).running; n++) await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(cleanupService.get(cleanupGroup.id).activeAgentId, publishedAgents[0]!.id, "群组快照暴露当前正在执行的部门 Agent");
 	assert.equal(cleanupService.get(cleanupGroup.id).activeAgentName, publishedAgents[0]!.name);
+	assert.throws(() => cleanupService.update(cleanupGroup.id, { name: "运行中修改", agentIds: publishedAgents.map((agent) => agent.id) }), (error: unknown) => error instanceof AgentGroupError && error.status === 409);
 	assert.throws(() => cleanupService.delete(cleanupGroup.id), (error: unknown) => error instanceof AgentGroupError && error.status === 409, "删除运行中的群聊被拒绝，不能释放正在使用的 Pi runtime");
 	assert.equal(cleanupService.cancel(cleanupGroup.id), true, "主动取消会中止当前 Pi 会话并停止后续部门调度");
 	assert.equal(stopCount, 1, "取消调用当前部门会话的 stop/abort");
@@ -200,6 +201,45 @@ try {
 	assert.equal(cleanupService.delete(cleanupGroup.id), true);
 	assert.equal(removeCount, 1, "删除已停止的群聊会清理已启动的部门 runtime，未启动部门没有 runtime 可泄漏");
 
+	const configGroup = recoveryService.create({ name: "配置测试", agentIds: publishedAgents.map((agent) => agent.id), createdBy: "user-a" });
+	await recoveryService.send(configGroup.id, "保留记忆");
+	const beforeConfig = recoveryService.get(configGroup.id);
+	const thirdAgent = storage.createAgent({ id: "group-agent-third", name: "第三部门", status: "published", createdAt: 90, updatedAt: 90, statusChangedAt: 90 });
+	check("配置更新保留成员会话与历史，新成员无旧记忆", () => {
+		const retained = beforeConfig.members[0]!;
+		const removed = beforeConfig.members[1]!;
+		const updated = recoveryService.update(configGroup.id, { name: "更新后的群名", agentIds: [thirdAgent.id, retained.agentId] });
+		assert.equal(updated.name, "更新后的群名");
+		assert.deepEqual(updated.members.map((member) => member.agentId), [thirdAgent.id, retained.agentId]);
+		assert.equal(updated.members[0]!.sessionId, null);
+		assert.equal(updated.members[1]!.sessionId, retained.sessionId);
+		assert.equal(updated.members[1]!.id, retained.id);
+		assert.deepEqual(updated.messages, beforeConfig.messages);
+		assert.equal(workerSessions.has(removed.sessionId!), false);
+		assert.equal(workerSessions.has(retained.sessionId!), true);
+	});
+	check("配置校验先于写入，失败不改变群名和成员", () => {
+		const before = recoveryService.get(configGroup.id);
+		for (const agentIds of [[thirdAgent.id], [thirdAgent.id, thirdAgent.id], [thirdAgent.id, "missing"], [null, thirdAgent.id]]) {
+			assert.throws(() => recoveryService.update(configGroup.id, { name: "不能保存", agentIds }), AgentGroupError);
+			assert.deepEqual(recoveryService.get(configGroup.id), before);
+		}
+		assert.throws(() => recoveryService.update("missing", { name: "x", agentIds: [] }), (error: unknown) => error instanceof AgentGroupError && error.status === 404);
+	});
+	check("配置事务失败完整回滚群名与成员", () => {
+		const before = recoveryService.get(configGroup.id);
+		assert.throws(() => storage.saveAgentGroupConfig(configGroup.id, "回滚测试", [before.members[0]!, before.members[0]!]));
+		assert.deepEqual(recoveryService.get(configGroup.id), before);
+	});
+	const targeted = await recoveryService.send(configGroup.id, "只请第三部门发言", [thirdAgent.id]);
+	check("点名仅调度指定成员，其他成员不产生回复", () => {
+		const replies = targeted.messages.filter((entry) => entry.turnId === targeted.turns.at(-1)!.id && entry.role === "agent");
+		assert.deepEqual(replies.map((entry) => entry.agentId), [thirdAgent.id]);
+	});
+	await assert.rejects(recoveryService.send(configGroup.id, "非法点名", [publishedAgents[1]!.id]), (error: unknown) => error instanceof AgentGroupError && error.status === 400);
+	await assert.rejects(recoveryService.send(configGroup.id, "重复点名", [thirdAgent.id, thirdAgent.id]), AgentGroupError);
+	const allReply = await recoveryService.send(configGroup.id, "全部发言");
+	assert.equal(allReply.messages.filter((entry) => entry.turnId === allReply.turns.at(-1)!.id && entry.role === "agent").length, 2);
 	check("删除群组事务级联清理成员、turn、消息，重复删除返回 false", () => {
 		assert.equal(storage.deleteAgentGroup(group.id), true);
 		assert.equal(storage.getAgentGroup(group.id), undefined);
@@ -214,7 +254,7 @@ try {
 		assert.ok(migration);
 		const migrations = loadMigrations();
 		assert.equal(new Set(migrations.map((entry) => entry.version)).size, migrations.length);
-		assert.equal(migrations.at(-1)?.version, "0013");
+		assert.equal(migrations.at(-1)?.version, "0015");
 		assert.equal(migrations.find((entry) => entry.name === "model settings")?.version, "0012");
 		for (const table of ["agent_groups", "agent_group_members", "agent_group_turns", "agent_group_messages"]) {
 			assert.match(migration.sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));

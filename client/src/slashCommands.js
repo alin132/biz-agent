@@ -28,6 +28,12 @@ export const SLASH_COMMAND_DEFS = [
 		aliases: ["jihua", "plan"],
 	},
 	{
+		id: "mcp",
+		label: "MCP 集成",
+		hint: "打开 MCP 服务与工具管理",
+		aliases: ["mcp", "工具集成"],
+	},
+	{
 		id: "thinking",
 		label: "推理强度",
 		hint: "循环调整 Pi 推理强度",

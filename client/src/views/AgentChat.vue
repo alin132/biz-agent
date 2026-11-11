@@ -78,6 +78,7 @@ const showThinking = ref(false);
 
 let events = null;
 let openSessionSequence = 0;
+const sessionDrafts = new Map();
 const scrollBox = ref(null);
 
 const STATUS_META = {
@@ -219,6 +220,8 @@ function subscribe(id) {
 				if (current.value) current.value = { ...current.value, contextTokens: usedTokens.value, contextTokensEstimated: contextEstimated.value };
 				break;
 			case "compacting":
+				// 新一轮压缩开始后，旧的「内容不足」提示不再描述当前状态。
+				error.value = "";
 				compacting.value = true;
 				startCompactingTimer();
 				break;
@@ -244,6 +247,8 @@ function subscribe(id) {
 				queuedFollowUps.value = payload.followUp ?? [];
 				break;
 			case "done":
+				compacting.value = false;
+				stopCompactingTimer();
 				if (!streamText.value && payload.text) streamText.value = payload.text;
 				if (streamText.value.trim()) {
 					messages.value.push({ role: "assistant", text: streamText.value, at: Date.now() });
@@ -314,7 +319,18 @@ async function openSession(id) {
 		closeStream();
 		return;
 	}
+	if (current.value?.id !== id) {
+		if (current.value) sessionDrafts.set(current.value.id, draft.value);
+		draft.value = sessionDrafts.get(id) ?? "";
+		compacting.value = false;
+		stopCompactingTimer();
+		contextSession.value = null;
+	}
 	current.value = view;
+	const index = sessions.value.findIndex((item) => item.id === id);
+	if (index < 0) sessions.value.push(view);
+	else sessions.value[index] = view;
+	if (!titleOf(view).toLowerCase().includes(sessionQuery.value.toLowerCase())) sessionQuery.value = "";
 	hydrate(view);
 	selectedModel.value = view?.modelKey ?? null;
 	// 上下文用量是这条会话的累计值：换会话必须清零，否则数字会串到别的对话上
@@ -637,29 +653,16 @@ const slashOpen = ref(false);
  * 不包 .value 就取不到，slashFiltered 里 slashCommands.value 会是 undefined（实测踩过：面板永远弹不出）。 */
 const slashCommands = computed(() =>
 	createSlashCommands({
-		...(canStart.value ? { new: () => createSession() } : {}),
 		compact: () => compactContext(),
 		plan: () => togglePlanMode(),
-		thinking: () => cycleThinkingLevel(),
-		name: () => openRenameDialog(),
-		reload: () => reloadPiResources(),
-		copy: () => copyLatestAssistant(),
-		session: () => showPiStats(),
-		resume: () => { showSessions.value = true; },
-		settings: () => router.push({ name: "settings" }),
-		...(current.value && can("session.read") ? { export: () => exportPiSession() } : {}),
-		...(current.value && can("session.read") ? { "export-html": () => exportPiSessionHtml() } : {}),
-		tree: () => { piTreeOpen.value = true; },
-		fork: () => { piTreeOpen.value = true; },
-		...(current.value && can("session.write") ? { clone: () => cloneCurrentSession() } : {}),
-		model: () => modelPickerRef.value?.open(),
+		mcp: () => router.push({ name: "mcp" }),
+		skills: current.value?.skills ?? [],
+		skill: (skillId) => selectSkill(skillId),
 		piSkills: piSkills.value,
 		piSkill: (name) => {
 			draft.value = `/skill:${name} `;
 			nextTick(() => document.querySelector(".chat-input textarea")?.focus());
 		},
-		skills: current.value?.skills ?? [],
-		skill: (skillId) => selectSkill(skillId),
 	}),
 );
 
@@ -746,10 +749,10 @@ function openRenameDialog() {
 	sessionContextMenuRef.value?.openRenameFor(current.value);
 }
 
-async function showPiStats() {
-	if (!current.value) return;
+async function showPiStats(targetSession = current.value) {
+	if (!targetSession) return;
 	try {
-		piStats.value = await sessionApi.piStats(current.value.id);
+		piStats.value = await sessionApi.piStats(targetSession.id);
 		piStatsOpen.value = true;
 	} catch (cause) {
 		message.error(cause?.message ?? "读取 Pi 会话统计失败");
@@ -829,19 +832,19 @@ async function cycleThinkingLevel() {
 }
 
 /** /compact：压缩上下文，并把摘要记录放入对话时间线。 */
-async function compactContext() {
-	if (!current.value) {
+async function compactContext(targetSession = current.value) {
+	if (!targetSession) {
 		error.value = "先打开一个对话，再压缩。";
 		return;
 	}
-	if (sending.value || compacting.value) {
+	if ((sending.value && current.value?.id === targetSession.id) || compacting.value) {
 		error.value = compacting.value ? "正在压缩，稍候" : "上一条还没回完，等回复落地再压缩";
 		return;
 	}
 	compacting.value = true;
 	startCompactingTimer();
 	error.value = "";
-	const sessionId = current.value.id;
+	const sessionId = targetSession.id;
 	try {
 		await sessionApi.compact(sessionId);
 		const view = await http.get(`/api/sessions/${sessionId}`);
@@ -850,7 +853,10 @@ async function compactContext() {
 			applyCompressedTranscript(view.transcript);
 		}
 	} catch (err) {
-		error.value = err?.message ?? "压缩失败";
+		const detail = String(err?.message ?? "");
+		error.value = /Nothing to compact/i.test(detail)
+			? "当前对话还比较短，没有足够的旧内容可压缩。继续对话后再试。"
+			: detail || "压缩失败";
 	} finally {
 		compacting.value = false;
 		stopCompactingTimer();
@@ -946,6 +952,7 @@ watch(() => route.query.session, async (id) => {
 							v-for="item in visibleSessions"
 							:key="item.id"
 							class="chat-session"
+							:data-session-id="item.id"
 							:class="{ active: item.id === current?.id }"
 							@click="openSession(item.id)"
 							role="button" tabindex="0"
@@ -967,7 +974,7 @@ watch(() => route.query.session, async (id) => {
 				<section class="chat-main">
 					<PiSessionTree v-model:show="piTreeOpen" :session-id="current?.id" :can-fork="Boolean(current && !sending && !current.pendingApprovals?.length)" :can-navigate="Boolean(current && !sending && !current.pendingApprovals?.length)" @navigate="onPiTreeNavigate" @fork="onPiTreeFork" />
 					<PiSessionStats v-model:show="piStatsOpen" :stats="piStats" />
-					<SessionContextMenu ref="sessionContextMenuRef" :session="contextSession" :x="contextX" :y="contextY" :busy="toolbarBusy || (sending && contextSession?.id === current?.id)" :pinned="contextSession ? pinnedIds.includes(contextSession.id) : false" @close="contextSession=null" @pin="toggleSessionPin(contextSession)" @busy="toolbarBusy=$event" @updated="onContextSessionUpdated" @removed="onContextSessionRemoved" @created="onContextSessionCreated" />
+					<SessionContextMenu ref="sessionContextMenuRef" :session="contextSession" :x="contextX" :y="contextY" :busy="toolbarBusy || (sending && contextSession?.id === current?.id)" :pinned="contextSession ? pinnedIds.includes(contextSession.id) : false" @close="contextSession=null" @pin="toggleSessionPin(contextSession)" @busy="toolbarBusy=$event" @updated="onContextSessionUpdated" @removed="onContextSessionRemoved" @created="onContextSessionCreated" @compact="compactContext" @stats="showPiStats" />
 					<header v-if="current" class="chat-head">
 						<div class="chat-head-title">{{ titleOf(current) }}</div>
 						<div class="chat-head-tags">

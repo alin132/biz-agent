@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import { groupMentionOptions, groupMentionTargets } from '../client/src/groupMentions.js';
+const members = [{agentId:'a',agentName:'销售'}, {agentId:'b',agentName:'销售支持'}, {agentId:'c',agentName:'财务 部'}];
+assert.deepEqual(groupMentionTargets('@销售支持 请评估', members), ['b']);
+assert.deepEqual(groupMentionTargets('@销售支持者 请评估', members), []);
+assert.deepEqual(groupMentionTargets('@销售，@销售支持', members), ['a','b']);
+assert.deepEqual(groupMentionTargets('@销售 @销售支持 @财务 部：请评估 @销售', members), ['a','b','c']);
+assert.deepEqual(groupMentionTargets('test@销售.example @不在群里', members), []);
+const duplicates = [{agentId:'a',agentName:'销售'}, {agentId:'b',agentName:'销售'}];
+const options = groupMentionOptions(duplicates);
+assert.notEqual(options[0].token, options[1].token);
+assert.deepEqual(groupMentionTargets(`${options[1].token} 请发言`, duplicates), ['b']);
+assert.deepEqual(groupMentionTargets('@销售 请发言', duplicates), []);
+console.log('群聊点名解析：8 项通过');

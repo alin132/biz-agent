@@ -788,16 +788,21 @@ export interface Storage {
 	getAgentGroup(id: string): AgentGroupRecord | undefined;
 	createAgentGroup(group: AgentGroupRecord): AgentGroupRecord;
 	updateAgentGroup(id: string, patch: Partial<Pick<AgentGroupRecord, "name" | "updatedAt">>): AgentGroupRecord | undefined;
+	saveAgentGroupConfig(id: string, name: string, members: AgentGroupMemberRecord[], collaboration?: AgentGroupCollaboration): void;
 	deleteAgentGroup(id: string): boolean;
 	listAgentGroupMembers(groupId: string): AgentGroupMemberRecord[];
 	getAgentGroupMember(id: string): AgentGroupMemberRecord | undefined;
 	addAgentGroupMember(member: AgentGroupMemberRecord): AgentGroupMemberRecord;
 	updateAgentGroupMember(id: string, patch: { sessionId?: string | null }): AgentGroupMemberRecord | undefined;
 	removeAgentGroupMember(id: string): boolean;
+	listAgentGroupConversations(groupId: string): AgentGroupConversationRecord[];
+	getAgentGroupConversation(id: string): AgentGroupConversationRecord | undefined;
+	createAgentGroupConversation(record: AgentGroupConversationRecord): AgentGroupConversationRecord;
+	updateAgentGroupConversation(id: string, patch: Partial<Pick<AgentGroupConversationRecord, "title" | "updatedAt" | "workers">>): AgentGroupConversationRecord | undefined;
 	listAgentGroupTurns(groupId: string): AgentGroupTurnRecord[];
 	getAgentGroupTurn(id: string): AgentGroupTurnRecord | undefined;
 	createAgentGroupTurn(turn: AgentGroupTurnRecord): AgentGroupTurnRecord;
-	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt">>): AgentGroupTurnRecord | undefined;
+	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt" | "discussion">>): AgentGroupTurnRecord | undefined;
 	listAgentGroupMessages(groupId: string): AgentGroupMessageRecord[];
 	listAgentGroupTurnMessages(turnId: string): AgentGroupMessageRecord[];
 	appendAgentGroupMessage(message: AgentGroupMessageRecord): AgentGroupMessageRecord;
@@ -917,12 +922,37 @@ export interface AgentPatch {
 	kbIds?: string[];
 }
 
+export interface AgentGroupCollaboration {
+	mode: "moderated";
+	hostAgentId: string;
+	maxRounds: number;
+	maxCalls: number;
+}
+
+export interface AgentGroupDiscussion {
+	round: number;
+	calls: number;
+	phase: "planning" | "discussing" | "summarizing" | "finished";
+	outcome: "pending" | "consensus" | "round_limit" | "call_limit" | "failed" | "cancelled" | "interrupted";
+	participants: string[];
+	proposal: string;
+}
+
+export interface AgentGroupMessageMetadata {
+	kind: "plan" | "reply" | "summary" | "notice";
+	round: number;
+	stance?: "agree" | "disagree" | "needs_info";
+	proposalId?: string;
+	mentions?: string[];
+}
+
 export interface AgentGroupRecord {
 	id: string;
 	name: string;
 	createdBy: string | null;
 	createdAt: number;
 	updatedAt: number;
+	collaboration?: AgentGroupCollaboration;
 }
 
 export interface AgentGroupMemberRecord {
@@ -935,7 +965,17 @@ export interface AgentGroupMemberRecord {
 	addedAt: number;
 }
 
+export interface AgentGroupConversationRecord {
+	id: string;
+	groupId: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
+	workers: Record<string, string>;
+}
+
 export interface AgentGroupTurnRecord {
+	conversationId?: string;
 	id: string;
 	groupId: string;
 	sequence: number;
@@ -943,6 +983,7 @@ export interface AgentGroupTurnRecord {
 	status: "running" | "completed" | "failed" | "cancelled";
 	createdAt: number;
 	completedAt: number | null;
+	discussion?: AgentGroupDiscussion;
 }
 
 export interface AgentGroupMessageRecord {
@@ -955,6 +996,7 @@ export interface AgentGroupMessageRecord {
 	content: string;
 	isError: boolean;
 	createdAt: number;
+	metadata?: AgentGroupMessageMetadata;
 }
 
 /**

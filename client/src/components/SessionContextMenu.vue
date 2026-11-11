@@ -2,11 +2,11 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { NButton, NInput, NModal, useDialog, useMessage } from "naive-ui";
 import { http } from "../api.js";
-import { downloadPiSession } from "../piSessionDownload.js";
+import { downloadPiSession, downloadPiSessionHtml } from "../piSessionDownload.js";
 import { can } from "../access.js";
 
 const props = defineProps({ session: Object, x: Number, y: Number, busy: Boolean, pinned: Boolean });
-const emit = defineEmits(["close", "updated", "removed", "created", "busy", "pin"]);
+const emit = defineEmits(["close", "updated", "removed", "created", "busy", "pin", "compact", "stats"]);
 const dialog = useDialog();
 const message = useMessage();
 const menu = ref(null);
@@ -48,6 +48,17 @@ async function exportPiSession() {
 		await downloadPiSession(sessionId);
 	} catch (cause) {
 		message.error(cause?.message ?? "导出 Pi 会话失败");
+	}
+}
+
+async function exportPiSessionHtml() {
+	if (!targetSession.value || !canRead.value) return;
+	const sessionId = targetSession.value.id;
+	emit("close");
+	try {
+		await downloadPiSessionHtml(sessionId);
+	} catch (cause) {
+		message.error(cause?.message ?? "导出 Pi HTML 会话失败");
 	}
 }
 
@@ -130,6 +141,9 @@ onBeforeUnmount(() => {
 			@click.stop
 		>
 			<button v-if="canRead" type="button" role="menuitem" :disabled="working" @click="exportPiSession">导出 Pi 会话 (.jsonl)</button>
+			<button v-if="canRead" type="button" role="menuitem" :disabled="working" @click="exportPiSessionHtml">导出 Pi 会话 HTML</button>
+			<button v-if="canRead" type="button" role="menuitem" :disabled="busy || working" @click="emit('stats', session); emit('close')">会话统计</button>
+			<button v-if="canWrite" type="button" role="menuitem" :disabled="busy || working || session.archived" @click="emit('compact', session); emit('close')">压缩对话</button>
 			<button v-if="canWrite" type="button" role="menuitem" :disabled="busy || working" @click="cloneSession">复制对话</button>
 			<button v-if="canWrite" type="button" role="menuitem" @click="emit('pin'); emit('close')">{{ pinned ? "取消置顶" : "置顶对话" }}</button>
 			<button v-if="canWrite" type="button" role="menuitem" :disabled="busy || working" @click="renameOpen = true; emit('close')">重命名</button>

@@ -531,6 +531,7 @@ export class ModelService {
 		const runtimeProviderId = `biz_${provider.id.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 		const model: Model<any> = {
 			...template,
+			...((provider.kind === "custom" || provider.kind === "ollama") ? { api: "openai-completions" as const } : {}),
 			id: row.modelId,
 			name: row.name,
 			provider: runtimeProviderId,
@@ -590,6 +591,7 @@ export class ModelService {
 				if (!template || !baseUrl) return [];
 				return [{
 					...template,
+					...((provider.kind === "custom" || provider.kind === "ollama") ? { api: "openai-completions" as const } : {}),
 					id: row.modelId,
 					name: row.name,
 					provider: piProviderId,

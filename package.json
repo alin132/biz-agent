@@ -28,6 +28,8 @@
     "mcp:selftest": "tsx scripts/mcp-selftest.ts",
     "agents:selftest": "tsx scripts/agents-selftest.ts",
     "agent-groups:selftest": "tsx scripts/agent-groups-storage-selftest.ts",
+    "agent-groups:moderation:selftest": "tsx scripts/agent-group-moderation-selftest.ts",
+    "agent-groups:e2e": "node scripts/agent-group-moderation-e2e.mjs",
     "plugins:selftest": "tsx scripts/plugins-selftest.ts",
     "contracts:selftest": "tsx scripts/session-contract-selftest.ts",
     "contracts:e2e": "node scripts/contracts-e2e.mjs",

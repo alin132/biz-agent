@@ -12,6 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { WorkflowSkillText, WorkflowStep } from "../../src/core/types.js";
 import { DEFAULT_WORKSPACE_ID } from "./types.js";
 import type {
+	AgentGroupConversationRecord,
 	AgentGroupMemberRecord,
 	AgentGroupMessageRecord,
 	AgentGroupRecord,
@@ -300,6 +301,15 @@ const SCHEMA_DDL = `
 		updated_at INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_agent_groups_updated ON agent_groups (updated_at DESC);
+	CREATE TABLE IF NOT EXISTS agent_group_conversations (
+		id TEXT PRIMARY KEY,
+		group_id TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+		title TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		workers TEXT NOT NULL DEFAULT '{}'
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_group_conversations_group ON agent_group_conversations (group_id, updated_at DESC);
 	CREATE TABLE IF NOT EXISTS agent_group_members (
 		id TEXT PRIMARY KEY,
 		group_id TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
@@ -344,6 +354,10 @@ const SCHEMA_DDL = `
  * `CREATE TABLE IF NOT EXISTS` 只对新库生效，老库加了列必须在这里补一行，否则读写直接炸。
  */
 const EXTRA_COLUMNS: { table: string; name: string; ddl: string }[] = [
+	{ table: "agent_group_turns", name: "conversation_id", ddl: "ALTER TABLE agent_group_turns ADD COLUMN conversation_id TEXT REFERENCES agent_group_conversations(id)" },
+	{ table: "agent_groups", name: "collaboration", ddl: "ALTER TABLE agent_groups ADD COLUMN collaboration TEXT" },
+	{ table: "agent_group_turns", name: "discussion", ddl: "ALTER TABLE agent_group_turns ADD COLUMN discussion TEXT" },
+	{ table: "agent_group_messages", name: "metadata", ddl: "ALTER TABLE agent_group_messages ADD COLUMN metadata TEXT" },
 	{ table: "workflows", name: "skill", ddl: "ALTER TABLE workflows ADD COLUMN skill TEXT" },
 	{ table: "workflows", name: "plugin_id", ddl: "ALTER TABLE workflows ADD COLUMN plugin_id TEXT" },
 	// P7 MCP：老库可能只建了 0001 那版（没有 env / 最近一次发现状态），启动时补齐
@@ -1583,16 +1597,16 @@ export class SqliteStorage implements Storage {
 	}
 
 	listAgentGroups(): AgentGroupRecord[] {
-		return (this.db.prepare("SELECT id, name, created_by, created_at, updated_at FROM agent_groups ORDER BY updated_at DESC, id").all() as Record<string, unknown>[]).map(toAgentGroupRecord);
+		return (this.db.prepare("SELECT id, name, created_by, created_at, updated_at, collaboration FROM agent_groups ORDER BY updated_at DESC, id").all() as Record<string, unknown>[]).map(toAgentGroupRecord);
 	}
 
 	getAgentGroup(id: string): AgentGroupRecord | undefined {
-		const row = this.db.prepare("SELECT id, name, created_by, created_at, updated_at FROM agent_groups WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+		const row = this.db.prepare("SELECT id, name, created_by, created_at, updated_at, collaboration FROM agent_groups WHERE id = ?").get(id) as Record<string, unknown> | undefined;
 		return row ? toAgentGroupRecord(row) : undefined;
 	}
 
 	createAgentGroup(group: AgentGroupRecord): AgentGroupRecord {
-		this.db.prepare("INSERT INTO agent_groups (id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(group.id, group.name, group.createdBy, group.createdAt, group.updatedAt);
+		this.db.prepare("INSERT INTO agent_groups (id, name, created_by, created_at, updated_at, collaboration) VALUES (?, ?, ?, ?, ?, ?)").run(group.id, group.name, group.createdBy, group.createdAt, group.updatedAt, group.collaboration ? JSON.stringify(group.collaboration) : null);
 		return this.getAgentGroup(group.id)!;
 	}
 
@@ -1600,6 +1614,20 @@ export class SqliteStorage implements Storage {
 		if (!this.getAgentGroup(id)) return undefined;
 		this.db.prepare("UPDATE agent_groups SET name = ?, updated_at = ? WHERE id = ?").run(patch.name ?? this.getAgentGroup(id)!.name, patch.updatedAt ?? Date.now(), id);
 		return this.getAgentGroup(id);
+	}
+
+	saveAgentGroupConfig(id: string, name: string, members: AgentGroupMemberRecord[], collaboration?: AgentGroupRecord["collaboration"]): void {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			this.updateAgentGroup(id, { name, updatedAt: Date.now() });
+			this.db.prepare("UPDATE agent_groups SET collaboration = ? WHERE id = ?").run(collaboration ? JSON.stringify(collaboration) : null, id);
+			this.db.prepare("DELETE FROM agent_group_members WHERE group_id = ?").run(id);
+			for (const member of members) this.addAgentGroupMember(member);
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	deleteAgentGroup(id: string): boolean {
@@ -1641,12 +1669,33 @@ export class SqliteStorage implements Storage {
 		return Number(this.db.prepare("DELETE FROM agent_group_members WHERE id = ?").run(id).changes) > 0;
 	}
 
+	listAgentGroupConversations(groupId: string): AgentGroupConversationRecord[] {
+		return (this.db.prepare("SELECT * FROM agent_group_conversations WHERE group_id = ? ORDER BY updated_at DESC, id").all(groupId) as Record<string, unknown>[]).map(toAgentGroupConversationRecord);
+	}
+
+	getAgentGroupConversation(id: string): AgentGroupConversationRecord | undefined {
+		const row = this.db.prepare("SELECT * FROM agent_group_conversations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+		return row ? toAgentGroupConversationRecord(row) : undefined;
+	}
+
+	createAgentGroupConversation(record: AgentGroupConversationRecord): AgentGroupConversationRecord {
+		this.db.prepare("INSERT INTO agent_group_conversations (id, group_id, title, created_at, updated_at, workers) VALUES (?, ?, ?, ?, ?, ?)").run(record.id, record.groupId, record.title, record.createdAt, record.updatedAt, JSON.stringify(record.workers));
+		return this.getAgentGroupConversation(record.id)!;
+	}
+
+	updateAgentGroupConversation(id: string, patch: Partial<Pick<AgentGroupConversationRecord, "title" | "updatedAt" | "workers">>): AgentGroupConversationRecord | undefined {
+		const current = this.getAgentGroupConversation(id);
+		if (!current) return undefined;
+		this.db.prepare("UPDATE agent_group_conversations SET title = ?, updated_at = ?, workers = ? WHERE id = ?").run(patch.title ?? current.title, patch.updatedAt ?? current.updatedAt, JSON.stringify(patch.workers ?? current.workers), id);
+		return this.getAgentGroupConversation(id);
+	}
+
 	listAgentGroupTurns(groupId: string): AgentGroupTurnRecord[] {
-		return (this.db.prepare("SELECT id, group_id, sequence, user_message, status, created_at, completed_at FROM agent_group_turns WHERE group_id = ? ORDER BY sequence, id").all(groupId) as Record<string, unknown>[]).map(toAgentGroupTurnRecord);
+		return (this.db.prepare("SELECT id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id FROM agent_group_turns WHERE group_id = ? ORDER BY sequence, id").all(groupId) as Record<string, unknown>[]).map(toAgentGroupTurnRecord);
 	}
 
 	getAgentGroupTurn(id: string): AgentGroupTurnRecord | undefined {
-		const row = this.db.prepare("SELECT id, group_id, sequence, user_message, status, created_at, completed_at FROM agent_group_turns WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+		const row = this.db.prepare("SELECT id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id FROM agent_group_turns WHERE id = ?").get(id) as Record<string, unknown> | undefined;
 		return row ? toAgentGroupTurnRecord(row) : undefined;
 	}
 
@@ -1657,7 +1706,7 @@ export class SqliteStorage implements Storage {
 				const error = Object.assign(new Error("agent group already has a running turn"), { code: "AGENT_GROUP_TURN_ALREADY_RUNNING" });
 				throw error;
 			}
-			this.db.prepare("INSERT INTO agent_group_turns (id, group_id, sequence, user_message, status, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(turn.id, turn.groupId, turn.sequence, turn.userMessage, turn.status, turn.createdAt, turn.completedAt);
+			this.db.prepare("INSERT INTO agent_group_turns (id, group_id, sequence, user_message, status, created_at, completed_at, discussion, conversation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(turn.id, turn.groupId, turn.sequence, turn.userMessage, turn.status, turn.createdAt, turn.completedAt, turn.discussion ? JSON.stringify(turn.discussion) : null, turn.conversationId ?? null);
 			this.db.exec("COMMIT");
 			return this.getAgentGroupTurn(turn.id)!;
 		} catch (error) {
@@ -1666,23 +1715,23 @@ export class SqliteStorage implements Storage {
 		}
 	}
 
-	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt">>): AgentGroupTurnRecord | undefined {
+	updateAgentGroupTurn(id: string, patch: Partial<Pick<AgentGroupTurnRecord, "status" | "completedAt" | "discussion">>): AgentGroupTurnRecord | undefined {
 		const current = this.getAgentGroupTurn(id);
 		if (!current) return undefined;
-		this.db.prepare("UPDATE agent_group_turns SET status = ?, completed_at = ? WHERE id = ?").run(patch.status ?? current.status, patch.completedAt === undefined ? current.completedAt : patch.completedAt, id);
+		this.db.prepare("UPDATE agent_group_turns SET status = ?, completed_at = ?, discussion = ? WHERE id = ?").run(patch.status ?? current.status, patch.completedAt === undefined ? current.completedAt : patch.completedAt, JSON.stringify(patch.discussion ?? current.discussion) ?? null, id);
 		return this.getAgentGroupTurn(id);
 	}
 
 	listAgentGroupMessages(groupId: string): AgentGroupMessageRecord[] {
-		return (this.db.prepare("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at FROM agent_group_messages WHERE group_id = ? ORDER BY created_at, id").all(groupId) as Record<string, unknown>[]).map(toAgentGroupMessageRecord);
+		return (this.db.prepare("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata FROM agent_group_messages WHERE group_id = ? ORDER BY created_at, id").all(groupId) as Record<string, unknown>[]).map(toAgentGroupMessageRecord);
 	}
 
 	listAgentGroupTurnMessages(turnId: string): AgentGroupMessageRecord[] {
-		return (this.db.prepare("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at FROM agent_group_messages WHERE turn_id = ? ORDER BY created_at, id").all(turnId) as Record<string, unknown>[]).map(toAgentGroupMessageRecord);
+		return (this.db.prepare("SELECT id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata FROM agent_group_messages WHERE turn_id = ? ORDER BY created_at, id").all(turnId) as Record<string, unknown>[]).map(toAgentGroupMessageRecord);
 	}
 
 	appendAgentGroupMessage(message: AgentGroupMessageRecord): AgentGroupMessageRecord {
-		this.db.prepare("INSERT INTO agent_group_messages (id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(message.id, message.groupId, message.turnId, message.role, message.agentId, message.agentName, message.content, message.isError ? 1 : 0, message.createdAt);
+		this.db.prepare("INSERT INTO agent_group_messages (id, group_id, turn_id, role, agent_id, agent_name, content, is_error, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(message.id, message.groupId, message.turnId, message.role, message.agentId, message.agentName, message.content, message.isError ? 1 : 0, message.createdAt, message.metadata ? JSON.stringify(message.metadata) : null);
 		return this.listAgentGroupTurnMessages(message.turnId).find((entry) => entry.id === message.id)!;
 	}
 
@@ -1746,19 +1795,23 @@ function toAgentRecord(row: AgentDbRow): AgentRecord {
 }
 
 function toAgentGroupRecord(row: Record<string, unknown>): AgentGroupRecord {
-	return { id: String(row.id), name: String(row.name), createdBy: row.created_by == null ? null : String(row.created_by), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at) };
+	return { id: String(row.id), name: String(row.name), createdBy: row.created_by == null ? null : String(row.created_by), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at), ...(row.collaboration == null ? {} : { collaboration: typeof row.collaboration === "string" ? JSON.parse(row.collaboration) : row.collaboration as AgentGroupRecord["collaboration"] }) };
 }
 
 function toAgentGroupMemberRecord(row: Record<string, unknown>): AgentGroupMemberRecord {
 	return { id: String(row.id), groupId: String(row.group_id), agentId: String(row.agent_id), agentName: String(row.agent_name), position: Number(row.position), sessionId: row.session_id == null ? null : String(row.session_id), addedAt: Number(row.added_at) };
 }
 
+function toAgentGroupConversationRecord(row: Record<string, unknown>): AgentGroupConversationRecord {
+	return { id: String(row.id), groupId: String(row.group_id), title: String(row.title), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at), workers: JSON.parse(String(row.workers)) };
+}
+
 function toAgentGroupTurnRecord(row: Record<string, unknown>): AgentGroupTurnRecord {
-	return { id: String(row.id), groupId: String(row.group_id), sequence: Number(row.sequence), userMessage: String(row.user_message), status: row.status as AgentGroupTurnRecord["status"], createdAt: Number(row.created_at), completedAt: row.completed_at == null ? null : Number(row.completed_at) };
+	return { ...(row.conversation_id == null ? {} : { conversationId: String(row.conversation_id) }), id: String(row.id), groupId: String(row.group_id), sequence: Number(row.sequence), userMessage: String(row.user_message), status: row.status as AgentGroupTurnRecord["status"], createdAt: Number(row.created_at), completedAt: row.completed_at == null ? null : Number(row.completed_at), ...(row.discussion == null ? {} : { discussion: typeof row.discussion === "string" ? JSON.parse(row.discussion) : row.discussion as AgentGroupTurnRecord["discussion"] }) };
 }
 
 function toAgentGroupMessageRecord(row: Record<string, unknown>): AgentGroupMessageRecord {
-	return { id: String(row.id), groupId: String(row.group_id), turnId: String(row.turn_id), role: row.role as AgentGroupMessageRecord["role"], agentId: row.agent_id == null ? null : String(row.agent_id), agentName: row.agent_name == null ? null : String(row.agent_name), content: String(row.content), isError: Number(row.is_error) !== 0, createdAt: Number(row.created_at) };
+	return { id: String(row.id), groupId: String(row.group_id), turnId: String(row.turn_id), role: row.role as AgentGroupMessageRecord["role"], agentId: row.agent_id == null ? null : String(row.agent_id), agentName: row.agent_name == null ? null : String(row.agent_name), content: String(row.content), isError: Number(row.is_error) !== 0, createdAt: Number(row.created_at), ...(row.metadata == null ? {} : { metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata as AgentGroupMessageRecord["metadata"] }) };
 }
 
 /** IM 机器人表的行（列名下划线，只在这一层映射）。 */

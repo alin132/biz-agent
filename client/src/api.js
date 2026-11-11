@@ -329,10 +329,12 @@ export const agentsApi = {
 
 export const agentGroupsApi = {
 	list: async () => items(await http.get("/api/agent-groups")),
-	get: (id) => http.get(`/api/agent-groups/${encodeURIComponent(id)}`),
+	get: (id, conversationId) => http.get(`/api/agent-groups/${encodeURIComponent(id)}${conversationId && conversationId !== id ? `?conversationId=${encodeURIComponent(conversationId)}` : ""}`),
+	createConversation: (id) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/conversations`, {}),
 	create: (input) => http.post("/api/agent-groups", input),
-	send: (id, message) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/turns`, { message }),
-	cancel: (id) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/cancel`, {}),
+	update: (id, input) => http.patch(`/api/agent-groups/${encodeURIComponent(id)}`, input),
+	send: (id, message, agentIds, conversationId) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/turns`, { message, conversationId, ...(agentIds?.length ? { agentIds } : {}) }),
+	cancel: (id, conversationId) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/cancel`, { conversationId }),
 	remove: (id) => http.delete(`/api/agent-groups/${encodeURIComponent(id)}`),
 };
 

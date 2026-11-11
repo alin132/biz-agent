@@ -185,6 +185,7 @@ const activeKey = computed(() => {
 	// Agent 的专属对话页在侧边栏里归属「Agent」（它就是从这个列表点进去的），
 	// 而不是「对话」——否则用户点开某个 Agent 后，菜单会跳到通用对话页那一项上，自相矛盾。
 	if (route.name === "agent-chat") return "agents";
+	if (route.name === "agent-group-chat") return "agent-groups";
 	return route.name;
 });
 function handleMenu(key) {
