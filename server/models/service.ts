@@ -426,6 +426,27 @@ export class ModelService {
 		return this.buildRuntime(row, provider);
 	}
 
+	/** 发布检查只读配置，不注册 Pi 运行时，也不请求供应商。 */
+	configurationReadiness(modelKey?: string): { mode: "live" | "simulated" | "fallback"; error?: string; contextWindow?: number } {
+		const row = modelKey ? this.store.findModelByKey(modelKey) : this.currentRow();
+		const fail = (error: string) => ({ mode: "simulated" as const, error });
+		if (modelKey && !row) return fail("绑定的模型不存在，请重新选择对话模型。");
+		if (row) {
+			if (row.kind !== "chat" || !row.enabled) return fail("绑定的模型已停用或不是对话模型。");
+			const provider = this.store.providerRow(row.providerId);
+			if (!provider || !provider.enabled) return fail("模型供应商不存在或已停用。");
+			const template = pickTemplate(providerKindToPi(provider.kind), row.modelId);
+			if (!template || !resolveBaseUrl(provider, template.baseUrl)) return fail("模型缺少可用的供应商接口地址或协议配置。");
+			try {
+				if (!this.store.secretOf(provider) && provider.kind !== "ollama") return fail("模型供应商尚未填写 API Key，请到模型管理补充。");
+			} catch {
+				return fail("模型凭证无法解密，请到模型管理重新填写 API Key。");
+			}
+			return { mode: llmDisabled() ? "simulated" : "live", contextWindow: row.contextWindow ?? template.contextWindow };
+		}
+		return { mode: llmDisabled() ? "simulated" : "fallback" };
+	}
+
 	/** `/api/health.model` 与 `/v1/health` 共用（形状与 P2 完全一致）。 */
 	currentRuntime(): LlmRuntime | null {
 		const resolved = this.resolveRuntime();

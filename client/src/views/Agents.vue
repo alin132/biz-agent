@@ -29,6 +29,7 @@ import PageShell from "../components/PageShell.vue";
 import { agentsApi, kbApi, mcpApi, modelsApi, skillsApi } from "../api.js";
 
 import { can } from "../access.js";
+import { openAgentHistory, startAgentChat } from "../navigation.js";
 const dialog = useDialog();
 const keyword = ref("");
 const message = useMessage();
@@ -43,6 +44,14 @@ const busy = ref("");
 const showEditor = ref(false);
 const saving = ref(false);
 const editingId = ref(null);
+const editingAdvanced = ref({});
+const checkTarget = ref(null);
+const checkReport = ref(null);
+const checkLoading = ref(false);
+const checkError = ref("");
+const copySource = ref(null);
+const copyName = ref("");
+const copying = ref(false);
 const form = reactive(blankForm());
 const skillOptions = ref([]);
 const kbOptions = ref([]);
@@ -62,23 +71,9 @@ function chattable(status) {
  */
 async function startChat(item) {
 	busy.value = item.id + "chat";
-	const chatWindow = item.status === "published" ? window.open("about:blank", "_blank") : null;
-	if (item.status === "published" && !chatWindow) {
-		busy.value = "";
-		message.warning("浏览器阻止了新窗口，请允许此站点打开新标签页后重试。");
-		return;
-	}
-	if (chatWindow) chatWindow.opener = null;
 	try {
-		const session = await agentsApi.startChat(item.id);
-		const target = router.resolve({ name: "chat", query: { agentId: item.id, session: session.id, standalone: "1" } });
-		if (chatWindow) {
-			chatWindow.location.replace(`${window.location.origin}/${target.href}`);
-		} else {
-			router.push(target);
-		}
+		await startAgentChat(router, item.id);
 	} catch (err) {
-		chatWindow?.close();
 		message.error(err?.message ?? "开对话失败");
 	} finally {
 		busy.value = "";
@@ -92,7 +87,11 @@ async function startChat(item) {
 	 * 新对话按钮仍由 startChat 处理；这里仅进入对应 Agent 的会话列表。
  */
 function openAgentChat(item) {
-	router.push({ name: "chat", query: { agentId: item.id } });
+	try {
+		openAgentHistory(router, item.id);
+	} catch (cause) {
+		message.error(cause.message);
+	}
 }
 
 const STATUS_META = {
@@ -186,12 +185,53 @@ async function loadOptions() {
 
 function openCreate() {
 	editingId.value = null;
+	editingAdvanced.value = {};
 	Object.assign(form, blankForm());
 	showEditor.value = true;
 }
 
+function openCopy(item) {
+	copySource.value = { id: item.id, name: item.name };
+	copyName.value = `${item.name.slice(0, 55)} - 副本`;
+}
+
+async function copyAgent() {
+	if (copying.value || !copySource.value) return;
+	const name = copyName.value.trim();
+	if (!name || name.length > 60) {
+		message.warning("请填写 1–60 个字的副本名称");
+		return;
+	}
+	copying.value = true;
+	try {
+		const source = await agentsApi.get(copySource.value.id);
+		await agentsApi.create({
+			name,
+			description: source.description,
+			category: source.category,
+			icon: source.icon,
+			agentsMd: source.agentsMd,
+			modelConfig: source.modelConfig,
+			memoryConfig: source.memoryConfig,
+			advancedConfig: source.advancedConfig,
+			skillIds: source.skillIds,
+			kbIds: source.kbIds,
+		});
+		copySource.value = null;
+		keyword.value = name;
+		statusFilter.value = "all";
+		await load();
+		message.success("已复制为草稿，可独立配置和发布");
+	} catch (cause) {
+		message.error(cause?.message || "复制 Agent 失败");
+	} finally {
+		copying.value = false;
+	}
+}
+
 function openEdit(item) {
 	editingId.value = item.id;
+	editingAdvanced.value = { ...(item.advancedConfig ?? {}) };
 	Object.assign(form, blankForm(), {
 		name: item.name,
 		description: item.description,
@@ -227,7 +267,7 @@ function toPayload() {
 			stream: form.stream,
 		},
 		memoryConfig: { reserveTokens: form.reserveTokens, keepRecentTokens: form.keepRecentTokens },
-		advancedConfig: { maxIters: form.maxIters, showThinking: form.showThinking },
+		advancedConfig: { ...editingAdvanced.value, maxIters: form.maxIters, showThinking: form.showThinking },
 		skillIds: form.skillIds,
 		kbIds: form.kbIds,
 	};
@@ -259,6 +299,7 @@ async function save() {
 }
 
 async function runAction(item, action) {
+	if (action === "publish") return openCheck(item);
 	busy.value = item.id + action;
 	try {
 		await agentsApi.act(item.id, action);
@@ -268,6 +309,44 @@ async function runAction(item, action) {
 		message.error(cause.message);
 	} finally {
 		busy.value = "";
+	}
+}
+
+async function openCheck(item) {
+	if (checkLoading.value) return;
+	checkTarget.value = item;
+	checkReport.value = null;
+	await refreshCheck();
+}
+
+async function refreshCheck() {
+	if (!checkTarget.value || checkLoading.value) return;
+	checkLoading.value = true;
+	checkError.value = "";
+	try {
+		checkReport.value = await agentsApi.preflight(checkTarget.value.id);
+	} catch (cause) {
+		checkReport.value = null;
+		checkError.value = cause.message;
+	} finally {
+		checkLoading.value = false;
+	}
+}
+
+async function publishChecked() {
+	if (!checkTarget.value || !checkReport.value?.ready || checkLoading.value) return;
+	checkLoading.value = true;
+	checkError.value = "";
+	try {
+		await agentsApi.act(checkTarget.value.id, "publish");
+		checkTarget.value = null;
+		await load();
+		message.success("已发布");
+	} catch (cause) {
+		checkReport.value = null;
+		checkError.value = cause.message;
+	} finally {
+		checkLoading.value = false;
 	}
 }
 
@@ -342,7 +421,9 @@ onMounted(async () => {
 						对话
 					</n-button>
 					<n-button size="small" quaternary @click="openAgentChat(item)">历史会话</n-button>
+					<n-button size="small" quaternary @click="openCheck(item)">发布检查</n-button>
 					<details v-if="can('workflow.write')" class="more-actions"><summary>管理</summary><div class="more-menu">
+					<n-button size="small" quaternary @click="openCopy(item)">复制为草稿</n-button>
 					<n-button
 						v-for="act in actionsOf(item.status)"
 						:key="act.key"
@@ -363,6 +444,21 @@ onMounted(async () => {
 				</div>
 			</article>
 		</div>
+
+		<n-modal :show="Boolean(copySource)" preset="card" title="复制为草稿" :closable="!copying" :mask-closable="!copying" :close-on-esc="!copying" style="width: 460px; max-width: 95vw" @update:show="value => { if (!value && !copying) copySource = null; }">
+			<p class="hint">从「{{ copySource?.name }}」复制配置及能力绑定。历史会话和长期记忆保留在原 Agent。</p>
+			<n-form label-placement="top" @submit.prevent="copyAgent">
+				<n-form-item label="副本名称" required>
+					<n-input v-model:value="copyName" :disabled="copying" :maxlength="60" show-count placeholder="填写副本名称" />
+				</n-form-item>
+			</n-form>
+			<template #footer>
+				<div class="action-row">
+					<n-button :disabled="copying" @click="copySource = null">取消</n-button>
+					<n-button type="primary" :loading="copying" :disabled="copying || !copyName.trim()" @click="copyAgent">创建副本</n-button>
+				</div>
+			</template>
+		</n-modal>
 
 		<n-modal v-model:show="showEditor" preset="card" :title="editingId ? '配置 Agent' : '新建 Agent'" style="width: 860px; max-width: 95vw">
 			<p class="hint">先填写名称、职责、模型与能力绑定即可开始试用；记忆和高级设置可按需调整。</p>
@@ -463,10 +559,38 @@ onMounted(async () => {
 				</div>
 			</template>
 		</n-modal>
+		<n-modal :show="Boolean(checkTarget)" preset="card" title="Agent 发布检查" class="agent-preflight" :closable="!checkLoading" :mask-closable="!checkLoading" :close-on-esc="!checkLoading" style="width: 620px; max-width: 95vw" @update:show="value => { if (!value && !checkLoading) checkTarget = null; }">
+			<p class="check-agent-name">{{ checkTarget?.name }}</p>
+			<p v-if="checkLoading" role="status">正在检查配置…</p>
+			<p v-if="checkError" role="alert" class="check-error">{{ checkError }}</p>
+			<template v-if="checkReport">
+				<n-tag :type="checkReport.ready ? 'success' : 'error'" :bordered="false">{{ checkReport.ready ? '配置检查通过' : '存在阻断项，暂不可发布' }}</n-tag>
+				<ul class="check-issues">
+					<li v-for="(issue, index) in checkReport.issues" :key="index" :class="{ 'check-error': issue.level === 'error' }">
+						<n-tag size="small" :bordered="false" :type="issue.level === 'error' ? 'error' : 'warning'">{{ issue.level === 'error' ? '需修复' : '提醒' }}</n-tag>
+						<span>{{ issue.message }}</span>
+					</li>
+				</ul>
+				<p v-if="!checkReport.issues.length">未发现配置问题。</p>
+			</template>
+			<template #footer>
+				<div class="check-actions">
+					<n-button :disabled="checkLoading" @click="refreshCheck">重新检查</n-button>
+					<n-button v-if="checkTarget && chattable(checkTarget.status)" :disabled="checkLoading" :loading="busy === checkTarget.id + 'chat'" @click="startChat(checkTarget)">一键试聊</n-button>
+					<n-button v-if="checkTarget && ['draft', 'testing'].includes(checkTarget.status) && can('workflow.write')" type="primary" :disabled="!checkReport?.ready || checkLoading" :loading="checkLoading" @click="publishChecked">确认发布</n-button>
+				</div>
+			</template>
+		</n-modal>
 	</page-shell>
 </template>
 
 <style scoped>
+.check-agent-name { margin-top: 0; font-weight: 600; }
+.check-issues { list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 12px; }
+.check-issues li { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; }
+.check-issues .n-tag { flex-shrink: 0; margin-top: 2px; }
+.check-error { color: var(--error, #c0393a); }
+.check-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .status-bar {
 	display: flex;
 	align-items: center;

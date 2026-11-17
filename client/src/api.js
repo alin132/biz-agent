@@ -309,6 +309,7 @@ export const agentsApi = {
 	remove: (id) => http.delete(`/api/agents/${id}`),
 	/** 状态机动作：test / publish / stop / revert */
 	act: (id, action) => http.post(`/api/agents/${id}/actions`, { action }),
+	preflight: (id) => http.get(`/api/agents/${encodeURIComponent(id)}/preflight`),
 	/**
 	 * 用这个 Agent 开一个对话。
 	 *

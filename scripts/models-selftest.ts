@@ -318,6 +318,27 @@ async function main(): Promise<void> {
 		expectModelError(() => store.createModel({ providerId: provider.id, modelId: "x", kind: "image" }), 400, "chat");
 	});
 
+	await check("发布模型检查：缺失、停用、向量模型及缺少凭证均不可用", () => {
+		const service = new ModelService(storage);
+		assert.ok(service.configurationReadiness("missing").error);
+		assert.ok(service.configurationReadiness(embeddingModel.id).error);
+		assert.equal(service.configurationReadiness(chatModel.id).mode, "live");
+		store.updateModel(chatModel.id, { enabled: false });
+		try { assert.ok(service.configurationReadiness(chatModel.id).error); }
+		finally { store.updateModel(chatModel.id, { enabled: true }); }
+		store.updateProvider(provider.id, { enabled: false });
+		try { assert.ok(service.configurationReadiness(chatModel.id).error); }
+		finally { store.updateProvider(provider.id, { enabled: true }); }
+		const noKey = store.createProvider({ name: "预检无凭证", kind: "custom", baseUrl: "https://example.invalid/v1" });
+		const model = store.createModel({ providerId: noKey.id, modelId: "preflight" });
+		try { assert.ok(service.configurationReadiness(model.id).error?.includes("API Key")); }
+		finally { store.removeProvider(noKey.id); }
+		const local = store.createProvider({ name: "预检本地模型", kind: "ollama" });
+		const localModel = store.createModel({ providerId: local.id, modelId: "local" });
+		try { assert.equal(service.configurationReadiness(localModel.id).error, undefined); }
+		finally { store.removeProvider(local.id); }
+	});
+
 	await check("删供应商连带删它的模型", () => {
 		const temp = store.createProvider({ name: "待删供应商", kind: "custom" });
 		store.createModel({ providerId: temp.id, modelId: "temp-model" });

@@ -75,7 +75,7 @@ import { handleApiKeysRoute } from "./apiKeys/routes.js";
 import { openStore } from "./db/index.js";
 import { loadEnvFile } from "./env.js";
 import { initIm } from "./im/index.js";
-import { handleKb, initKb } from "./kb/index.js";
+import { getKb, handleKb, initKb } from "./kb/index.js";
 import { supportedKeyEnvs } from "./llm.js";
 import { initMcp } from "./mcp/index.js";
 import { handleModelsRoute } from "./models/routes.js";
@@ -86,6 +86,7 @@ import { handleAgents } from "./agents/routes.js";
 import { AgentGroupService } from "./agentGroups/service.js";
 import { handleAgentGroups } from "./agentGroups/routes.js";
 import { AgentService } from "./agents/service.js";
+import { checkAgentConfiguration } from "./agents/preflight.js";
 import { initModels } from "./models/service.js";
 import { PluginService, handlePluginRoute } from "./plugins/service.js";
 import { createObservability, handleMonitorRoute } from "./observability/index.js";
@@ -135,7 +136,15 @@ const models = initModels({ storage: db });
 const apiKeys = createApiKeyService(db);
 // Agent 实体（P10）：六维配置 + 状态机。只依赖存储层，不碰会话——Agent 是"配置"，
 // 会话是"运行实例"，两者解耦，别把会话搬进来。
-const agents = new AgentService({ storage: db });
+const agents = new AgentService({
+	storage: db,
+	checkConfiguration: (agent) => checkAgentConfiguration(agent, {
+		model: (id) => models.configurationReadiness(id),
+		skillAvailable: (id) => repo.all().some((skill) => skill.id === id),
+		knowledgeBases: () => getKb().listKnowledgeBases().map((kb) => ({ id: kb.id, documentCount: kb.docCount })),
+		mcpServers: () => mcp.registry.listServers(),
+	}),
+});
 const memories = new MemoryService(db);
 // 监控与可观测（P9）：每轮消息一条调用链 + 批量落 trace_events；不传存储以外的东西，
 // MCP 服务名解析通过注册表查（可观测模块本身不依赖 MCP）。

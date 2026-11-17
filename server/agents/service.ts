@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import type { Storage } from "../db/types.js";
 import type { AgentAction, AgentPatch, AgentRecord, AgentStatus } from "../db/types.js";
+import type { AgentCheckIssue, AgentPreflight } from "./preflight.js";
 
 /** 状态机的合法迁移表：当前态 → 允许的动作 → 目标态 */
 const TRANSITIONS: Record<AgentStatus, Partial<Record<AgentAction, AgentStatus>>> = {
@@ -31,6 +32,7 @@ const CHATTABLE: AgentStatus[] = ["draft", "testing", "published"];
 export type AgentFailureCode =
 	/** 3002：已发布不可直接编辑 */
 	| "published_locked"
+	| "preflight_failed"
 	/** 3003：stopped 不可对话 */
 	| "stopped_not_chattable"
 	/** 状态机不允许这次动作 */
@@ -40,6 +42,7 @@ export type AgentFailureCode =
 export class AgentError extends Error {
 	readonly status: number;
 	readonly code?: AgentFailureCode;
+	preflight?: AgentPreflight;
 
 	constructor(message: string, status: number, code?: AgentFailureCode) {
 		super(message);
@@ -54,6 +57,7 @@ export interface AgentServiceOptions {
 	/** 注入时间与 id，自检可以替换成确定性实现 */
 	now?: () => number;
 	idFactory?: () => string;
+	checkConfiguration?: (agent: AgentRecord) => AgentCheckIssue[];
 }
 
 const NAME_MAX = 60;
@@ -64,11 +68,13 @@ export class AgentService {
 	private readonly storage: Storage;
 	private readonly now: () => number;
 	private readonly idFactory: () => string;
+	private readonly checkConfiguration: (agent: AgentRecord) => AgentCheckIssue[];
 
 	constructor(options: AgentServiceOptions) {
 		this.storage = options.storage;
 		this.now = options.now ?? (() => Date.now());
 		this.idFactory = options.idFactory ?? (() => `agent_${randomUUID().replace(/-/g, "").slice(0, 12)}`);
+		this.checkConfiguration = options.checkConfiguration ?? (() => [{ code: "checks_unavailable", level: "error", message: "配置检查尚未接入，无法确认是否可发布。" }]);
 	}
 
 	list(): AgentRecord[] {
@@ -157,7 +163,13 @@ export class AgentService {
 		return this.storage.updateAgent(id, next)!;
 	}
 
-	/** 执行一次状态机动作（试运行 / 发布 / 停用 / 召回） */
+	/** 当前配置的本地检查结果，不改变 Agent 状态。 */
+	preflight(id: string): AgentPreflight {
+		const issues = this.checkConfiguration(this.get(id));
+		return { agentId: id, checkedAt: this.now(), ready: !issues.some((issue) => issue.level === "error"), issues };
+	}
+
+	/** 执行一次状态机动作（试运行 / 发布 / 停用 / 召回）。 */
 	applyAction(id: string, action: AgentAction): AgentRecord {
 		const current = this.get(id);
 		const target = TRANSITIONS[current.status][action];
@@ -167,6 +179,14 @@ export class AgentService {
 				409,
 				"illegal_transition",
 			);
+		}
+		if (action === "publish") {
+			const report = this.preflight(id);
+			if (!report.ready) {
+				const error = new AgentError("发布检查未通过，请修复阻断项后重试", 409, "preflight_failed");
+				error.preflight = report;
+				throw error;
+			}
 		}
 		return this.storage.setAgentStatus(id, target, this.now())!;
 	}

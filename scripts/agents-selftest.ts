@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../server/db/index.js";
 import { AgentError, AgentService } from "../server/agents/service.js";
+import { checkAgentConfiguration } from "../server/agents/preflight.js";
+import type { AgentCheckDependencies } from "../server/agents/preflight.js";
 import { agentPromptOf } from "../server/session.js";
 import { ToolRegistry } from "../src/core/registry.js";
 import { createBusinessRuntime } from "../src/core/runtime.js";
@@ -56,6 +58,7 @@ const store = openStore({ dbPath: join(dir, "agents.db") });
 let tick = 1000;
 const service = new AgentService({
 	storage: store,
+	checkConfiguration: () => [],
 	now: () => (tick += 10),
 	idFactory: (() => {
 		let n = 0;
@@ -109,6 +112,52 @@ check("skillIds / kbIds 去重并丢掉非字符串", () => {
 	const a = service.create({ name: "去重", skillIds: ["s1", "s1", 42 as unknown as string, ""], kbIds: ["kb1"] });
 	assert.deepEqual(a.skillIds, ["s1"]);
 	assert.deepEqual(a.kbIds, ["kb1"]);
+});
+
+console.log("\n── 发布检查 ────────────────────────────────────");
+const deps: AgentCheckDependencies = {
+	model: () => ({ mode: "simulated" }),
+	skillAvailable: (id) => id === "valid-skill",
+	knowledgeBases: () => [{ id: "empty-kb", documentCount: 0 }],
+	mcpServers: () => [{ name: "测试 MCP", enabled: true, lastStatus: "error" }],
+};
+const checked = new AgentService({ storage: store, checkConfiguration: (record) => checkAgentConfiguration(record, deps) });
+check("缺失依赖检查器时发布失败，状态保持草稿", () => {
+	const unwired = new AgentService({ storage: store });
+	const a = unwired.create({ name: "未接入检查" });
+	assert.equal(unwired.preflight(a.id).ready, false);
+	assert.throws(() => unwired.applyAction(a.id, "publish"), (cause: unknown) => cause instanceof AgentError && cause.code === "preflight_failed");
+	assert.equal(unwired.get(a.id).status, "draft");
+});
+check("模拟模型、空人格、空知识库及异常 MCP 是提醒，仍能演示发布", () => {
+	const a = checked.create({ name: "演示发布", skillIds: ["valid-skill"], kbIds: ["empty-kb"] });
+	const report = checked.preflight(a.id);
+	assert.equal(report.ready, true);
+	for (const code of ["simulated_model", "persona_empty", "kb_empty", "mcp_unverified"]) assert.ok(report.issues.some((issue) => issue.code === code && issue.level === "warning"));
+	assert.equal(checked.applyAction(a.id, "publish").status, "published");
+});
+check("失效技能和知识库阻止发布，错误携带结构化预检结果", () => {
+	const a = checked.create({ name: "失效绑定", skillIds: ["missing"], kbIds: ["missing"] });
+	assert.throws(() => checked.applyAction(a.id, "publish"), (cause: unknown) => {
+		return cause instanceof AgentError && cause.status === 409 && cause.preflight?.issues.filter((issue) => issue.level === "error").length === 2;
+	});
+	assert.equal(checked.get(a.id).status, "draft");
+});
+check("发布会重新预检，检查后模型失效不能绕过", () => {
+	const a = checked.create({ name: "检查竞争" });
+	assert.equal(checked.preflight(a.id).ready, true);
+	const original = deps.model;
+	deps.model = () => ({ mode: "simulated", error: "绑定模型已停用" });
+	try {
+		assert.throws(() => checked.applyAction(a.id, "publish"), (cause: unknown) => cause instanceof AgentError && cause.code === "preflight_failed");
+		assert.equal(checked.get(a.id).status, "draft");
+	} finally { deps.model = original; }
+});
+check("最大输出超过上下文阻断，压缩预留过大提醒", () => {
+	const a = checked.create({ name: "上下文边界", modelConfig: { maxTokens: 4096 }, memoryConfig: { reserveTokens: 4000 } });
+	const issues = checkAgentConfiguration(a, { ...deps, model: () => ({ mode: "live", contextWindow: 2048 }) });
+	assert.ok(issues.some((issue) => issue.code === "output_exceeds_context" && issue.level === "error"));
+	assert.ok(issues.some((issue) => issue.code === "compaction_reserve" && issue.level === "warning"));
 });
 
 console.log("\n── 状态机全路径 ────────────────────────────────");

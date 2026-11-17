@@ -5,6 +5,7 @@
  *   GET    /api/agents                 列表（按 updatedAt 倒序）
  *   POST   /api/agents                 新建（一律 draft）→ 201
  *   GET    /api/agents/:id             详情
+ *   GET    /api/agents/:id/preflight   发布前配置检查（不进行网络探测）
  *   PATCH  /api/agents/:id             改配置（published 拒绝，409 published_locked）
  *   DELETE /api/agents/:id             删除 → { removed: true }
  *   POST   /api/agents/:id/actions     { action: "test" | "publish" | "stop" | "revert" } 走状态机
@@ -133,6 +134,11 @@ export async function handleAgents(
 			return true;
 		}
 
+		if (suffix === "preflight" && segments.length === 2 && method === "GET") {
+			sendJson(res, 200, service.preflight(id));
+			return true;
+		}
+
 		if (suffix === "actions") {
 			if (method !== "POST") {
 				sendJson(res, 405, { error: "状态机动作只支持 POST" });
@@ -153,7 +159,7 @@ export async function handleAgents(
 	} catch (cause) {
 		if (cause instanceof AgentError) {
 			// code 一起回：前端要区分"已发布锁定"和"别的 409"，别让它去匹配中文
-			sendJson(res, cause.status, cause.code ? { error: cause.message, code: cause.code } : { error: cause.message });
+			sendJson(res, cause.status, { error: cause.message, ...(cause.code ? { code: cause.code } : {}), ...(cause.preflight ? { preflight: cause.preflight } : {}) });
 			return true;
 		}
 		const message = cause instanceof Error ? cause.message : String(cause);

@@ -25,7 +25,7 @@ process.env.DB_PATH = dbPath;
 const db = new SqliteStorage(dbPath);
 initKb({ dbPath });
 const repo = new WorkflowRepo(db);
-const service = new AgentService({ storage: db });
+const service = new AgentService({ storage: db, checkConfiguration: () => [] });
 let passed = 0;
 async function check(name: string, fn: () => void | Promise<void>) {
 	try { await fn(); passed++; console.log(`  ✓ ${name}`); }

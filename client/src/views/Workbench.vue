@@ -1,13 +1,42 @@
 <script setup>
 import { onMounted, ref, computed } from "vue";
 import { useRouter } from "vue-router";
-import { NButton, NCard, NStatistic, NTag, NEmpty, NSkeleton } from "naive-ui";
+import { NButton, NCard, NStatistic, NTag, NEmpty, NSkeleton, useMessage } from "naive-ui";
 import PageShell from "../components/PageShell.vue";
 import Panel from "../components/Panel.vue";
 import { healthApi, agentsApi, kbApi, modelsApi, http, approvalsApi } from "../api.js";
 import { can } from "../access.js";
+import { startAgentChat } from "../navigation.js";
 
 const router = useRouter();
+const message = useMessage();
+const startingAgent = ref("");
+const creatingSession = ref(false);
+
+async function createSession() {
+	if (creatingSession.value) return;
+	creatingSession.value = true;
+	try {
+		const session = await http.post("/api/sessions", { workflowId: "auto-flow" });
+		await router.push({ name: "chat", query: { session: session.id } });
+	} catch (cause) {
+		message.error(cause?.message || "新建对话失败");
+	} finally {
+		creatingSession.value = false;
+	}
+}
+
+async function startChat(item) {
+	if (startingAgent.value) return;
+	startingAgent.value = item.id;
+	try {
+		await startAgentChat(router, item.id);
+	} catch (cause) {
+		message.error(cause?.message || "开对话失败");
+	} finally {
+		startingAgent.value = "";
+	}
+}
 const loading = ref(true);
 const error = ref("");
 const health = ref(null);
@@ -92,7 +121,7 @@ onMounted(load);
 		<template #actions>
 			<n-button :loading="loading" :disabled="loading" @click="load">刷新</n-button>
 			<n-button @click="router.push({ name: 'agents' })">选择 Agent</n-button>
-			<n-button type="primary" @click="router.push({ name: 'chat' })">新建对话</n-button>
+			<n-button type="primary" :loading="creatingSession" :disabled="creatingSession" @click="createSession">新建对话</n-button>
 		</template>
 
 		<section class="workspace-status" aria-label="工作空间状态">
@@ -141,7 +170,7 @@ onMounted(load);
 				<template #actions><n-button text type="primary" @click="router.push({ name: 'chat' })">全部对话</n-button></template>
 				<div v-if="loading" class="list-loading" aria-label="正在加载最近对话"><n-skeleton v-for="index in 3" :key="index" text :repeat="2" /></div>
 				<n-empty v-else-if="!ready('sessions')" description="暂时无法读取最近对话" class="empty-state"><template #extra><n-button size="small" @click="load">重新加载</n-button></template></n-empty>
-				<n-empty v-else-if="!recentSessions.length" description="开始一段对话，最近的工作会显示在这里" class="empty-state"><template #extra><n-button size="small" type="primary" @click="router.push({ name: 'chat' })">新建对话</n-button></template></n-empty>
+				<n-empty v-else-if="!recentSessions.length" description="开始一段对话，最近的工作会显示在这里" class="empty-state"><template #extra><n-button size="small" type="primary" :loading="creatingSession" :disabled="creatingSession" @click="createSession">新建对话</n-button></template></n-empty>
 				<div v-else class="session-list">
 					<button v-for="item in recentSessions" :key="item.id" class="session-row" @click="openSession(item)">
 						<span class="session-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M20 11.5a8 8 0 0 1-8 8H5l-3 2v-10a9 9 0 0 1 18 0Z"/><path d="M7 10h8M7 14h5"/></svg></span>
@@ -171,7 +200,7 @@ onMounted(load);
 						</div>
 						<div class="agent-row-actions">
 							<n-tag size="small" :type="item.status === 'published' ? 'success' : item.status === 'testing' ? 'info' : 'default'" :bordered="false">{{ statusLabel(item.status) }}</n-tag>
-							<n-button size="small" @click="router.push({ name: 'agent-chat', params: { id: item.id } })">{{ item.status === 'published' ? '开始对话' : '试用' }}</n-button>
+							<n-button size="small" :loading="startingAgent === item.id" :disabled="Boolean(startingAgent)" @click="startChat(item)">{{ item.status === 'published' ? '开始对话' : '试用' }}</n-button>
 						</div>
 					</div>
 				</div>

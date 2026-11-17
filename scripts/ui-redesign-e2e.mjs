@@ -18,6 +18,37 @@ async function action(path,method,fn){const wait=page.waitForResponse(r=>new URL
 async function confirm(name='删除'){await page.locator('.n-dialog').getByRole('button',{name,exact:true}).click();}
 const uid=Date.now().toString(36);
 try{
+ await check('Agent 发布检查阻断失效绑定、保留高级配置并新开试聊',async()=>{
+  const subject=await api('/api/agents',{name:'发布检查-'+uid,skillIds:['missing-skill'],kbIds:['missing-kb'],advancedConfig:{maxIters:7,showThinking:false,customPolicy:{readOnly:true}}});
+  try{
+   const report=await api(`/api/agents/${subject.id}/preflight`);
+   assert.equal(report.ready,false);
+   const denied=await fetch(BASE+`/api/agents/${subject.id}/actions`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'publish'})});
+   assert.equal(denied.status,409);assert.equal((await denied.json()).code,'preflight_failed');
+   await go('agents','Agent');
+   const card=page.locator(`[data-agent-id="${subject.id}"]`);
+   await card.getByRole('button',{name:'发布检查',exact:true}).click();
+   await expect(modal().getByText('存在阻断项，暂不可发布',{exact:true})).toBeVisible();
+   await expect(modal().getByRole('button',{name:'确认发布',exact:true})).toBeDisabled();
+   await page.screenshot({path:resolve(out,'agent-preflight-blocked.png'),fullPage:true,animations:'disabled'});
+   await modal().locator('.n-base-close').click();
+   await card.locator('summary').click();await card.getByRole('button',{name:'配置',exact:true}).click();
+   await field('简介').fill('编辑基础信息应保留未展示的高级配置');
+   await action(`/api/agents/${subject.id}`,'PATCH',()=>modal().getByRole('button',{name:'保存',exact:true}).click());
+   assert.deepEqual((await api(`/api/agents/${subject.id}`)).advancedConfig.customPolicy,{readOnly:true});
+   await api(`/api/agents/${subject.id}`,{skillIds:[],kbIds:[]},'PATCH');
+   await go('agents','Agent');
+   await card.getByRole('button',{name:'发布检查',exact:true}).click();
+   await expect(modal().getByText('配置检查通过',{exact:true})).toBeVisible();
+   await expect(modal()).toContainText('当前使用模拟模型');
+   const sourceUrl=page.url();
+   const [popup]=await Promise.all([page.context().waitForEvent('page'),modal().getByRole('button',{name:'一键试聊',exact:true}).click()]);
+   try{await expect(popup.getByRole('heading',{name:subject.name,exact:true})).toBeVisible();await expect(popup.locator('.chat-input textarea')).toBeEnabled();await expect(page).toHaveURL(sourceUrl);}finally{await popup.close();}
+   await page.screenshot({path:resolve(out,'agent-preflight-ready.png'),fullPage:true,animations:'disabled'});
+   await action(`/api/agents/${subject.id}/actions`,'POST',()=>modal().getByRole('button',{name:'确认发布',exact:true}).click());
+   await expect(card.getByText('已发布',{exact:true})).toBeVisible();
+  }finally{await api(`/api/agents/${subject.id}`,undefined,'DELETE');}
+ });
  await check('工作台加载与部分失败明确展示未知，重试后恢复真实数据',async()=>{
   await go('workbench','工作台');
   let releaseHealth,healthStarted;
@@ -42,6 +73,102 @@ try{
   await page.locator('.page-head').getByRole('button',{name:'刷新',exact:true}).click();
   await expect(page.locator('.page')).toHaveAttribute('aria-busy','false');
   await expect(page.locator('.workspace-status')).toContainText('模拟模式');await expect(page.locator('.page-alert')).toHaveCount(0);
+ });
+ await check('工作台和 Agent 管理的对话入口新开独立页面，失败后关闭空标签',async()=>{
+  const agent=await api('/api/agents',{name:'独立对话入口-'+uid,description:'新标签回归'});
+  try{
+   for(const entry of ['agents-draft','workbench-draft','workbench-testing','workbench-published']){
+    if(entry==='workbench-testing')await api(`/api/agents/${agent.id}/actions`,{action:'test'});
+    if(entry==='workbench-published')await api(`/api/agents/${agent.id}/actions`,{action:'publish'});
+    const management=entry==='agents-draft';
+    if(!management){await page.goto(BASE+'/#/workbench');await page.reload();}
+    await go(management?'agents':'workbench',management?'Agent':'工作台');
+    const sourceUrl=page.url();
+    const row=management?page.locator(`[data-agent-id="${agent.id}"]`):page.locator('.agent-row').filter({hasText:agent.name});
+    const [popup]=await Promise.all([
+     page.context().waitForEvent('page'),
+     row.getByRole('button',{name:management?'对话':entry==='workbench-published'?'开始对话':'试用',exact:true}).click(),
+    ]);
+    try{
+     popup.on('pageerror',error=>errors.push(error.message));
+     await expect(popup.getByRole('heading',{name:agent.name,exact:true})).toBeVisible();
+     await expect(popup.locator('.chat-input textarea')).toBeEnabled();
+     await expect(popup.locator('.app-sider')).toHaveCount(0);
+     await expect(popup.locator('.nav-toggle')).toHaveCount(0);
+     await expect(page).toHaveURL(sourceUrl);
+     const query=new URLSearchParams(new URL(popup.url()).hash.split('?')[1]);
+     assert.equal(query.get('standalone'),'1');
+     assert.equal((await api(`/api/sessions/${query.get('session')}`)).agentId,agent.id);
+     assert.equal(await popup.evaluate(()=>window.opener),null);
+     if(entry==='workbench-published')await popup.screenshot({path:resolve(out,'workbench-agent-popup.png'),fullPage:true,animations:'disabled'});
+     console.log(`    ${entry}：新页面已显示 Agent 对话`);
+    }finally{await popup.close();}
+   }
+   const failSession=route=>route.request().method()==='POST'?route.fulfill({status:503,json:{error:'新建对话暂不可用'}}):route.continue();
+   await page.route('**/api/sessions',failSession);
+   try{
+    const popupEvent=page.context().waitForEvent('page');
+    await page.locator('.agent-row').filter({hasText:agent.name}).getByRole('button',{name:'开始对话',exact:true}).click();
+    const popup=await popupEvent;
+    await expect.poll(()=>popup.isClosed()).toBe(true);
+    await expect(page.locator('.n-message')).toContainText('新建对话暂不可用');
+    await expect(page.getByRole('heading',{name:'工作台',exact:true})).toBeVisible();
+   }finally{await page.unroute('**/api/sessions',failSession);}
+   const beforeBlocked=(await api('/api/sessions')).length;
+   await page.evaluate(()=>{window.__originalOpen=window.open;window.open=()=>null;});
+   try{
+    await page.locator('.agent-row').filter({hasText:agent.name}).getByRole('button',{name:'开始对话',exact:true}).click();
+    await expect(page.locator('.n-message').filter({hasText:'浏览器阻止了新窗口'})).toBeVisible();
+    assert.equal((await api('/api/sessions')).length,beforeBlocked);
+   }finally{await page.evaluate(()=>{window.open=window.__originalOpen;delete window.__originalOpen;});}
+   let releaseCreation;
+   const heldCreation=new Promise(resolve=>{releaseCreation=resolve;});
+   const delaySession=async route=>{
+    if(route.request().method()!=='POST')return route.continue();
+    await heldCreation;
+    await route.continue();
+   };
+   await page.route('**/api/sessions',delaySession);
+   try{
+    const [closedPage]=await Promise.all([
+     page.context().waitForEvent('page'),
+     page.locator('.agent-row').filter({hasText:agent.name}).getByRole('button',{name:'开始对话',exact:true}).click(),
+    ]);
+    const creation=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/sessions'&&response.request().method()==='POST');
+    await closedPage.close();releaseCreation();
+    const saved=await (await creation).json();
+    await expect(page.locator('.n-message').filter({hasText:'新建的会话已保留'})).toBeVisible();
+    assert.equal((await api(`/api/sessions/${saved.id}`)).agentId,agent.id);
+   }finally{releaseCreation();await page.unroute('**/api/sessions',delaySession);}
+  }finally{await api(`/api/agents/${agent.id}`,undefined,'DELETE');}
+ });
+ await check('工作台新建真实会话，Agent 历史在独立页恢复已有会话',async()=>{
+  await go('workbench','工作台');
+  const created=await action('/api/sessions','POST',()=>page.locator('.page-head').getByRole('button',{name:'新建对话',exact:true}).click());
+  await expect(page).toHaveURL(new RegExp(`session=${created.id}`));
+  await expect(page.locator('.chat-session.active')).toHaveAttribute('data-session-id',created.id);
+  await expect(page.locator('.chat-input textarea')).toBeEnabled();
+  assert.equal(created.agentId,null);
+  const agent=await api('/api/agents',{name:'历史入口-'+uid});
+  try{
+   const session=await api('/api/sessions',{workflowId:'auto-flow',agentId:agent.id});
+   await api(`/api/sessions/${session.id}`,{title:'继续原来的任务-'+uid},'PATCH');
+   await go('agents','Agent');
+   const originalUrl=page.url();
+   const [history]=await Promise.all([
+    page.context().waitForEvent('page'),
+    page.locator(`[data-agent-id="${agent.id}"]`).getByRole('button',{name:'历史会话',exact:true}).click(),
+   ]);
+   try{
+    await expect(history.getByRole('heading',{name:agent.name,exact:true})).toBeVisible();
+    await expect(history.locator('.app-sider')).toHaveCount(0);
+    await expect(page).toHaveURL(originalUrl);
+    await history.locator(`[data-session-id="${session.id}"]`).click();
+    await expect(history.locator('.chat-session.active')).toHaveAttribute('data-session-id',session.id);
+    await expect(history.locator('.chat-head-title')).toHaveText('继续原来的任务-'+uid);
+    await expect(history.locator('.chat-input textarea')).toBeEnabled();
+   }finally{await history.close();}
+  }finally{await api(`/api/agents/${agent.id}`,undefined,'DELETE');}
  });
  await check('长期记忆可创建编辑删除，刷新后保留且展示来源',async()=>{
   await go('settings','设置');
@@ -164,6 +291,68 @@ try{
   try{await go(`agent-groups/${pollGroupId}/chat`,'轮询验证-'+uid);await expect(page.getByRole('status')).toContainText('财务部门 正在处理本轮消息');await expect(page.locator('.group-members')).toContainText('财务部门 · 正在处理');await expect(page.getByTestId('group-messages')).toContainText('预算已核算，等待销售部门确认。',{timeout:5000});await expect(page.getByRole('status')).toHaveCount(0,{timeout:5000});assert.ok(reads>=2,'页面定期读取服务端群聊状态');}
   finally{await page.unroute(`**/api/agent-groups/${pollGroupId}`);await page.unroute('**/api/agent-groups');}
  });
+ await check('Agent 配置复制为草稿，取消和失败不写入，副本独立且刷新保留',async()=>{
+  const skill=(await api('/api/skills')).find(item=>item.id!=='auto-flow');
+  const kb=await api('/api/kb',{name:'副本知识库-'+uid});
+  const source=await api('/api/agents',{
+   name:'配置原件-'+uid,description:'复制前简介',category:'销售',icon:'copy-fixture',agentsMd:'# 角色\n核算预算并注明依据',
+   modelConfig:{temperature:0.3,topP:0.8,maxTokens:3072,stream:false},
+   memoryConfig:{reserveTokens:8192,keepRecentTokens:12000},
+   advancedConfig:{maxIters:7,showThinking:false},skillIds:[skill.id],kbIds:[kb.id],
+  });
+  let copiedId;
+  try{
+   await go('agents','Agent');
+   await page.getByPlaceholder('搜索 Agent 名称或用途').fill(source.name);
+   const card=page.locator(`[data-agent-id="${source.id}"]`);
+   await card.locator('summary').click();
+   await card.getByRole('button',{name:'复制为草稿',exact:true}).click();
+   const before=(await api('/api/agents')).items.length;
+   await modal().getByRole('button',{name:'取消',exact:true}).click();
+   assert.equal((await api('/api/agents')).items.length,before);
+   await card.getByRole('button',{name:'复制为草稿',exact:true}).click();
+   await page.getByPlaceholder('填写副本名称').fill('');
+   await expect(modal().getByRole('button',{name:'创建副本',exact:true})).toBeDisabled();
+   await page.getByPlaceholder('填写副本名称').fill('配置副本-'+uid);
+   await page.setViewportSize({width:390,height:844});
+   await expect(modal().getByRole('button',{name:'创建副本',exact:true})).toBeInViewport();
+   await expect(modal()).toHaveCSS('transform','none');
+   const bounds=await modal().boundingBox();assert.ok(bounds.x>=0&&bounds.x+bounds.width<=390,'复制表单手机端溢出');
+   await page.screenshot({path:resolve(out,'agent-copy-mobile.png'),fullPage:true,animations:'disabled'});
+   await page.setViewportSize({width:1440,height:1000});
+   await api(`/api/agents/${source.id}`,{description:'确认时读取最新简介'},'PATCH');
+   await api(`/api/agents/${source.id}/actions`,{action:'publish'});
+   const failRead=route=>route.fulfill({status:503,json:{error:'原配置暂时无法读取'}});
+   await page.route(`**/api/agents/${source.id}`,failRead);
+   try{
+    await modal().getByRole('button',{name:'创建副本',exact:true}).click();
+    await expect(page.locator('.n-message').filter({hasText:'原配置暂时无法读取'})).toBeVisible();
+    await expect(page.getByPlaceholder('填写副本名称')).toHaveValue('配置副本-'+uid);
+    assert.equal((await api('/api/agents')).items.length,before);
+   }finally{await page.unroute(`**/api/agents/${source.id}`,failRead);}
+   const copied=await action('/api/agents','POST',()=>modal().getByRole('button',{name:'创建副本',exact:true}).click());
+   copiedId=copied.id;
+   assert.notEqual(copied.id,source.id);assert.equal(copied.status,'draft');
+   const original=await api(`/api/agents/${source.id}`);
+   for(const key of ['description','category','icon','agentsMd','modelConfig','memoryConfig','advancedConfig','skillIds','kbIds'])assert.deepEqual(copied[key],original[key],key+' 完整复制');
+   assert.equal(original.status,'published');
+   assert.equal((await api('/api/sessions')).filter(session=>session.agentId===copied.id).length,0);
+   await page.reload();
+   const copyCard=page.locator(`[data-agent-id="${copied.id}"]`);
+   await expect(copyCard).toContainText('草稿');
+   await page.getByPlaceholder('搜索 Agent 名称或用途').fill(copied.name);
+   await copyCard.locator('summary').click();
+   await copyCard.getByRole('button',{name:'配置',exact:true}).click();
+   await field('简介').fill('副本单独修改');
+   await action(`/api/agents/${copied.id}`,'PATCH',()=>modal().getByRole('button',{name:'保存',exact:true}).click());
+   assert.equal((await api(`/api/agents/${source.id}`)).description,'确认时读取最新简介');
+   assert.equal((await api(`/api/agents/${copied.id}`)).description,'副本单独修改');
+  }finally{
+   if(copiedId)await api(`/api/agents/${copiedId}`,undefined,'DELETE');
+   await api(`/api/agents/${source.id}`,undefined,'DELETE');
+   await api(`/api/kb/${kb.id}`,undefined,'DELETE');
+  }
+ });
  let agentId;
  await check('部门群聊新建表单、搜索与删除',async()=>{
   await go('agent-groups','部门群聊');await page.getByRole('button',{name:'刷新',exact:true}).click();
@@ -181,7 +370,7 @@ try{
   await card.getByRole('button',{name:'删除',exact:true}).click();await action(`/api/agent-groups/${created.id}`,'DELETE',()=>confirm());
   await expect(card).toHaveCount(0);
  });
- await check('Agent 新建、MCP 能力展示、发布与已发布锁定',async()=>{await go('agents','Agent');await page.getByRole('button',{name:'新建 Agent',exact:true}).click();await field('名称').fill('UI智能体-'+uid);await field('简介').fill('用于验证界面操作');const a=await action('/api/agents','POST',()=>modal().getByRole('button',{name:'保存',exact:true}).click());agentId=a.id;const card=page.locator(`[data-agent-id="${agentId}"]`);await expect(card).toBeVisible();await page.getByPlaceholder('搜索 Agent 名称或用途').fill('UI智能体-'+uid);await expect(page.locator('.agent-card')).toHaveCount(1);await card.locator('summary').click();await card.getByRole('button',{name:'配置',exact:true}).click();await modal().locator('.n-tabs-tab').filter({hasText:'能力绑定'}).click();await expect(modal().getByText('MCP 工具',{exact:true})).toBeVisible();await expect(modal().getByText('高风险调用需要人工审批')).toBeVisible();await modal().getByRole('button',{name:'管理 MCP',exact:true}).click();await expect(page).toHaveURL(/#\/mcp$/);await go('agents','Agent');const refreshedCard=page.locator(`[data-agent-id="${agentId}"]`);await refreshedCard.locator('summary').click();await action(`/api/agents/${agentId}/actions`,'POST',()=>refreshedCard.getByRole('button',{name:'发布',exact:true}).click());await expect(refreshedCard.getByText('已发布',{exact:true})).toBeVisible();if((await refreshedCard.locator('details').getAttribute('open'))===null)await refreshedCard.locator('summary').click();await expect(refreshedCard.getByRole('button',{name:'配置',exact:true})).toBeDisabled();});
+ await check('Agent 新建、MCP 能力展示、发布与已发布锁定',async()=>{await go('agents','Agent');await page.getByRole('button',{name:'新建 Agent',exact:true}).click();await field('名称').fill('UI智能体-'+uid);await field('简介').fill('用于验证界面操作');const a=await action('/api/agents','POST',()=>modal().getByRole('button',{name:'保存',exact:true}).click());agentId=a.id;const card=page.locator(`[data-agent-id="${agentId}"]`);await expect(card).toBeVisible();await page.getByPlaceholder('搜索 Agent 名称或用途').fill('UI智能体-'+uid);await expect(page.locator('.agent-card')).toHaveCount(1);await card.locator('summary').click();await card.getByRole('button',{name:'配置',exact:true}).click();await modal().locator('.n-tabs-tab').filter({hasText:'能力绑定'}).click();await expect(modal().getByText('MCP 工具',{exact:true})).toBeVisible();await expect(modal().getByText('高风险调用需要人工审批')).toBeVisible();await modal().getByRole('button',{name:'管理 MCP',exact:true}).click();await expect(page).toHaveURL(/#\/mcp$/);await go('agents','Agent');const refreshedCard=page.locator(`[data-agent-id="${agentId}"]`);await refreshedCard.locator('summary').click();await refreshedCard.getByRole('button',{name:'发布',exact:true}).click();await expect(modal().getByText('配置检查通过',{exact:true})).toBeVisible();await action(`/api/agents/${agentId}/actions`,'POST',()=>modal().getByRole('button',{name:'确认发布',exact:true}).click());await expect(refreshedCard.getByText('已发布',{exact:true})).toBeVisible();if((await refreshedCard.locator('details').getAttribute('open'))===null)await refreshedCard.locator('summary').click();await expect(refreshedCard.getByRole('button',{name:'配置',exact:true})).toBeDisabled();});
  await check('Agent 在无平台侧栏的新标签打开标准对话页，并显示逐轮工具明细',async()=>{
   const ringProvider=await api('/api/models/providers',{name:'UI圆环供应商-'+uid,kind:'custom',baseUrl:'http://127.0.0.1:9/v1',apiKey:randomUUID()});
   const ringModel=await api('/api/models',{providerId:ringProvider.id,modelId:'ui-ring-'+uid,name:'UI圆环模型-'+uid,kind:'chat',contextWindow:262100});
