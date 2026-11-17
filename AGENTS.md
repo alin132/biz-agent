@@ -28,6 +28,13 @@
 
 ---
 
+## 记忆与私有会话边界
+
+- `server/memory/` 管理用户显式保存的长期记忆，范围为个人 / Agent / 会话。内容和来源必填，所有者由认证用户决定；模型不能自动写入。SQLite 内建表与 PG `0016_long_term_memory.sql` 保持一致。
+- `server/session.ts` 每轮空闲时刷新适用记忆，最多 20 条、约 6000 字符；群聊内部会话及无创建者的开放接口会话不注入私人记忆。删除仅停止后续注入，保留已产生的历史。
+- `AUTH_MODE=required` 时，普通会话读写、SSE、导出、clone/fork/tree、批量清理和审批只允许创建者，owner 也不能读取他人私有会话。无创建者的旧记录不自动归属；内部群聊会话只允许本人通过审批中心处理审批，不能当普通会话读取。`off` 演示共享行为不变。
+- 改动上述边界后运行 `memory:selftest`、`memory:ownership:e2e`、`contracts:selftest`、`pi:selftest` 和 `contracts:e2e`。
+
 ## 常用命令
 
 ```bash
@@ -109,7 +116,7 @@ $env:LLM_DISABLE="1"; $env:DB_PATH="$PWD\data\scratch.db"; $env:PORT="4318"; npm
 | `server/workflows.ts` | 运行时流程仓库：内置（代码）+ 自定义（存储层）合并成一份索引；`detail/create/update` 带技能文案 `skill` | 单条定义失效（引用的工具被删）要进 `broken` 并拒绝建会话，别让启动崩掉；`update` 里 `skill` 要显式覆盖（可能是"清空"），不能靠展开旧值 |
 | `server/auth/**` | 企业安全（P3）：`roles.ts` 权限矩阵（唯一真相，P4~P9 的方法+路径映射也在这里：models / api-keys / mcp / kb / skills 绑定 / monitor / im / approvals / 成员写接口）、`password.ts` scrypt、`jwt.ts` HS256、`rateLimit.ts` 登录限流、`service.ts` 运行时（`AUTH_MODE` / 建初始账号 / 守卫 / 写审计 / `updateMember` / `removeMember`）、`routes.ts` 的 `/api/auth/*`（含成员 PATCH/DELETE，DAO 走 `updateUser` / `deleteUser`）与 `/api/audit`（P9 起支持 `actorType` / `targetType` / `from` / `to` / `q`） | 矩阵与「方法+路径→权限点」只在 `roles.ts` 维护，别在 `server/index.ts` / 前端 / 各模块 routes 里再抄一份；`AUTH_MODE=off` 必须保持"全部放行 + 演示所有者"（`smoke` 默认跑的就是它）；令牌每次按 `sub` 回表，停用/改角色立刻生效（这是"停用后旧令牌立即 401"的实现方式）；**成员保护规则在 service 层**：不能改自己 / 必须保留一个启用 owner（见坑 32）；403 文案中文上界面；`smoke:auth` 是这块的回归入口（要 `AUTH_MODE=required` 实例）；`audit_logs.actor_type` 现在有 `user` / `anonymous` / `api_key` 三种，写审计的调用方要显式传 |
 | `server/kb/**` | 知识库（P5）：`embedding.ts` 的配置来源是**模型页向量模型 > `EMBEDDING_*` 环境变量**（`resolveModelEmbedding` 由宿主注入，见坑 33）、`schema.ts` 建 SQLite 表、`store.ts` SQLite DAO（JSON 向量本地余弦，并导出两后端共用的归一化/映射/列表 SELECT）、`pgStore.ts` Postgres DAO（pgvector `<=>` 检索，经同步桥）、`parse.ts` / `chunk.ts` 解析分块、`embedding.ts` 可插拔向量化、`search.ts` 向量/关键词检索（向量排名交给 store）、`service.ts` 编排（含 `reembedKnowledgeBase` 整库重算）、`routes.ts` 的 `/api/kb*`、`tool.ts` 会话级 `kb_search` | 两种后端跟着 `DATABASE_URL` 走（见坑 24）：SQLite 表与会话同 `DB_PATH` 文件、PG 表靠 `0001`+`0007` 迁移；向量化失败要回退关键词、绝不阻断上传；`kb_search` 是**会话级工具**，不进 `/api/tools` / 自定义流程 `via`；改检索/绑定/重新向量化要跑 `kb:selftest` + `kb:pg:selftest`（有 PG 实例时）+ `smoke` 场景 G |
-| `server/models/**` | 多模型管理（P6）：`crypto.ts`（AES-256-GCM 加解密 + 掩码 + sha256）、`store.ts`（供应商/模型 DAO 与校验）、`service.ts`（首启 default 供应商、当前模型、**向量模型选择 `embeddingConfig()`**、ping、给会话注入运行时）、`routes.ts` 的 `/api/models*`（含 `/api/models/embedding`） | API Key 只以 `{v,iv,tag,data}` 密文落库，出参只有掩码（`apiKeyMasked`）；密钥优先级 `SECRET_KEY` → `AUTH_SECRET` → 进程内随机（warn）；密文解不开时出参带 `apiKeyBroken:true`，页面据此给「重新填写 Key」入口，**别让前端去匹配中文占位串**；**当前模型/向量模型都只存内存**（重启回落第一条可用项，页面已写明）；`embeddingConfig()` 只回纯数据给知识库（别把 `ModelRecord` 泄出去，见坑 33）；ping 永远 200、失败给中文 `error`；改这块跑 `models:selftest` + `smoke:openapi` |
+| `server/models/**` | 多模型管理（P6）：`crypto.ts`（AES-256-GCM 加解密 + 掩码 + sha256）、`store.ts`（供应商/模型 DAO 与校验）、`service.ts`（首启 default 供应商、当前模型、**向量模型选择 `embeddingConfig()`**、ping、给会话注入运行时）、`routes.ts` 的 `/api/models*`（含 `/api/models/embedding`） | API Key 只以 `{v,iv,tag,data}` 密文落库，出参只有掩码（`apiKeyMasked`）；密钥优先级 `SECRET_KEY` → `AUTH_SECRET`；未配置稳定密钥时拒绝凭证写入并返回 503；密文解不开时出参带 `apiKeyBroken:true`，页面据此给「重新填写 Key」入口，**别让前端去匹配中文占位串**；**当前模型/向量模型选择均持久化**（失效时回落可用项并更新设置）；`embeddingConfig()` 只回纯数据给知识库（别把 `ModelRecord` 泄出去，见坑 33）；ping 永远 200、失败给中文 `error`；改这块跑 `models:selftest` + `smoke:openapi` |
 | `server/apiKeys/**` | 开放 API 的 Key（P4）：`store.ts`（`bk_` 生成、sha256、软吊销）、`service.ts`（令牌桶限流）、`routes.ts` 的 `/api/api-keys*` | 明文只在创建响应里出现一次；库里只存 hash + `prefix`；`DELETE` 是软吊销不是物理删除；限流桶在内存（重启清零）；改这块跑 `models:selftest`（Key/限流部分）+ `smoke:openapi` |
 | `server/openapi/**` | 开放 API（P4）：`chat.ts`（请求解析、拼 prompt、跑一轮会话）、`routes.ts`（`/v1/chat` 非流式 + SSE、`/v1/health`、统一错误、审计） | `/v1/*` 必须在 `server/index.ts` 的静态分支**之前**接管，否则被当静态资源 404；错误形状固定 `{ error: { message, type, code } }`；每个响应带 `x-trace-id`、每次调用写 `audit_logs(actor_type="api_key")`；改这块跑 `smoke:openapi` |
 | `server/mcp/**` | MCP 集成（P7）：`client.ts`（手写 JSON-RPC 2.0，stdio/HTTP/SSE 三种传输）、`registry.ts`（发现/快照/调用/启停）、`names.ts`（工具名唯一真相）、`routes.ts`（`/api/mcp*`）、`index.ts`（挂载 + 把 MCP 工具工厂 push 进 `builtinToolFactories`） | 工具名只用 `mcpToolName()` 生成，slug 后只含 `[a-z0-9_]`；工具默认 `risk:"high"`（见坑 25）；发现失败只落 `last_status/last_error`，不能抛到启动流程；MCP 工具是会话/技能工具集的**快照**；改这块跑 `mcp:selftest` + `smoke:mcp` |
@@ -360,9 +367,9 @@ $env:SMOKE_IM_BASE="http://127.0.0.1:4380"; npm run smoke:im             # 37 �
     另外 `traces` / `trace_events` 有保留期清理（`TRACE_RETENTION_DAYS`，默认 30 天）：
     启动先清一次、之后每小时一次，走 `purgeTracesBefore`（先删事件再删 trace，两种后端都实现）；
     清理失败只打日志，别让它抛到主流程。
-27. **当前模型只存内存，重启回落第一条 enabled chat 模型**：`ModelService.currentKey` 是进程内字段，
-    `POST /api/models/current` 不落库。重启后 `pickInitialCurrent()` 取库里第一条可用 chat 模型，
-    所以"切到 B 模型 → 重启 → 又变回 A"是设计如此，不是 bug。想固定默认值就改 `.env`（首启会建 `default` 供应商）。
+27. **当前对话模型和向量模型选择均已持久化**：`ModelService` 从 `model_settings` 恢复已选记录；
+    记录被删除、停用或不可用时才回落到可用项。模型凭证需要固定 `SECRET_KEY`（或 `AUTH_SECRET`），
+    未配置时拒绝保存新凭证；旧版本依赖进程随机密钥保存的凭证，重启后须重新填写。
     `LLM_DISABLE=1` 时 `resolveRuntime()` 直接返回 `undefined`（强制模拟），当前模型的选择只影响展示。
 28. **`/v1/*` 必须放在静态分支之前**：`server/index.ts` 的静态资源分支是 `!pathname.startsWith("/api/")`
     就 `serveStatic`。`/v1/chat` 不带 `/api/` 前缀，**一旦把开放 API 的接管挪到静态分支之后**，

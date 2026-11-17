@@ -1,29 +1,36 @@
 /* 页面级公共骨架：每个模块页都用同一套标题/说明/间距，避免每页各写一份 */
 .page {
+	width: 100%;
 	padding: 28px 32px 40px;
-	max-width: 1180px;
+	max-width: 1400px;
 	margin: 0 auto;
 }
 
 .page-head {
 	display: flex;
-	align-items: flex-start;
+	align-items: center;
 	justify-content: space-between;
 	gap: 16px;
 	margin-bottom: 20px;
 }
 
+.page-head-copy { min-width: 0; }
+
 .page-title {
 	margin: 0;
-	font-size: 22px;
+	font-size: 24px;
 	font-weight: 600;
-	letter-spacing: 0.01em;
+	letter-spacing: -.02em;
+	line-height: 1.35;
+	overflow-wrap: anywhere;
 }
 
 .page-sub {
 	margin: 6px 0 0;
 	font-size: 13px;
-	color: var(--muted);
+	color: var(--text-2);
+	line-height: 1.7;
+	max-width: 720px;
 }
 
 .page-alert {
@@ -39,9 +46,6 @@
 body { font-size: 14px; }
 button, input, textarea { font: inherit; }
 button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--brand-primary); outline-offset: 3px; }
-.page { width: 100%; max-width: 1400px; padding: 28px 32px 40px; }
-.page-title { font-size: 24px; letter-spacing: -.02em; }
-.page-sub { line-height: 1.7; color: var(--text-2); max-width: 720px; }
 .page-head-actions { flex-wrap: wrap; justify-content: flex-end; }
 .page--wide { max-width: none; }
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
@@ -49,9 +53,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .toolbar .spacer { flex: 1; }
 .action-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .table-wrap { width: 100%; overflow-x: auto; }
-.data-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-.data-table th { text-align: left; background: var(--surface-alt); font-weight: 500; color: var(--text-2); white-space: nowrap; }
-.data-table th, .data-table td { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.6; }
+.data-table th { text-align: left; background: var(--surface-alt); font-weight: 600; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.data-table th, .data-table td { padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .data-table tbody tr:hover { background: var(--surface-alt); }
 .data-table .secondary { display: block; font-size: 12px; margin-top: 4px; }
 .secondary, .hint { color: var(--muted); line-height: 1.65; }
@@ -113,7 +117,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
  .nav-toggle { display: flex; align-items: center; gap: 8px; position: fixed; z-index: 90; top: 8px; left: 12px; border: 1px solid var(--line); background: white; border-radius: 8px; padding: 6px 12px; }
  .nav-backdrop { display: block; position: fixed; inset: 0; background: #172b4d55; border: 0; z-index: 95; }
  .page { padding: 18px 16px 28px; } .page-head { gap: 12px; flex-wrap: wrap; } .page-title { font-size: 22px; }
- .page-head > div:first-child { min-width: 0; flex: 1 1 180px; } .page-head-actions { justify-content: flex-start; }
+ .page-head > div:first-child { min-width: 0; flex: 1 1 180px; } .page-head-actions { justify-content: flex-start; max-width: 100%; }
  .section-grid, .form-grid { grid-template-columns: minmax(0,1fr); }
  .page .chat-layout { display: block; height: calc(100dvh - 215px); min-height: 420px; }
  .page .chat-list { display: none; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); padding: 12px; margin-bottom: 12px; background: white; }

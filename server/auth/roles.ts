@@ -91,6 +91,9 @@ export function denyMessage(role: Role, permission: Permission): string {
  */
 export function permissionFor(method: string, pathname: string): Permission | null {
 	const write = method === "POST" || method === "PATCH" || method === "PUT" || method === "DELETE";
+	if (pathname === "/api/memories" || pathname.startsWith("/api/memories/")) {
+		return write ? "session.write" : "session.read";
+	}
 	if (pathname === "/api/agents" || pathname.startsWith("/api/agents/")) {
 		return write ? "workflow.write" : "workflow.read";
 	}
@@ -152,7 +155,7 @@ export function permissionFor(method: string, pathname: string): Permission | nu
 	}
 	if (pathname === "/api/agent-groups" || pathname.startsWith("/api/agent-groups/")) {
 		if (!write) return "session.read";
-		if (/^\/api\/agent-groups\/[^/]+\/turns$/.test(pathname)) return "session.run";
+		if (/^\/api\/agent-groups\/[^/]+\/(?:turns|resume)$/.test(pathname)) return "session.run";
 		return "session.write";
 	}
 	if (pathname.startsWith("/api/sessions")) {

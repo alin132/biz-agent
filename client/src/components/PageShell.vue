@@ -24,13 +24,13 @@ const emit = defineEmits(["action"]);
 </script>
 
 <template>
-	<div class="page" :class="{ 'page--wide': wide }">
+	<div class="page" :class="{ 'page--wide': wide }" :aria-busy="loading">
 		<header class="page-head">
-			<div>
+			<div class="page-head-copy">
 				<h1 class="page-title">{{ title }}</h1>
 				<p v-if="subtitle" class="page-sub">{{ subtitle }}</p>
 			</div>
-			<div class="page-head-actions">
+			<div v-if="$slots.actions || action" class="page-head-actions">
 				<slot name="actions" />
 				<n-button v-if="action" type="primary" :loading="actionLoading" @click="emit('action')">
 					{{ action }}

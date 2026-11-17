@@ -39,6 +39,9 @@ import {
 	type ImSessionPatch,
 	type ImSessionRecord,
 	type MigrationRecord,
+	type MemoryFilter,
+	type MemoryInput,
+	type MemoryRecord,
 	type MonitorStats,
 	type ModelInput,
 	type ModelPatch,
@@ -603,6 +606,32 @@ export class PostgresStorage implements Storage {
 			traceId: row.trace_id === null || row.trace_id === undefined ? null : String(row.trace_id),
 			createdAt: asNumber(row.created_at),
 		};
+	}
+
+	/* ---------------- 长期记忆 ---------------- */
+	listMemories(filter: MemoryFilter): MemoryRecord[] {
+		const where = ["workspace_id = $1", "owner_id = $2"];
+		const args: Array<string | null> = [this.workspaceId, filter.ownerId];
+		for (const [column, value] of [["agent_id", filter.agentId], ["session_id", filter.sessionId]] as const) {
+			if (value === undefined) continue;
+			if (value === null) where.push(`${column} IS NULL`);
+			else { args.push(value); where.push(`${column} = $${args.length}`); }
+		}
+		return this.rows(`SELECT * FROM memories WHERE ${where.join(" AND ")} ORDER BY updated_at DESC, id DESC`, args).map((row) => this.toMemory(row));
+	}
+	private toMemory(row: Record<string, unknown>): MemoryRecord {
+		return { id: String(row.id), workspaceId: String(row.workspace_id), ownerId: String(row.owner_id), agentId: row.agent_id == null ? null : String(row.agent_id), sessionId: row.session_id == null ? null : String(row.session_id), content: String(row.content), source: String(row.source), createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at) };
+	}
+	createMemory(memory: MemoryInput): MemoryRecord {
+		this.exec("INSERT INTO memories (id,workspace_id,owner_id,agent_id,session_id,content,source,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)", [memory.id, this.workspaceId, memory.ownerId, memory.agentId, memory.sessionId, memory.content, memory.source, memory.createdAt, memory.updatedAt]);
+		return { ...memory, workspaceId: this.workspaceId };
+	}
+	updateMemory(id: string, ownerId: string, patch: Pick<MemoryRecord, "content" | "source" | "updatedAt">): MemoryRecord | undefined {
+		this.exec("UPDATE memories SET content=$1, source=$2, updated_at=$3 WHERE id=$4 AND workspace_id=$5 AND owner_id=$6", [patch.content, patch.source, patch.updatedAt, id, this.workspaceId, ownerId]);
+		return this.listMemories({ ownerId }).find((memory) => memory.id === id);
+	}
+	removeMemory(id: string, ownerId: string): boolean {
+		return this.rowCount("DELETE FROM memories WHERE id=$1 AND workspace_id=$2 AND owner_id=$3", [id, this.workspaceId, ownerId]) > 0;
 	}
 
 	/* ---------------- 多模型管理（P6） ---------------- */

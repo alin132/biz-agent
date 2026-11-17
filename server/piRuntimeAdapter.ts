@@ -31,6 +31,8 @@ type ToolResultMessage = Extract<AgentMessage, { role: "toolResult" }>;
 
 export interface CreatePiRuntimeAdapterOptions {
 	agent: Agent;
+	/** Authoritative host prompt; restored system patches must not become the new base. */
+	systemPrompt?: string;
 	sessionManager: SessionManager;
 	tools: AgentTool[];
 	/** Additional Pi-native extensions whose tool names are also present in `tools`. */
@@ -142,6 +144,7 @@ export async function createPiBusinessRuntime(options: CreatePiBusinessRuntimeOp
 	const agent = createPiBusinessAgent(options);
 	return createPiRuntimeAdapter({
 		agent,
+		systemPrompt: options.business.systemPrompt,
 		sessionManager: options.sessionManager,
 		tools: toPiAgentTools(options.registry.all(), options.ctx),
 		cwd: options.cwd,
@@ -269,6 +272,7 @@ export async function createPiBusinessSession(options: CreatePiBusinessSessionOp
 	});
 	const runtime = await createPiRuntimeAdapter({
 		agent,
+		systemPrompt: options.systemPrompt,
 		sessionManager: options.sessionManager,
 		tools: agent.state.tools,
 		cwd: options.cwd,
@@ -536,7 +540,7 @@ export async function createPiRuntimeAdapter(options: CreatePiRuntimeAdapterOpti
 			createToolSearchExtension(),
 			...(options.extensions ?? []),
 		],
-		systemPrompt: agent.state.systemPrompt,
+		systemPrompt: options.systemPrompt ?? agent.state.systemPrompt,
 	});
 	await resourceLoader.reload();
 	const toolNames = new Set(tools.map((tool) => tool.name));

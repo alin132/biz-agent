@@ -16,11 +16,11 @@ defineProps({
 <template>
 	<section class="panel">
 		<header v-if="title" class="panel-head">
-			<div class="panel-title">
+			<h2 class="panel-title">
 				{{ title }}
 				<span v-if="meta" class="panel-meta">{{ meta }}</span>
-			</div>
-			<div class="panel-actions">
+			</h2>
+			<div v-if="$slots.actions" class="panel-actions">
 				<slot name="actions" />
 			</div>
 		</header>
@@ -43,18 +43,26 @@ defineProps({
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
+	flex-wrap: wrap;
 	gap: 12px;
 	padding: 14px 20px;
 	border-bottom: 1px solid var(--line);
 }
 
 .panel-title {
+	display: flex;
+	align-items: baseline;
+	flex-wrap: wrap;
+	gap: 4px 8px;
+	margin: 0;
+	min-width: 0;
+	overflow-wrap: anywhere;
 	font-size: 14px;
 	font-weight: 600;
+	line-height: 1.6;
 }
 
 .panel-meta {
-	margin-left: 8px;
 	font-size: 12px;
 	font-weight: 400;
 	color: var(--muted);
@@ -63,6 +71,8 @@ defineProps({
 .panel-actions {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
+	max-width: 100%;
 	gap: 8px;
 }
 
@@ -72,5 +82,11 @@ defineProps({
 
 .panel-body--flush {
 	padding: 0;
+}
+
+@media (max-width: 760px) {
+	.panel-head { padding: 12px 16px; gap: 10px; }
+	.panel-body:not(.panel-body--flush) { padding: 16px; }
+	.panel-actions { gap: 6px; }
 }
 </style>

@@ -20,6 +20,9 @@ const model=createServer(async(req,res)=>{
   const message=body.messages.filter(message=>message.role==='user').at(-1);
   const prompt=typeof message?.content==='string'?message.content:message?.content?.map(item=>item.text??'').join('\n')??'';
   requests.push(prompt);
+  if(scenario==='recover'&&prompt.startsWith('BIZ_GROUP_DEPARTMENT')&&prompt.includes('你代表「财务」')){
+   res.writeHead(500,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:'本机恢复测试：财务暂时不可用'}}));return;
+  }
   let content;
   const round=Number(prompt.match(/第 (\d+) 轮/)?.[1]??1);
   if(prompt.startsWith('BIZ_GROUP_HOST_PLAN')&&scenario==='repeat')content=JSON.stringify({content:'先请财务评估，再请风控和销售',proposal:'完整方案',agentIds:[ids.finance,ids.risk,ids.sales]});
@@ -31,7 +34,11 @@ const model=createServer(async(req,res)=>{
   else if(prompt.startsWith('BIZ_GROUP_HOST_PLAN')&&scenario==='priority')content=JSON.stringify({content:'请按销售、财务、交付、风控评审',proposal:'完整方案',agentIds:[ids.sales,ids.finance,ids.delivery,ids.risk]});
   else if(prompt.startsWith('BIZ_GROUP_DEPARTMENT')&&scenario==='priority')content=JSON.stringify({content:prompt.includes('你代表「交付」')?'请 @销售 先补充清单，@财务 核算成本':'已回应本轮方案',mentions:prompt.includes('你代表「交付」')?[ids.sales,ids.finance]:[],stance:prompt.includes('你代表「交付」')?'needs_info':'agree',proposalId:`round-${round}`});
   else if(prompt.startsWith('BIZ_GROUP_HOST_PLAN'))content=JSON.stringify({content:round===1?'请销售先评估交付方案':'根据财务意见修订方案并邀请复核',proposal:round===1?'预算十万，月底交付':'预算八万，分期交付',agentIds:[ids.sales]});
-  else if(prompt.startsWith('BIZ_GROUP_HOST_SUMMARY'))content='## 统一汇总\n\n预算八万，分期交付。\n\n- 销售：确认客户范围\n- 财务：复核预算\n\n未解决的事项需用户确认。';
+  else if(prompt.startsWith('BIZ_GROUP_HOST_SUMMARY')){
+   const sources=JSON.parse(prompt.match(/本轮可引用发言：(\[[^\n]*\])/)?.[1]??'[]');
+   const sourceMessageIds=[sources.filter(item=>item.agentId).at(-1)?.id].filter(Boolean);
+   content=JSON.stringify({summary:'## 统一汇总\n\n预算八万，分期交付。',decisions:[{content:'采用分期交付方案',sourceMessageIds}],actionItems:[{title:'确认客户范围与交付清单',ownerAgentId:ids.sales,deadline:null,sourceMessageIds}],unresolved:[{content:'具体截止日期待用户确认',sourceMessageIds}]});
+  }
   else if(prompt.startsWith('BIZ_GROUP_DEPARTMENT'))content=JSON.stringify({content:round===1?'@财务 请核对预算':'已核对预算与交付安排',mentions:[],stance:scenario==='dispute'?'disagree':round===1?'needs_info':'agree',proposalId:`round-${round}`});
   else throw new Error('非预期模型请求');
   res.writeHead(200,{'content-type':'text/event-stream'});
@@ -90,6 +97,56 @@ try {
   await page.screenshot({path:join(out,'agent-group-moderated-consensus.png'),fullPage:true,animations:'disabled'});
   await page.reload();await expect(page.getByTestId('group-discussion-state')).toContainText('参与部门已达成共识');
   await expect(page.locator('.summary-message')).toHaveCount(1);
+ });
+ await check('结构化结果展示来源与行动项，修改状态后刷新保留',async()=>{
+  const resultPanel=page.getByTestId('group-results').last();
+  await expect(resultPanel).toContainText('确认客户范围与交付清单');
+  await expect(resultPanel).toContainText('具体截止日期待用户确认');
+  await resultPanel.getByRole('button',{name:'依据 1',exact:true}).first().click();
+  assert.ok(await page.evaluate(()=>Boolean(document.activeElement?.dataset.messageId)),'依据跳转到可聚焦的原始发言');
+  const changed=page.waitForResponse(response=>response.url().endsWith(`/api/agent-groups/${group.id}/actions`)&&response.request().method()==='PATCH');
+  await resultPanel.locator('[data-action-id="action-1"] .n-select').click();
+  await page.locator('.n-base-select-option').filter({hasText:'已完成'}).click();
+  assert.equal((await changed).status(),200);
+  await page.reload();await expect(page.getByTestId('group-results').last().locator('[data-action-id="action-1"]')).toContainText('已完成');
+  const restored=await api(`/api/agent-groups/${group.id}`);
+  assert.equal(restored.turns.at(-1).discussion.result.actionItems[0].status,'done');
+  await page.screenshot({path:join(out,'agent-group-action-items.png'),fullPage:true,animations:'disabled'});
+ });
+ await check('Token预算通过配置页保存与清除，未知用量和费用明确展示',async()=>{
+  await expect(page.getByTestId('group-token-usage')).toContainText('实际费用未知');
+  await page.getByRole('button',{name:'群聊配置',exact:true}).click();
+  const budget=page.locator('.n-modal label').filter({hasText:'Token 预算'}).locator('input');
+  await budget.fill('500000');
+  const changed=page.waitForResponse(response=>response.url().endsWith(`/api/agent-groups/${group.id}`)&&response.request().method()==='PATCH');
+  await page.locator('.n-modal').getByRole('button',{name:'保存配置',exact:true}).click();
+  assert.equal((await(await changed).json()).collaboration.maxTokens,500000);
+  await expect(page.locator('.n-modal')).toHaveCount(0);
+  await page.getByRole('button',{name:'群聊配置',exact:true}).click();await expect(budget).toHaveValue('500000');
+  await budget.fill('');await budget.press('Tab');
+  const cleared=page.waitForResponse(response=>response.url().endsWith(`/api/agent-groups/${group.id}`)&&response.request().method()==='PATCH');
+  await page.locator('.n-modal').getByRole('button',{name:'保存配置',exact:true}).click();
+  assert.equal((await(await cleared).json()).collaboration.maxTokens,undefined);
+  await expect(page.locator('.n-modal')).toHaveCount(0);
+ });
+ await check('财务失败后点击只读恢复，原轮次与销售已完成发言保持不变',async()=>{
+  scenario='recover';
+  const recovering=await api('/api/agent-groups',{name:'恢复界面验证',agentIds:[ids.host,ids.sales,ids.finance],collaboration:{mode:'moderated',hostAgentId:ids.host,maxRounds:1,maxCalls:16}});
+  await page.goto(base+'/#/agent-groups/'+recovering.id+'/chat');
+  await page.getByRole('textbox',{name:'群聊消息',exact:true}).fill('评估方案后继续未完成财务意见');await page.getByRole('button',{name:'发送',exact:true}).click();
+  const resume=page.getByRole('button',{name:'只读恢复讨论',exact:true});await expect(resume).toBeVisible({timeout:60000});
+  const failed=await api(`/api/agent-groups/${recovering.id}`),turn=failed.turns.at(-1);
+  const salesMessages=failed.messages.filter(item=>item.agentId===ids.sales&&!item.isError);
+  assert.ok(salesMessages.length>0);assert.equal(turn.status,'failed');
+  scenario='consensus';
+  const response=page.waitForResponse(response=>response.url().endsWith(`/api/agent-groups/${recovering.id}/resume`)&&response.request().method()==='POST');
+  await resume.click();assert.equal((await response).status(),200);await expect(resume).toHaveCount(0);
+  const restored=await api(`/api/agent-groups/${recovering.id}`);
+  assert.equal(restored.turns.length,1);assert.equal(restored.turns[0].id,turn.id);assert.equal(restored.turns[0].status,'completed');
+  assert.deepEqual(restored.messages.filter(item=>item.agentId===ids.sales&&!item.isError),salesMessages);
+  await expect(page.getByTestId('group-messages')).toContainText('只读恢复');
+  await page.screenshot({path:join(out,'agent-group-recovery.png'),fullPage:true,animations:'disabled'});
+  await page.goto(base+'/#/agent-groups/'+group.id+'/chat');
  });
  await check('持续分歧达到轮数上限，最终汇总保留未达共识状态',async()=>{
   scenario='dispute';await api(`/api/agent-groups/${group.id}`,{name:group.name,agentIds:[ids.host,ids.sales,ids.finance],collaboration:{...group.collaboration,maxRounds:2}},'PATCH');

@@ -80,6 +80,8 @@ import { supportedKeyEnvs } from "./llm.js";
 import { initMcp } from "./mcp/index.js";
 import { handleModelsRoute } from "./models/routes.js";
 import { handlePiSettingsRoute } from "./piSettings.js";
+import { MemoryService } from "./memory/service.js";
+import { handleMemoryRoute } from "./memory/routes.js";
 import { handleAgents } from "./agents/routes.js";
 import { AgentGroupService } from "./agentGroups/service.js";
 import { handleAgentGroups } from "./agentGroups/routes.js";
@@ -134,6 +136,7 @@ const apiKeys = createApiKeyService(db);
 // Agent 实体（P10）：六维配置 + 状态机。只依赖存储层，不碰会话——Agent 是"配置"，
 // 会话是"运行实例"，两者解耦，别把会话搬进来。
 const agents = new AgentService({ storage: db });
+const memories = new MemoryService(db);
 // 监控与可观测（P9）：每轮消息一条调用链 + 批量落 trace_events；不传存储以外的东西，
 // MCP 服务名解析通过注册表查（可观测模块本身不依赖 MCP）。
 const observability = createObservability({
@@ -164,6 +167,13 @@ const plugins = new PluginService(db, repo, mcp.registry, hub);
 const storage = db.info();
 // 鉴权：AUTH_MODE 未设置时是 off（全部放行，行为与 P2 一致）；required 时验 Bearer 令牌 + 四角色矩阵
 const auth = initAuth(db);
+
+function sessionAccessibleTo(req: IncomingMessage, id: string, includeInternal = false): boolean {
+	if (auth.mode === "off") return true;
+	const record = db.load(id);
+	const userId = auth.userOf(req)?.id;
+	return Boolean(userId && record && record.createdBy === userId && (includeInternal || !record.internalGroupSession));
+}
 // IM Bot 网关（P8）：机器人凭证（AES 加密）+ 钉钉回调（加签/AES）+ 出站（fake outbox / 真 https）
 const im = initIm({ storage: db, hub });
 // 知识库：启动时建表（幂等），表与会话库同一个 SQLite 文件。
@@ -314,6 +324,9 @@ const server = createServer((req, res) => {
 		if (await handlePiSettingsRoute(req, res, db)) {
 			return;
 		}
+		if (await handleMemoryRoute(req, res, url, memories, auth)) {
+			return;
+		}
 
 		// ---- Agent 实体（/api/agents*）：六维配置 CRUD + 状态机动作 ----
 		if (await handleAgents(req, res, agents)) {
@@ -416,7 +429,7 @@ const server = createServer((req, res) => {
 		}
 
 		if (pathname === "/api/sessions" && method === "GET") {
-			json(res, 200, hub.list());
+			json(res, 200, hub.list().filter((session) => sessionAccessibleTo(req, session.id)));
 			return;
 		}
 
@@ -475,12 +488,17 @@ const server = createServer((req, res) => {
 		}
 
 		if (pathname === "/api/sessions" && method === "DELETE") {
-			json(res, 200, { removed: hub.clear() });
+			const removed = auth.mode === "off" ? hub.clear() : hub.list().filter((session) => sessionAccessibleTo(req, session.id)).reduce((total, session) => total + Number(hub.remove(session.id)), 0);
+			json(res, 200, { removed });
 			return;
 		}
 
 		const sessionMatch = /^\/api\/sessions\/([^/]+)(\/[a-z-]+(?:\/[a-z-]+)?)?$/.exec(pathname);
 		if (sessionMatch) {
+			if (!sessionAccessibleTo(req, sessionMatch[1]!)) {
+				json(res, 404, { error: "session not found" });
+				return;
+			}
 			const session = hub.get(sessionMatch[1]!);
 			const action = sessionMatch[2] ?? "";
 
@@ -773,13 +791,17 @@ const server = createServer((req, res) => {
 		// 审批中心（全局待办）：跨会话合并挂起中的审批。
 		// 会话级 POST /api/sessions/:id/approve 保留不动（向后兼容），两条入口最终都走 resolveApproval。
 		if (pathname === "/api/approvals" && method === "GET") {
-			const items = hub.pendingApprovals();
+			const items = hub.pendingApprovals().filter((item) => sessionAccessibleTo(req, item.sessionId, true));
 			json(res, 200, { items, total: items.length });
 			return;
 		}
 
 		const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(pathname);
 		if (approvalMatch && method === "POST") {
+			if (!sessionAccessibleTo(req, approvalMatch[1]!, true)) {
+				json(res, 404, { error: "会话不存在" });
+				return;
+			}
 			// 先确认会话存在（404），再校验入参（400），最后才看这条审批还活着没（409）
 			const session = hub.get(approvalMatch[1]!);
 			if (!session) {

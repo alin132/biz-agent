@@ -13,6 +13,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +24,7 @@ import { ApiKeyService, TokenBucketLimiter } from "../server/apiKeys/service.js"
 import {
 	decryptSecret,
 	encryptSecret,
+	encryptionStatus,
 	maskSecret,
 	resetEncryptionSecretCache,
 	sha256Hex,
@@ -113,6 +115,51 @@ async function main(): Promise<void> {
 		assert.throws(() => decryptSecret(blob, "secret-b"), /bad decrypt|unable to authenticate|Unsupported state/i);
 	});
 
+	await check("显式配置密钥可在独立进程中解密", () => {
+		const blob = encryptSecret("restart-check-value");
+		const source = `import { decryptSecret } from './server/models/crypto.ts'; process.stdout.write(decryptSecret(${JSON.stringify(blob)}));`;
+		const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], {
+			cwd: ROOT, encoding: "utf8", env: { ...process.env, SECRET_KEY: SECRET, AUTH_SECRET: "" },
+		});
+		assert.equal(child.status, 0, child.stderr);
+		assert.equal(child.stdout, "restart-check-value");
+	});
+
+	await check("未配置稳定密钥时拒绝加密而非生成易失密钥", () => {
+		const originalSecret = process.env.SECRET_KEY;
+		const originalAuthSecret = process.env.AUTH_SECRET;
+		try {
+			delete process.env.SECRET_KEY;
+			delete process.env.AUTH_SECRET;
+			resetEncryptionSecretCache();
+			assert.equal(encryptionStatus().configured, false);
+			assert.match(encryptionStatus().problem ?? "", /SECRET_KEY/);
+			assert.throws(() => encryptSecret("must-not-persist"), /未配置稳定的模型加密密钥/);
+		} finally {
+			if (originalSecret === undefined) delete process.env.SECRET_KEY;
+			else process.env.SECRET_KEY = originalSecret;
+			if (originalAuthSecret === undefined) delete process.env.AUTH_SECRET;
+			else process.env.AUTH_SECRET = originalAuthSecret;
+			resetEncryptionSecretCache();
+		}
+	});
+
+	await check("未配置稳定密钥不阻断环境模型启动，也不落入不可恢复的 default 凭证", () => {
+		const bootstrapPath = resolve(TMP_DIR, "models-no-secret-bootstrap.db");
+		removeDbFiles(bootstrapPath);
+		try {
+			const source = `import { SqliteStorage } from './server/db/sqlite.ts'; import { ModelService } from './server/models/service.ts'; const db = new SqliteStorage(${JSON.stringify(bootstrapPath)}); const service = new ModelService(db); service.bootstrapDefaultProvider(); process.stdout.write(JSON.stringify({providers:service.providerCount(),mode:service.healthModel().mode})); db.close();`;
+			const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], {
+				cwd: ROOT, encoding: "utf8", timeout: 30_000,
+				env: { ...process.env, SECRET_KEY: "", AUTH_SECRET: "", LLM_DISABLE: "", LLM_PROVIDER: "openai", LLM_API_KEY: "environment-model-fixture", OPENAI_API_KEY: "environment-model-fixture", LLM_MODEL: "gpt-4o-mini" },
+			});
+			assert.equal(child.status, 0, child.stderr);
+			assert.deepEqual(JSON.parse(child.stdout), { providers: 0, mode: "live" });
+			assert.match(child.stderr, /SECRET_KEY/);
+			assert.ok(!child.stderr.includes("environment-model-fixture"));
+		} finally { removeDbFiles(bootstrapPath); }
+	});
+
 	await check("篡改密文解不开", () => {
 		const parsed = JSON.parse(encryptSecret("sk-tamper", SECRET)) as {
 			v: number;
@@ -200,6 +247,27 @@ async function main(): Promise<void> {
 		assert.equal(decryptSecret(row!.apiKeyEncrypted!, SECRET), "sk-1234567890abcd");
 	});
 
+	await check("缺少稳定密钥时创建与替换 Key 返回 503，存储不被部分修改", () => {
+		const original = process.env.SECRET_KEY;
+		const rowBefore = storage.getModelProvider(provider.id);
+		const countBefore = store.providerRows().length;
+		try {
+			delete process.env.SECRET_KEY;
+			resetEncryptionSecretCache();
+			expectModelError(() => store.createProvider({ name: "拒绝易失密钥", kind: "openai", apiKey: "not-persisted" }), 503, "SECRET_KEY");
+			expectModelError(() => store.updateProvider(provider.id, { name: "不应部分改名", apiKey: "not-persisted" }), 503, "SECRET_KEY");
+			assert.equal(store.providerRows().length, countBefore);
+			assert.deepEqual(storage.getModelProvider(provider.id), rowBefore);
+			assert.equal(store.provider(provider.id)?.apiKeyBroken, true, "旧凭证仍能列出并明确标为不可解密");
+		} finally {
+			if (original === undefined) delete process.env.SECRET_KEY;
+			else process.env.SECRET_KEY = original;
+			resetEncryptionSecretCache();
+		}
+		assert.equal(store.provider(provider.id)?.apiKeyBroken, false);
+		assert.deepEqual(encryptionStatus(), { configured: true });
+	});
+
 	await check("密文解不开：出参标 apiKeyBroken=true 并给占位掩码（列表接口不 500）", () => {
 		storage.updateModelProvider(provider.id, { apiKeyEncrypted: "v1:not-a-real-cipher", updatedAt: Date.now() });
 		const broken = store.providers().find((item) => item.id === provider.id)!;
@@ -280,6 +348,13 @@ async function main(): Promise<void> {
 		const restarted = new ModelService(storage);
 		assert.equal(restarted.currentModelKey(), secondChat.id);
 		assert.equal(restarted.embeddingView().modelKey, embeddingModel.id);
+		const source = `import { SqliteStorage } from './server/db/sqlite.ts'; import { ModelService } from './server/models/service.ts'; const db = new SqliteStorage(${JSON.stringify(DB_PATH)}); const service = new ModelService(db); process.stdout.write(JSON.stringify({current:service.currentModelKey(),embedding:service.embeddingView().modelKey,credentialValid:service.store.secretOf(service.store.providerRow(${JSON.stringify(provider.id)}))==='sk-1234567890abcd'})); db.close();`;
+		const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], {
+			cwd: ROOT, encoding: "utf8", timeout: 30_000,
+			env: { ...process.env, SECRET_KEY: SECRET, AUTH_SECRET: "" },
+		});
+		assert.equal(child.status, 0, child.stderr);
+		assert.deepEqual(JSON.parse(child.stdout), { current: secondChat.id, embedding: embeddingModel.id, credentialValid: true });
 		storage.removeModel(secondChat.id);
 		const recovered = new ModelService(storage);
 		assert.equal(recovered.currentModelKey(), chatModel.id, "所选模型删除后回退到第一条可用 chat 模型");

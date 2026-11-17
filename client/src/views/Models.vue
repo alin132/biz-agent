@@ -14,7 +14,7 @@
  * 所以判定成败只能读 body.ok，不能看状态码——看状态码会把「连不上」显示成「正常」。
  */
 import { computed, onMounted, ref } from "vue";
-import { NButton, NEmpty, NInput, NModal, NPopconfirm, NSelect, NTag, useMessage } from "naive-ui";
+import { NAlert, NButton, NEmpty, NInput, NModal, NPopconfirm, NSelect, NTag, useMessage } from "naive-ui";
 import PageShell from "../components/PageShell.vue";
 import Panel from "../components/Panel.vue";
 import ModelForm from "../components/ModelForm.vue";
@@ -268,7 +268,10 @@ onMounted(load);
 		:loading="loading"
 		:error="error"
 	>
-		<div class="toolbar"><n-input v-model:value="keyword" class="search" placeholder="搜索模型名称或 ID" clearable /><n-select v-model:value="selectedProvider" :options="providers.map(p=>({label:p.name,value:p.id}))" clearable placeholder="全部供应商" style="width:220px" /></div>
+		<n-alert v-if="data?.encryption?.configured === false" type="warning" :bordered="false" style="margin-bottom:16px" data-testid="model-encryption-warning">
+			{{ data.encryption.problem }} 请由部署人员通过环境变量设置固定的 SECRET_KEY，重启后再保存模型 Key；不要把加密密钥填入供应商 API Key。
+		</n-alert>
+		<div class="toolbar"><n-input v-model:value="keyword" class="search" placeholder="搜索模型名称或 ID" clearable /><n-select v-model:value="selectedProvider" :options="providers.map(p=>({label:p.name,value:p.id}))" clearable placeholder="全部供应商" class="provider-filter" /></div>
 		<div class="stack">
 			<panel title="供应商" :meta="`${providers.length} 个`">
 				<template #actions>
@@ -278,9 +281,14 @@ onMounted(load);
 				<ul v-else class="row-list">
 					<li v-for="item in providers" :key="item.id" class="row">
 						<div class="row-main">
-							<div class="row-name">{{ item.name }}</div>
+							<div class="row-name"><span class="name-text">{{ item.name }}</span>
+								<n-tag :bordered="false" size="small" :type="item.enabled === false ? 'default' : 'success'">
+									{{ item.enabled === false ? "已停用" : "启用" }}
+								</n-tag>
+							</div>
 							<div class="row-meta">
-								{{ item.baseUrl || "默认地址" }} · Key：<span data-testid="provider-key-masked">{{ item.apiKeyMasked || "未配置" }}</span>
+								<span class="provider-address">{{ item.baseUrl || "默认地址" }}</span>
+								<span class="provider-key">Key：<span data-testid="provider-key-masked">{{ item.apiKeyMasked || "未配置" }}</span></span>
 							</div>
 							<!-- Key 密文解不开：给显眼的「重新填写 Key」入口，判定只看 apiKeyBroken，不匹配占位文案 -->
 							<div v-if="item.apiKeyBroken" class="row-meta key-broken" data-testid="provider-key-broken">
@@ -289,10 +297,7 @@ onMounted(load);
 							</div>
 						</div>
 						<div class="row-actions">
-							<n-tag :bordered="false" size="small" :type="item.enabled === false ? 'default' : 'success'">
-								{{ item.enabled === false ? "已停用" : "启用" }}
-							</n-tag>
-							<n-button size="small" data-testid="provider-edit" :disabled="!can('workflow.write')" @click="openProviderEdit(item)">编辑</n-button>
+							<n-button size="small" quaternary data-testid="provider-edit" :disabled="!can('workflow.write')" @click="openProviderEdit(item)">编辑</n-button>
 							<n-popconfirm
 								:show-icon="false"
 								positive-text="删除"
@@ -320,14 +325,15 @@ onMounted(load);
 					<li v-for="item in models" :key="item.id" class="row" :class="{ 'row--current': isCurrent(item) }">
 						<div class="row-main">
 							<div class="row-name">
-								{{ item.name || item.modelId }}
+								<span class="name-text">{{ item.name || item.modelId }}</span>
 								<n-tag v-if="isCurrent(item)" :bordered="false" size="small" type="primary" class="current-tag">
 									当前
 								</n-tag>
+								<n-tag :bordered="false" size="small">{{ kindLabel(item.kind) }}</n-tag>
 							</div>
-							<div class="row-meta">{{ providerName(item.providerId) }} · {{ item.modelId }} · {{ kindLabel(item.kind) }}</div>
-							<div class="row-meta">
-								最大上下文：<span data-testid="model-context-value">{{ contextWindowText(item) }}</span>
+							<div class="row-meta"><span>{{ providerName(item.providerId) }}</span><span class="model-id">{{ item.modelId }}</span></div>
+							<div class="row-meta context-meta">
+								<span>最大上下文：<span data-testid="model-context-value">{{ contextWindowText(item) }}</span></span>
 							</div>
 							<!-- 测试结果如实贴在行内：ok/延迟/失败原因都来自后端，失败时不能只写「失败」 -->
 							<div
@@ -339,12 +345,15 @@ onMounted(load);
 								{{ pingText(item) }}
 							</div>
 						</div>
-						<div class="row-actions">
-							<n-button size="small" :disabled="isCurrent(item) || !can('workflow.write')" :loading="switching === item.id" @click="setCurrent(item)">
+						<div class="row-actions model-actions">
+							<div class="action-group">
+							<n-button size="small" secondary :type="isCurrent(item) ? 'primary' : 'default'" :disabled="isCurrent(item) || !can('workflow.write')" :loading="switching === item.id" @click="setCurrent(item)">
 								{{ isCurrent(item) ? '使用中' : item.kind === 'embedding' ? '设为默认向量' : '设为默认对话' }}
 							</n-button>
+							</div>
+							<div class="action-group action-group--secondary">
 							<n-button
-								size="small"
+								size="small" quaternary
 								data-testid="model-context-edit" :disabled="!can('workflow.write')"
 								:title="`配置「${item.name || item.modelId}」的最大上下文`"
 								@click="openContextDialog(item)"
@@ -352,7 +361,7 @@ onMounted(load);
 								最大上下文
 							</n-button>
 							<n-button
-								size="small"
+								size="small" quaternary
 								data-testid="model-ping" :disabled="!can('workflow.write')"
 								:title="`向「${item.name || item.modelId}」发一次极短请求，验证 Key 与地址可用`"
 								:loading="pings[item.id]?.state === 'running'"
@@ -360,7 +369,7 @@ onMounted(load);
 							>
 								测试连通
 							</n-button>
-							<n-button size="small" data-testid="model-edit" :disabled="!can('workflow.write')" @click="openEdit(item)">编辑</n-button>
+							<n-button size="small" quaternary data-testid="model-edit" :disabled="!can('workflow.write')" @click="openEdit(item)">编辑</n-button>
 							<n-popconfirm
 								:show-icon="false"
 								positive-text="删除"
@@ -374,6 +383,7 @@ onMounted(load);
 								</template>
 								{{ `确定删除「${item.name || item.modelId}」？绑定了它的会话会回落到默认模型。` }}
 							</n-popconfirm>
+							</div>
 						</div>
 					</li>
 				</ul>
@@ -422,6 +432,22 @@ onMounted(load);
 </template>
 
 <style scoped>
+.toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	margin-bottom: 16px;
+}
+
+.search {
+	flex: 1 1 240px;
+	min-width: 0;
+}
+
+.provider-filter {
+	width: 220px;
+}
+
 .stack {
 	display: flex;
 	flex-direction: column;
@@ -436,10 +462,11 @@ onMounted(load);
 
 .row {
 	display: flex;
-	align-items: center;
+	flex-wrap: wrap;
+	align-items: flex-start;
 	justify-content: space-between;
 	gap: 16px;
-	padding: 10px 12px;
+	padding: 16px 12px;
 	border-radius: var(--radius);
 }
 
@@ -452,26 +479,79 @@ onMounted(load);
 	background: var(--brand-soft);
 }
 
+.row-main {
+	flex: 1 1 260px;
+	min-width: 0;
+}
+
 .row-name {
 	display: flex;
+	flex-wrap: wrap;
 	align-items: center;
 	gap: 8px;
 	font-size: 13.5px;
 	font-weight: 500;
 }
 
+.name-text {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.row-name :deep(.n-tag) {
+	flex-shrink: 0;
+}
+
 .row-meta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 12px;
 	font-size: 12px;
 	color: var(--muted);
-	margin-top: 3px;
-	word-break: break-all;
+	margin-top: 6px;
+	line-height: 1.6;
+	overflow-wrap: anywhere;
+}
+
+.row-meta > span {
+	min-width: 0;
+}
+
+.model-id {
+	font-family: var(--font-mono, monospace);
+}
+
+.provider-address {
+	flex-basis: 100%;
+}
+
+.context-meta {
+	margin-top: 4px;
 }
 
 .row-actions {
 	display: flex;
+	flex-wrap: wrap;
 	align-items: center;
-	gap: 8px;
-	flex: none;
+	gap: 6px;
+	max-width: 100%;
+}
+
+.model-actions {
+	justify-content: flex-end;
+	gap: 8px 12px;
+}
+
+.action-group {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 2px;
+}
+
+.action-group--secondary {
+	padding-left: 10px;
+	border-left: 1px solid var(--line);
 }
 
 .current-tag {
@@ -516,5 +596,29 @@ onMounted(load);
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
+}
+
+@media (max-width: 640px) {
+	.provider-filter {
+		width: 100%;
+	}
+
+	.row {
+		gap: 12px;
+		padding: 14px 8px;
+	}
+
+	.row-main {
+		flex-basis: 100%;
+	}
+
+	.row-actions {
+		justify-content: flex-start;
+	}
+
+	.action-group--secondary {
+		padding-left: 0;
+		border-left: 0;
+	}
 }
 </style>

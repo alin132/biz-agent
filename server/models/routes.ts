@@ -20,6 +20,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ModelError } from "./store.js";
 import type { ModelService } from "./service.js";
+import { encryptionStatus } from "./crypto.js";
 
 const MODELS_PREFIX = "/api/models";
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -85,6 +86,7 @@ async function route(
 			const view = service.currentView();
 			json(res, 200, {
 				mode: view.mode,
+				encryption: encryptionStatus(),
 				current: view.current,
 				label: view.label,
 				options: service.options(),

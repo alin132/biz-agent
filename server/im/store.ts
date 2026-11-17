@@ -18,7 +18,7 @@ import type {
 	Storage,
 } from "../db/types.js";
 import { DEFAULT_WORKSPACE_ID } from "../db/types.js";
-import { decryptSecret, encryptSecret, maskSecret } from "../models/crypto.js";
+import { decryptSecret, encryptSecret, maskSecret, MissingEncryptionSecretError } from "../models/crypto.js";
 import { ImError } from "./errors.js";
 import type { OutboundBot } from "./outbound.js";
 
@@ -31,6 +31,15 @@ const MAX_SECRET = 500;
 const MAX_ROBOT_CODE = 200;
 const MAX_WORKFLOW_ID = 100;
 const MASK_DECRYPT_FAILED = "****（无法解密，请重新填写）";
+
+function encryptImCredential(value: string): string {
+	try {
+		return encryptSecret(value);
+	} catch (error) {
+		if (error instanceof MissingEncryptionSecretError) throw new ImError(503, "未配置稳定的凭证加密密钥：请设置 SECRET_KEY（或 AUTH_SECRET）后再保存机器人凭证");
+		throw error;
+	}
+}
 
 /** 机器人出参：**只有掩码**，明文与密文都不出去。 */
 export interface ImBotView {
@@ -195,10 +204,10 @@ export class ImStore {
 			name,
 			platform,
 			appKey,
-			appSecretEnc: encryptSecret(appSecret),
-			callbackTokenEnc: encryptSecret(callbackToken),
+			appSecretEnc: encryptImCredential(appSecret),
+			callbackTokenEnc: encryptImCredential(callbackToken),
 			robotCode,
-			aesKeyEnc: aesKey ? encryptSecret(aesKey) : null,
+			aesKeyEnc: aesKey ? encryptImCredential(aesKey) : null,
 			workflowId,
 			enabled,
 			createdAt: now,
@@ -219,10 +228,10 @@ export class ImStore {
 		}
 		if ("appSecret" in body) {
 			// appSecret 是必填凭证：可以替换，但不能"清空"（清空后机器人直接不可用）
-			patch.appSecretEnc = encryptSecret(requiredString(body.appSecret, "appSecret", MAX_SECRET));
+			patch.appSecretEnc = encryptImCredential(requiredString(body.appSecret, "appSecret", MAX_SECRET));
 		}
 		if ("callbackToken" in body) {
-			patch.callbackTokenEnc = encryptSecret(requiredString(body.callbackToken, "callbackToken", MAX_SECRET));
+			patch.callbackTokenEnc = encryptImCredential(requiredString(body.callbackToken, "callbackToken", MAX_SECRET));
 		}
 		if ("robotCode" in body) {
 			patch.robotCode = requiredString(body.robotCode, "robotCode", MAX_ROBOT_CODE);
@@ -230,7 +239,7 @@ export class ImStore {
 		if ("aesKey" in body) {
 			// aesKey 是可选项：传 null / "" 表示不启用 AES 回调
 			const aesKey = parseAesKey(body.aesKey);
-			patch.aesKeyEnc = aesKey ? encryptSecret(aesKey) : null;
+			patch.aesKeyEnc = aesKey ? encryptImCredential(aesKey) : null;
 		}
 		if ("workflowId" in body) {
 			patch.workflowId = parseWorkflowId(body.workflowId, current.workflowId);
@@ -335,7 +344,8 @@ export class ImStore {
 		}
 		try {
 			return decryptSecret(blob);
-		} catch {
+		} catch (error) {
+			if (error instanceof MissingEncryptionSecretError) throw new ImError(503, "未配置凭证加密密钥：请恢复 SECRET_KEY（或 AUTH_SECRET）后再使用机器人");
 			throw new ImError(500, `${label} 无法解密（SECRET_KEY / AUTH_SECRET 可能变过），请重新填写`);
 		}
 	}

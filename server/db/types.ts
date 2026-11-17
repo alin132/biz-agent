@@ -706,6 +706,12 @@ export interface Storage {
 	/** 物理删除成员（不是停用）；返回是否真的删掉了一行 */
 	deleteUser(id: string): boolean;
 
+	/* ---------------- 长期记忆 ---------------- */
+	listMemories(filter: MemoryFilter): MemoryRecord[];
+	createMemory(memory: MemoryInput): MemoryRecord;
+	updateMemory(id: string, ownerId: string, patch: Pick<MemoryRecord, "content" | "source" | "updatedAt">): MemoryRecord | undefined;
+	removeMemory(id: string, ownerId: string): boolean;
+
 	/* ---------------- 平台审计（P3，倒序 = 最新的在前） ---------------- */
 	appendAudit(entry: AuditLogInput): void;
 	listAudit(filter: AuditFilter): AuditLogRecord[];
@@ -844,6 +850,27 @@ export interface AgentModelConfig {
 	stream?: boolean;
 }
 
+/** 用户显式确认的长期记忆，与 Pi 上下文摘要分开保存。 */
+export interface MemoryFilter {
+	ownerId: string;
+	agentId?: string | null;
+	sessionId?: string | null;
+}
+
+export interface MemoryRecord {
+	id: string;
+	workspaceId: string;
+	ownerId: string;
+	agentId: string | null;
+	sessionId: string | null;
+	content: string;
+	source: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export type MemoryInput = Omit<MemoryRecord, "workspaceId">;
+
 /** Pi coding-agent 上下文压缩参数。 */
 export interface AgentMemoryConfig {
 	/** Pi starts automatic compaction below this many free context tokens. */
@@ -927,15 +954,66 @@ export interface AgentGroupCollaboration {
 	hostAgentId: string;
 	maxRounds: number;
 	maxCalls: number;
+	maxDurationMs?: number;
+	maxTokens?: number;
+}
+
+export interface AgentGroupResultItem {
+	id: string;
+	content: string;
+	sourceMessageIds: string[];
+}
+
+export interface AgentGroupActionItem {
+	id: string;
+	title: string;
+	ownerAgentId: string | null;
+	deadline: string | null;
+	status: "pending" | "in_progress" | "done" | "cancelled";
+	sourceMessageIds: string[];
+}
+
+export interface AgentGroupResult {
+	summary: string;
+	structured: boolean;
+	decisions: AgentGroupResultItem[];
+	actionItems: AgentGroupActionItem[];
+	unresolved: AgentGroupResultItem[];
+}
+
+export interface AgentGroupCheckpoint {
+	phase: "planning" | "discussing" | "summarizing";
+	round: number;
+	queue: string[];
+	ballots: Record<string, "agree" | "disagree" | "needs_info">;
+	requests: string[];
+	pending: string[];
+	failedAgentIds?: string[];
+	committedReplyCount?: number;
+	summaryOutcome?: AgentGroupDiscussion["outcome"];
 }
 
 export interface AgentGroupDiscussion {
+	hostAgentId?: string;
 	round: number;
 	calls: number;
 	phase: "planning" | "discussing" | "summarizing" | "finished";
-	outcome: "pending" | "consensus" | "round_limit" | "call_limit" | "failed" | "cancelled" | "interrupted";
+	outcome: "pending" | "consensus" | "round_limit" | "call_limit" | "time_limit" | "token_limit" | "failed" | "cancelled" | "interrupted";
 	participants: string[];
 	proposal: string;
+	elapsedMs?: number;
+	activeCallStartedAt?: number;
+	resumeCount?: number;
+	checkpoint?: AgentGroupCheckpoint;
+	result?: AgentGroupResult;
+	usage?: AgentGroupUsage;
+}
+
+export interface AgentGroupUsage {
+	tokens: number | null;
+	/** Provider billing cannot be inferred from Pi catalog template pricing. */
+	costUsd: number | null;
+	piReportedCostUsd: number | null;
 }
 
 export interface AgentGroupMessageMetadata {

@@ -3,7 +3,7 @@
  *
  * 取舍：
  * - 密文落库前序列化成 `{ v: 1, iv, tag, data }`（每段 base64），`v` 留给以后换算法；
- * - 密钥优先级 `SECRET_KEY` → `AUTH_SECRET` → **进程内随机生成**（只打一次 warn，重启后旧密文解不开）；
+ * - 密钥优先级 `SECRET_KEY` → `AUTH_SECRET`；未配置时拒绝加密，避免写入重启后必然无法解密的凭证；
  * - GCM 自带完整性校验：密钥不对或密文被改，`decryptSecret()` 会直接抛错，不会返回半截明文；
  * - 对外永远只给掩码（`sk-****abcd`），明文只在创建/替换的那一刻进一次内存。
  */
@@ -18,11 +18,23 @@ const ALGORITHM = "aes-256-gcm";
 const SECRET_ENVS = ["SECRET_KEY", "AUTH_SECRET"] as const;
 
 let cachedSecret: string | null = null;
-let warnedRandomSecret = false;
+
+export class MissingEncryptionSecretError extends Error {
+	constructor() {
+		super("未配置稳定的模型加密密钥：请设置 SECRET_KEY（或 AUTH_SECRET）后再保存 API Key");
+		this.name = "MissingEncryptionSecretError";
+	}
+}
+
+/** 只返回可公开的配置状态，绝不暴露密钥或指纹。 */
+export function encryptionStatus(): { configured: boolean; problem?: string } {
+	const configured = cachedSecret !== null || SECRET_ENVS.some((name) => Boolean(process.env[name]?.trim()));
+	return configured ? { configured: true } : { configured: false, problem: new MissingEncryptionSecretError().message };
+}
 
 /**
  * 加密密钥来源（进程内缓存，一次运行只解析一次）。
- * 显式配置缺失时随机生成——安全上不弱，但重启后解不开旧密文，所以必须 warn。
+ * 不使用进程内随机回退：密钥不稳定会造成凭证落库后无法恢复。
  */
 export function encryptionSecret(): string {
 	if (cachedSecret !== null) {
@@ -35,20 +47,12 @@ export function encryptionSecret(): string {
 			return cachedSecret;
 		}
 	}
-	cachedSecret = randomBytes(32).toString("hex");
-	if (!warnedRandomSecret) {
-		warnedRandomSecret = true;
-		console.warn(
-			"未配置 SECRET_KEY / AUTH_SECRET：模型 API Key 用进程内随机密钥加密，重启后旧密文解不开（生产环境请显式配置）",
-		);
-	}
-	return cachedSecret;
+	throw new MissingEncryptionSecretError();
 }
 
 /** 测试用：清掉缓存，让下一次 `encryptionSecret()` 重新读环境变量。 */
 export function resetEncryptionSecretCache(): void {
 	cachedSecret = null;
-	warnedRandomSecret = false;
 }
 
 /** 把任意长度的密钥串压成 32 字节 AES 密钥。 */

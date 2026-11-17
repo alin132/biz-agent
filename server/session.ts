@@ -32,6 +32,7 @@ import { createSimulatedRuntime } from "./demoScripts.js";
 import { getKb } from "./kb/index.js";
 import { KB_SEARCH_TOOL_NAME, createKbPiExtension, createKbSearchTool } from "./kb/tool.js";
 import { resolveLlm } from "./llm.js";
+import { memoryPrompt } from "./memory/service.js";
 import type { LlmRuntime } from "./llm.js";
 import { isMcpToolName } from "./mcp/names.js";
 import { createMcpExtension } from "@earendil-works/pi-coding-agent";
@@ -679,11 +680,16 @@ export class Session {
 	/** 当前加载的技能 id；null = 跑会话自己的流程 */
 	private activeSkillId: string | null = null;
 	private permissionMode: PermissionMode = "full";
+	private modelRequestGuard: (() => void) | undefined;
+	private blockUnmeteredDelegation = false;
+	private pendingModelGuardFailure: string | undefined;
+	private readonly rejectedModelMessageKeys = new Set<string>();
 	private title: string | null = null;
 	private archived = false;
 	/** 计划模式开关：会话级，落进 payload（见 planModePromptOf） */
 	private planMode = false;
 	private thinkingLevel: ThinkingLevel = "medium";
+	private longTermMemoryPrompt = "";
 	private autoCompactionEnabled = true;
 	/** 最近一次压缩的时间戳与摘要（进视图，前端据此渲染「已压缩」卡片） */
 	private compactedAt: number | null = null;
@@ -959,7 +965,13 @@ export class Session {
 					break;
 				case "message_end":
 					// 每轮 LLM 调用结束：模型名 + token（真实 usage 优先，否则按内容估算）+ 耗时
-					if (event.message.role === "assistant") this.recordLlmEvent(event.message);
+					if (event.message.role === "assistant") {
+						if (this.pendingModelGuardFailure && event.message.stopReason === "error" && event.message.errorMessage === this.pendingModelGuardFailure) {
+							this.rejectedModelMessageKeys.add(`${event.message.timestamp}:${event.message.errorMessage}`);
+							this.pendingModelGuardFailure = undefined;
+						}
+						this.recordLlmEvent(event.message);
+					}
 					else this.persist();
 					break;
 				case "tool_execution_start":
@@ -1237,6 +1249,7 @@ export class Session {
 				risk: "medium" as const,
 				parameters: flowToolParameters(),
 				execute: async (args: Record<string, unknown>) => {
+					if (this.blockUnmeteredDelegation) return { content: `当前启用 token 预算，${flowToolName(target.id)} 委托子运行的 usage 未计入主会话，已阻止委托；请直接调用业务工具或取消 token 预算。`, isError: true };
 					try {
 						const result = await runSubWorkflow({
 							workflow: target,
@@ -1550,6 +1563,31 @@ export class Session {
 		return this.permissionMode;
 	}
 
+	setModelRequestGuard(guard?: () => void, options?: { blockUnmeteredDelegation?: boolean }): void {
+		this.modelRequestGuard = guard;
+		this.blockUnmeteredDelegation = Boolean(guard && options?.blockUnmeteredDelegation);
+	}
+
+	piBudgetUsage(): { tokens: number | null; costUsd: null; piReportedCostUsd: number | null } {
+		const stats = this.piRuntime?.stats();
+		if (!stats) return { tokens: 0, costUsd: null, piReportedCostUsd: null };
+		const tokens = Number(stats.tokens.total);
+		const unknown = (usage: { totalTokens?: number } | undefined): boolean => !Number.isFinite(usage?.totalTokens) || Number(usage?.totalTokens) <= 0;
+		const unknownMessage = (message: AgentMessage): boolean => message.role === "assistant"
+			&& !this.rejectedModelMessageKeys.has(`${message.timestamp}:${message.errorMessage}`) && unknown(message.usage);
+		// Stats include compacted history and native usage records, not only the visible messages.
+		const hasUnknownUsage = this.runtimeMessages().some(unknownMessage) || this.piHistory.getEntries().some((entry) => {
+			if (entry.type === "message") return unknownMessage(entry.message);
+			if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") return unknown(entry.usage);
+			return false;
+		});
+		return {
+			tokens: !hasUnknownUsage && Number.isFinite(tokens) && (tokens > 0 || stats.assistantMessages === 0) ? tokens : null,
+			costUsd: null,
+			piReportedCostUsd: !hasUnknownUsage && Number.isFinite(stats.cost) && stats.cost > 0 ? stats.cost : null,
+		};
+	}
+
 	/**
 	 * 设置自定义标题；传空字符串（或只有空白）则清除，前端恢复「用首条消息派生」。
 	 * 超长按 TITLE_MAX_LENGTH 截断，不会报错。
@@ -1577,7 +1615,13 @@ export class Session {
 		baseWorkflowState: WorkflowState | undefined = this.built?.baseWorkflowState(),
 	): BusinessRuntime {
 		const { modelConfig, advancedConfig } = this.agentConfig;
-		const streamFn: StreamFn = (model, context, options) => runtime.streamFn(model, context, {
+		const streamFn: StreamFn = (model, context, options) => {
+			try { this.modelRequestGuard?.(); }
+			catch (error) {
+				this.pendingModelGuardFailure = error instanceof Error ? error.message : String(error);
+				throw error;
+			}
+			return runtime.streamFn(model, context, {
 			...options,
 			...(modelConfig.temperature !== undefined ? { temperature: modelConfig.temperature } : {}),
 			...(modelConfig.maxTokens !== undefined ? { maxTokens: modelConfig.maxTokens } : {}),
@@ -1593,8 +1637,10 @@ export class Session {
 				}
 				return body;
 			},
-		});
+			});
+		};
 		this.runtime = { model: runtime.model, streamFn, modelRuntime: runtime.modelRuntime };
+		this.longTermMemoryPrompt = memoryPrompt(this.db, this.internalGroupSession ? null : this.createdBy, this.agentId, this.id);
 		return createBusinessRuntime({
 			workflow: this.workflow,
 			registry: this.registry,
@@ -1613,6 +1659,7 @@ export class Session {
 				agentPromptOf(this.agentPrompt ?? undefined),
 				kbDefaultHintOf(),
 				planModePromptOf(this.planMode),
+				this.longTermMemoryPrompt,
 			].filter((text) => text.length > 0),
 		});
 	}
@@ -1962,7 +2009,10 @@ export class Session {
 	}
 
 	async send(text: string): Promise<void> {
-		try { this.assertChattable(); } catch (error) {
+		try {
+			this.assertChattable();
+			if (!this.running && memoryPrompt(this.db, this.internalGroupSession ? null : this.createdBy, this.agentId, this.id) !== this.longTermMemoryPrompt) this.rebuildBusinessRuntime();
+		} catch (error) {
 			this.emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
 			return;
 		}

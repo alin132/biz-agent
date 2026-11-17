@@ -35,6 +35,9 @@ import type {
 	ImSessionPatch,
 	ImSessionRecord,
 	MigrationRecord,
+	MemoryFilter,
+	MemoryInput,
+	MemoryRecord,
 	MonitorStats,
 	ModelInput,
 	ModelPatch,
@@ -273,6 +276,18 @@ const SCHEMA_DDL = `
 		UNIQUE (bot_id, conversation_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_im_sessions_bot ON im_sessions (bot_id, updated_at DESC);
+	CREATE TABLE IF NOT EXISTS memories (
+		id TEXT PRIMARY KEY,
+		workspace_id TEXT NOT NULL DEFAULT 'default',
+		owner_id TEXT NOT NULL,
+		agent_id TEXT,
+		session_id TEXT,
+		content TEXT NOT NULL,
+		source TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories (workspace_id, owner_id, agent_id, session_id, updated_at DESC);
 	CREATE TABLE IF NOT EXISTS agents (
 		id                TEXT PRIMARY KEY,
 		workspace_id      TEXT NOT NULL DEFAULT 'default',
@@ -720,6 +735,32 @@ export class SqliteStorage implements Storage {
 
 	removePlugin(id: string): boolean {
 		return Number(this.db.prepare("DELETE FROM plugins WHERE id=? AND workspace_id = 'default'").run(id).changes) > 0;
+	}
+
+	/* ---------------- 长期记忆 ---------------- */
+	listMemories(filter: MemoryFilter): MemoryRecord[] {
+		const where = ["workspace_id = ?", "owner_id = ?"];
+		const args: Array<string | null> = [DEFAULT_WORKSPACE_ID, filter.ownerId];
+		for (const [column, value] of [["agent_id", filter.agentId], ["session_id", filter.sessionId]] as const) {
+			if (value === undefined) continue;
+			if (value === null) where.push(`${column} IS NULL`);
+			else { where.push(`${column} = ?`); args.push(value); }
+		}
+		return this.db.prepare(`SELECT * FROM memories WHERE ${where.join(" AND ")} ORDER BY updated_at DESC, id DESC`).all(...args).map((row) => this.toMemory(row));
+	}
+	private toMemory(row: Record<string, unknown>): MemoryRecord {
+		return { id: String(row.id), workspaceId: String(row.workspace_id), ownerId: String(row.owner_id), agentId: row.agent_id == null ? null : String(row.agent_id), sessionId: row.session_id == null ? null : String(row.session_id), content: String(row.content), source: String(row.source), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at) };
+	}
+	createMemory(memory: MemoryInput): MemoryRecord {
+		this.db.prepare("INSERT INTO memories (id,workspace_id,owner_id,agent_id,session_id,content,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run(memory.id, DEFAULT_WORKSPACE_ID, memory.ownerId, memory.agentId, memory.sessionId, memory.content, memory.source, memory.createdAt, memory.updatedAt);
+		return { ...memory, workspaceId: DEFAULT_WORKSPACE_ID };
+	}
+	updateMemory(id: string, ownerId: string, patch: Pick<MemoryRecord, "content" | "source" | "updatedAt">): MemoryRecord | undefined {
+		this.db.prepare("UPDATE memories SET content=?, source=?, updated_at=? WHERE id=? AND workspace_id=? AND owner_id=?").run(patch.content, patch.source, patch.updatedAt, id, DEFAULT_WORKSPACE_ID, ownerId);
+		return this.listMemories({ ownerId }).find((memory) => memory.id === id);
+	}
+	removeMemory(id: string, ownerId: string): boolean {
+		return Number(this.db.prepare("DELETE FROM memories WHERE id=? AND workspace_id=? AND owner_id=?").run(id, DEFAULT_WORKSPACE_ID, ownerId).changes) > 0;
 	}
 
 	/* ---------------- 多模型管理（P6） ---------------- */

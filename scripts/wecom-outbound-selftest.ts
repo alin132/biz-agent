@@ -1,5 +1,6 @@
 /** 企业微信出站自检：npx tsx scripts/wecom-outbound-selftest.ts；所有请求均注入，不联网。 */
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,8 @@ const bot: OutboundBot = {
 	id: "wecom-outbound-test", name: "企业微信自检", platform: "wecom",
 	appKey: "corp&test", appSecret: "secret+test&value", robotCode: "1000002",
 };
+process.env.SECRET_KEY = randomBytes(32).toString("hex");
+delete process.env.AUTH_SECRET;
 let passed = 0;
 async function check(name: string, run: () => void | Promise<void>): Promise<void> {
 	await run();

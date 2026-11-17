@@ -1,6 +1,6 @@
 /** 企业微信自建应用协议自检：本机 HTTP + 注入会话，不联网、不写数据库。 */
 import assert from "node:assert/strict";
-import { createCipheriv, createHash } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { ImBotRecord, ImSessionRecord } from "../server/db/types.js";
@@ -15,6 +15,8 @@ const key = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64").s
 const corpId = "ww-selftest";
 const token = "自检token";
 const now = 1_800_000_000_000;
+process.env.SECRET_KEY = randomBytes(32).toString("hex");
+delete process.env.AUTH_SECRET;
 let checks = 0;
 function check(name: string, action: () => void): void { action(); checks++; console.log("通过：" + name); }
 

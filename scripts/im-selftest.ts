@@ -38,7 +38,7 @@ import { ImError } from "../server/im/errors.js";
 import { OutboundService, resolveDingTalkTransport } from "../server/im/outbound.js";
 import type { HttpJsonPost, OutboundBot } from "../server/im/outbound.js";
 import { ImStore } from "../server/im/store.js";
-import { decryptSecret, encryptSecret, maskSecret } from "../server/models/crypto.js";
+import { decryptSecret, encryptSecret, maskSecret, resetEncryptionSecretCache } from "../server/models/crypto.js";
 
 let passed = 0;
 
@@ -304,6 +304,29 @@ async function testCredentials(store: Storage): Promise<void> {
 		assert.equal(decryptSecret(encryptSecret("plain-value")), "plain-value");
 	});
 
+	await check("缺稳定加密密钥时拒绝新机器人凭证并返回 503", () => {
+		const original = process.env.SECRET_KEY;
+		const botCount = store.listImBots().length;
+		const existing = store.listImBots()[0]!;
+		const im = new ImStore(store);
+		try {
+			delete process.env.SECRET_KEY;
+			resetEncryptionSecretCache();
+			assert.throws(() => new ImStore(store).create({
+				name: "缺加密密钥", appKey: "fixture", appSecret: "never-persist", robotCode: "fixture", callbackToken: "never-persist",
+			}), (error: unknown) => error instanceof ImError && error.status === 503);
+			assert.equal(store.listImBots().length, botCount, "拒绝时不写入部分机器人记录");
+			assert.throws(() => im.update(existing.id, { name: "不应部分改名", appSecret: "never-persist" }), (error: unknown) => error instanceof ImError && error.status === 503);
+			assert.deepEqual(store.getImBot(existing.id), existing);
+			assert.throws(() => im.credentialsOf(existing), (error: unknown) => error instanceof ImError && error.status === 503);
+			assert.ok(im.view(existing.id).appSecretMasked?.includes("无法解密"), "列表仍可打开并提示凭证问题");
+		} finally {
+			if (original === undefined) delete process.env.SECRET_KEY;
+			else process.env.SECRET_KEY = original;
+			resetEncryptionSecretCache();
+		}
+	});
+
 	await check("缺少必填凭证 → 400；aesKey 形状不对 → 400", () => {
 		const imStore = new ImStore(store);
 		assert.throws(
@@ -566,8 +589,10 @@ async function testMisc(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	// 固定加密密钥：自检不依赖 .env，也不让随机密钥的 warn 干扰输出
-	process.env.SECRET_KEY = "im-selftest-secret-key";
+	// 每个测试进程独立生成密钥，自检不依赖 .env，也不使用固定凭证。
+	process.env.SECRET_KEY = randomBytes(32).toString("hex");
+	delete process.env.AUTH_SECRET;
+	resetEncryptionSecretCache();
 	const { store, cleanup } = tempStore();
 	try {
 		await testSign();

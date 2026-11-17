@@ -328,6 +328,8 @@ export const agentsApi = {
 };
 
 export const agentGroupsApi = {
+	resume: (id, turnId) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/resume`, { turnId }),
+	updateAction: (id, body) => http.patch(`/api/agent-groups/${encodeURIComponent(id)}/actions`, body),
 	list: async () => items(await http.get("/api/agent-groups")),
 	get: (id, conversationId) => http.get(`/api/agent-groups/${encodeURIComponent(id)}${conversationId && conversationId !== id ? `?conversationId=${encodeURIComponent(conversationId)}` : ""}`),
 	createConversation: (id) => http.post(`/api/agent-groups/${encodeURIComponent(id)}/conversations`, {}),

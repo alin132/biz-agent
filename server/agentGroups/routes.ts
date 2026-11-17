@@ -59,6 +59,16 @@ export async function handleAgentGroups(
 			return true;
 		}
 		if (action === "conversations" && method === "POST") { json(res, 201, service.createConversation(id)); return true; }
+		if (action === "resume" && method === "POST") {
+			const body = await bodyOf(req);
+			json(res, 200, await service.resume(id, body.turnId));
+			return true;
+		}
+		if (action === "actions" && method === "PATCH") {
+			const body = await bodyOf(req);
+			json(res, 200, service.updateAction(id, { turnId: body.turnId, actionId: body.actionId, status: body.status }));
+			return true;
+		}
 		if (action === "cancel" && method === "POST") {
 			const body = await bodyOf(req);
 			const view = service.get(id, body.conversationId);

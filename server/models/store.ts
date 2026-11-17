@@ -16,7 +16,7 @@ import type {
 	RemoveProviderResult,
 	Storage,
 } from "../db/types.js";
-import { decryptSecret, encryptSecret, maskSecret } from "./crypto.js";
+import { decryptSecret, encryptSecret, maskSecret, MissingEncryptionSecretError } from "./crypto.js";
 
 export class ModelError extends Error {
 	constructor(
@@ -149,6 +149,15 @@ function parseApiKey(value: unknown): string | null {
 		throw new ModelError(400, `apiKey 不能超过 ${MAX_API_KEY} 个字符`);
 	}
 	return trimmed;
+}
+
+function encryptApiKey(value: string): string {
+	try {
+		return encryptSecret(value);
+	} catch (error) {
+		if (error instanceof MissingEncryptionSecretError) throw new ModelError(503, error.message);
+		throw error;
+	}
 }
 
 function parseContextWindow(value: unknown): number | null {
@@ -292,7 +301,7 @@ export class ModelStore {
 			name,
 			kind,
 			baseUrl,
-			apiKeyEncrypted: apiKey ? encryptSecret(apiKey) : null,
+			apiKeyEncrypted: apiKey ? encryptApiKey(apiKey) : null,
 			enabled,
 			createdAt: now,
 			updatedAt: now,
@@ -321,7 +330,7 @@ export class ModelStore {
 		}
 		if ("apiKey" in body) {
 			const apiKey = parseApiKey(body.apiKey);
-			patch.apiKeyEncrypted = apiKey ? encryptSecret(apiKey) : null;
+			patch.apiKeyEncrypted = apiKey ? encryptApiKey(apiKey) : null;
 		}
 		if ("enabled" in body) {
 			patch.enabled = parseEnabled(body.enabled, current.enabled);

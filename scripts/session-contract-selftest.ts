@@ -12,6 +12,7 @@ import { initKb, closeKb } from "../server/kb/index.js";
 import { Session, SessionHub } from "../server/session.js";
 import type { SessionAgent, WireEvent } from "../server/session.js";
 import type { PiRuntimeAdapter } from "../server/piRuntimeAdapter.js";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { LlmRuntime } from "../server/llm.js";
 import { WorkflowRepo } from "../server/workflows.js";
 import { createObservability } from "../server/observability/index.js";
@@ -176,6 +177,22 @@ try {
 		const restored = new Session(repo.get("auto-flow")!, { db, repo, restore: saved, resolveModel: () => null });
 		assert.equal(restored.view().contextTokens, subject.view().contextTokens);
 		assert.equal(restored.view().contextTokensEstimated, true);
+	});
+	await check("预算核验包括已离开可见消息的 Pi 压缩和独立 usage 记录", async () => {
+		for (const kind of ["compaction", "usage"] as const) {
+			const subject = session(runtime([say("unused")]).live);
+			try {
+				await subject.piStats();
+				const history = (subject as unknown as { piHistory: SessionManager }).piHistory;
+				const message = fauxAssistantMessage("已报告的历史回答");
+				message.usage = { input: 9, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+				history.appendMessage(message);
+				assert.equal(subject.piBudgetUsage().tokens, 12);
+				if (kind === "compaction") history.appendCompaction("缺少用量的压缩摘要", null, 12);
+				else history.appendUsage("unknown", "faux", "faux", { ...message.usage, input: 0, output: 0, totalTokens: 0 });
+				assert.equal(subject.piBudgetUsage().tokens, null, `${kind} 缺失用量不能沿用旧累计12`);
+			} finally { await subject.shutdown(); }
+		}
 	});
 
 	await check("每轮会话持久化任务耗时及工具调用明细", async () => {

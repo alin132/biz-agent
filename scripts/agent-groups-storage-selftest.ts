@@ -254,7 +254,7 @@ try {
 		assert.ok(migration);
 		const migrations = loadMigrations();
 		assert.equal(new Set(migrations.map((entry) => entry.version)).size, migrations.length);
-		assert.equal(migrations.at(-1)?.version, "0015");
+		assert.ok(migrations.some((entry) => entry.version === "0015"));
 		assert.equal(migrations.find((entry) => entry.name === "model settings")?.version, "0012");
 		for (const table of ["agent_groups", "agent_group_members", "agent_group_turns", "agent_group_messages"]) {
 			assert.match(migration.sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));

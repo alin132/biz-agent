@@ -2,18 +2,23 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { SqliteStorage } from '../server/db/sqlite.js';
 import type { AgentGroupMessageRecord } from '../server/db/types.js';
 import type { SessionHub } from '../server/session.js';
 import { AgentGroupService, AgentGroupError } from '../server/agentGroups/service.js';
-import { collaborationConfig, parseDepartmentReply, parseHostPlan, moderateDiscussion } from '../server/agentGroups/moderation.js';
+import { handleAgentGroups } from '../server/agentGroups/routes.js';
+import { permissionFor } from '../server/auth/roles.js';
+import type { AuthRuntime } from '../server/auth/service.js';
+import { addPiUsage, structuredDiscussionContext } from '../server/agentGroups/results.js';
+import { collaborationConfig, parseDepartmentReply, parseHostPlan, parseHostSummary, moderateDiscussion } from '../server/agentGroups/moderation.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'group-moderation-'));
 const path = join(dir, 'groups.db');
 let storage = new SqliteStorage(path);
 let passed = 0;
 async function check(name: string, action: () => unknown | Promise<unknown>) { await action(); console.log(`  ✓ ${name}`); passed++; }
-type Mode = 'consensus' | 'loop' | 'invalid' | 'invalid-member' | 'cancel' | 'host-summary-error' | 'late-failure';
+type Mode = 'consensus' | 'loop' | 'invalid' | 'invalid-member' | 'cancel' | 'host-summary-error' | 'late-failure' | 'structured-summary';
 let mode: Mode = 'consensus';
 let calls: { agentId: string; prompt: string; sessionId: string }[] = [];
 let sequence = 0;
@@ -21,13 +26,17 @@ let release: (() => void) | undefined;
 let resolveStarted: (() => void) | undefined;
 const sessions = new Map<string, { id: string; transcript: { role: string; text: string }[]; send: (text: string) => Promise<void>; stop: () => boolean; setPermissionMode: (mode: string) => void }>();
 const permissions: string[] = [];
+const readonlySessionIds = new Set<string>();
 const fakeHub = {
  get: (id: string) => sessions.get(id), remove: (id: string) => sessions.delete(id),
  create: (_workflow: string, options: {agent: {id: string; skillIds: string[]; kbIds: string[]}}) => {
   const id = `worker-${++sequence}`;
   const agentId = options.agent.id;
   const session = { id, subscribe: (_listener: unknown) => () => {}, transcript: [] as {role: string;text: string}[],
-   setPermissionMode: (value: string) => { permissions.push(value); assert.equal(options.agent.skillIds.length, 0); },
+   piStats: async () => ({}),
+   piBudgetUsage: () => ({tokens:session.transcript.filter(entry=>entry.role==='assistant').length*10,costUsd:null,piReportedCostUsd:null}),
+   setModelRequestGuard: (_guard?:()=>void) => {},
+   setPermissionMode: (value: string) => { permissions.push(value); if(value==='readonly')readonlySessionIds.add(id); assert.equal(options.agent.skillIds.length, 0); },
    stop: () => { release?.(); return true; },
    send: async (prompt: string) => {
     calls.push({agentId,prompt,sessionId:id}); session.transcript.push({role:'user',text:prompt});
@@ -37,6 +46,13 @@ const fakeHub = {
     if (prompt.startsWith('BIZ_GROUP_HOST_PLAN')) content = mode === 'invalid' ? '普通文本，缺少结构' : JSON.stringify({content:'先请销售评估，再核对财务意见',proposal:round===1?'预算十万':'预算八万，分期交付',agentIds:['sales']});
     else if (prompt.startsWith('BIZ_GROUP_HOST_SUMMARY')) {
      if (mode==='host-summary-error') throw new Error('汇总模型不可用');
+     if (mode==='structured-summary') {
+      const cited=JSON.parse(prompt.match(/本轮可引用发言：(\[[\s\S]*?\])\n/)?.[1]??'[]') as {id:string;agentId:string|null}[];
+      const source=cited.find(message=>message.agentId==='sales')?.id;
+      assert.ok(source,'汇总提示包含本轮发言来源 ID');
+      content=JSON.stringify({summary:'预算安排已经确认。',decisions:[{content:'先核对预算。',sourceMessageIds:[source]}],actionItems:[{title:'核对销售预测',ownerAgentId:'sales',deadline:'2026-12-01',sourceMessageIds:[source]}],unresolved:[]});
+     }
+     else
      content = '## 统一汇总\n按各部门确认的方案安排交付，未解决事项请用户决策。';
     } else {
      if (mode==='late-failure' && agentId==='sales' && round===2) throw new Error('销售执行失败');
@@ -96,6 +112,34 @@ try {
  });
  await check('配置校验拒绝外部主持、越界轮数和调用预算',()=>{
   for(const config of [{mode:'moderated',hostAgentId:'outsider'}, {mode:'moderated',hostAgentId:'host',maxRounds:7}, {mode:'moderated',hostAgentId:'host',maxCalls:2}])assert.throws(()=>collaborationConfig(config,['host','sales']));
+ });
+ await check('结构化汇总拒绝伪造来源、群外负责人和无效截止日期',()=>{
+  const members=[{agentId:'sales',agentName:'销售'}];
+  const messages:AgentGroupMessageRecord[]=[{id:'source',groupId:'g',turnId:'t',role:'agent',agentId:'sales',agentName:'销售',content:'同意核对',isError:false,createdAt:1}];
+  const base={summary:'总结',decisions:[],actionItems:[{title:'核对',ownerAgentId:'sales',deadline:null,sourceMessageIds:['source']}],unresolved:[]};
+  assert.equal(parseHostSummary('旧版文本汇总',members,messages).structured,false);
+  for(const patch of [{sourceMessageIds:['foreign']},{ownerAgentId:'outsider'},{deadline:'2026-02-30'}])assert.throws(()=>parseHostSummary(JSON.stringify({...base,actionItems:[{...base.actionItems[0],...patch}]}),members,messages));
+  assert.throws(()=>collaborationConfig({mode:'moderated',hostAgentId:'host',maxDurationMs:999},['host','sales']));
+ });
+ await check('讨论耗时预算达到上限后停止，记录耗时且不继续发起汇总',async()=>{
+  let clock=0;let count=0;const messages:AgentGroupMessageRecord[]=[];
+  const result=await moderateDiscussion({config:{mode:'moderated',hostAgentId:'host',maxRounds:3,maxCalls:24,maxDurationMs:1000},members:['host','sales'].map((agentId,position)=>({id:agentId,groupId:'time',agentId,agentName:agentId,position,sessionId:null,addedAt:1})),initialTargets:[],groupName:'时限',userMessage:'测试',previousSummaries:'',signal:new AbortController().signal,now:()=>clock,
+   invoke:async()=>{count++;clock+=1001;return JSON.stringify({content:'选择销售',proposal:'方案',agentIds:['sales']});},append:(agentId,content,metadata,isError=false)=>{messages.push({id:String(messages.length),groupId:'time',turnId:'t',role:'agent',agentId,agentName:agentId,content,metadata,isError,createdAt:messages.length});},messages:()=>messages,persist:()=>{}});
+  assert.equal(result.outcome,'time_limit');assert.equal(result.elapsedMs,1001);assert.equal(count,1);assert.equal(result.calls,1);assert.equal(result.checkpoint?.phase,'planning');
+ });
+ await check('token 消耗只取 Pi 统计差额，未知 usage 和定价不冒充零',()=>{
+  const previous={tokens:20,costUsd:null,piReportedCostUsd:0.1};
+  const result=addPiUsage(previous,{tokens:100,costUsd:null,piReportedCostUsd:0.2},{tokens:112,costUsd:null,piReportedCostUsd:0.25});
+  assert.equal(result.tokens,32);assert.equal(result.costUsd,null);assert.ok(Math.abs(result.piReportedCostUsd!-0.15)<1e-9);
+  assert.equal(addPiUsage(previous,{tokens:100,costUsd:null,piReportedCostUsd:null},{tokens:null,costUsd:null,piReportedCostUsd:null}).tokens,null);
+  assert.throws(()=>collaborationConfig({mode:'moderated',hostAgentId:'host',maxTokens:0},['host','sales']));
+  assert.throws(()=>collaborationConfig({mode:'moderated',hostAgentId:'host',maxCostUsd:1},['host','sales']));
+ });
+ await check('token 预算用完后不继续调度部门或最终汇总',async()=>{
+  let tokens=0;let calls=0;
+  const result=await moderateDiscussion({config:{mode:'moderated',hostAgentId:'host',maxRounds:3,maxCalls:24,maxTokens:10},members:['host','sales'].map((agentId,position)=>({id:agentId,groupId:'tokens',agentId,agentName:agentId,position,sessionId:null,addedAt:1})),initialTargets:[],groupName:'tokens',userMessage:'测试',previousSummaries:'',signal:new AbortController().signal,
+   invoke:async()=>{calls++;tokens=12;return JSON.stringify({content:'选择销售',proposal:'方案',agentIds:['sales']});},usage:()=>({tokens,costUsd:null,piReportedCostUsd:null}),append:()=>{},messages:()=>[],persist:()=>{}});
+  assert.equal(result.outcome,'token_limit');assert.equal(result.usage?.tokens,12);assert.equal(calls,1);
  });
  const group=create();
  let result=await service.send(group.id,'讨论交付预算');
@@ -184,9 +228,51 @@ try {
  mode='host-summary-error';
  const failedSummary=await currentService.send(nextGroup().id,'汇总失败');
  await check('最终汇总失败时整体标记失败，不保留成功共识结果',()=>assert.equal(failedSummary.turns.at(-1)?.discussion?.outcome,'failed'));
+ mode='consensus';
+ const beforeSummaryResume=calls.length;
+ const summaryResumed=await currentService.resume(failedSummary.id,failedSummary.turns.at(-1)!.id);
+ await check('只汇总失败的轮次恢复时不重复分派或执行部门',()=>{
+  const retried=calls.slice(beforeSummaryResume);assert.equal(retried.length,1);assert.ok(retried[0]!.prompt.startsWith('BIZ_GROUP_HOST_SUMMARY'));assert.equal(summaryResumed.turns.at(-1)?.discussion?.outcome,'consensus');
+ });
  mode='late-failure';
  const lateFailure=await currentService.send(nextGroup().id,'重复发言失败');
  await check('后续轮次成员失败不被其前轮成功回复掩盖',()=>assert.equal(lateFailure.turns.at(-1)?.status,'failed'));
+ mode='structured-summary';
+ const structured=await currentService.send(nextGroup().id,'结构化行动项来源校验');
+ const structuredTurn=structured.turns.at(-1)!;
+ await check('主持决策与行动项使用可验证的本轮来源和群内负责人',()=>{
+  const result=structuredTurn.discussion?.result;assert.equal(result?.structured,true);assert.equal(result?.actionItems[0]?.ownerAgentId,'sales');assert.equal(result?.actionItems[0]?.status,'pending');
+  for(const item of [...(result?.decisions??[]),...(result?.actionItems??[]),...(result?.unresolved??[])])assert.ok(item.sourceMessageIds.every(id=>structured.messages.some(message=>message.id===id&&!message.isError)));
+  const changed=currentService.updateAction(structured.id,{turnId:structuredTurn.id,actionId:result!.actionItems[0]!.id,status:'done'});assert.equal(changed.turns.at(-1)?.discussion?.result?.actionItems[0]?.status,'done');
+ });
+ await check('已完成的主持轮次拒绝恢复，防止重复执行',async()=>assert.rejects(()=>currentService.resume(structured.id,structuredTurn.id),(error:unknown)=>error instanceof AgentGroupError&&error.status===409));
+ await check('后续讨论注入已更新行动项及来源，群内新对话和其它群不继承',async()=>{
+  mode='consensus';calls=[];
+  await currentService.send(structured.id,'继续复核已完成事项');
+  const prompt=calls[0]!.prompt;assert.ok(prompt.includes('已持久化结构化事实'));assert.ok(prompt.includes('"status":"done"'));assert.ok(prompt.includes('核对销售预测'));assert.ok(prompt.includes(structuredTurn.discussion!.result!.actionItems[0]!.sourceMessageIds[0]!));
+  const isolated=currentService.createConversation(structured.id);calls=[];
+  await currentService.send(structured.id,'全新独立事项',undefined,isolated.activeConversationId);assert.ok(!calls[0]!.prompt.includes('核对销售预测'));
+  calls=[];await currentService.send(nextGroup().id,'其他群事项');assert.ok(!calls[0]!.prompt.includes('核对销售预测'));
+  const large={...structuredTurn,discussion:{...structuredTurn.discussion!,result:{...structuredTurn.discussion!.result!,actionItems:Array.from({length:30},(_,index)=>({...structuredTurn.discussion!.result!.actionItems[0]!,id:`action-${index}`,title:'预算核算'.repeat(100)}))}}};
+  const bounded=structuredDiscussionContext([large]);assert.ok(bounded.length<=6000);assert.ok(bounded.includes('超出预算'));
+ });
+ mode='consensus';
+ const recoverable=nextGroup();
+ const interrupted={id:'turn-readable-resume',groupId:recoverable.id,sequence:1,userMessage:'恢复未完成分歧',status:'running' as const,createdAt:Date.now(),completedAt:null,
+  discussion:{round:2,calls:2,phase:'discussing' as const,outcome:'pending' as const,participants:['sales','finance'],proposal:'已在评审的方案',checkpoint:{phase:'discussing' as const,round:2,queue:['sales','finance'],ballots:{},requests:['finance'],pending:[],committedReplyCount:0}}};
+ storage.createAgentGroupTurn(interrupted);
+ storage.appendAgentGroupMessage({id:'resume-user',groupId:recoverable.id,turnId:interrupted.id,role:'user',agentId:null,agentName:null,content:interrupted.userMessage,isError:false,createdAt:interrupted.createdAt+1});
+ storage.appendAgentGroupMessage({id:'resume-sales',groupId:recoverable.id,turnId:interrupted.id,role:'agent',agentId:'sales',agentName:'销售',content:'销售确认方案',isError:false,createdAt:interrupted.createdAt+2,metadata:{kind:'reply',round:2,stance:'agree',proposalId:'round-2'}});
+ new AgentGroupService(storage,fakeHub);
+ const callsBeforeResume=calls.length;
+ const resumed=await new AgentGroupService(storage,fakeHub).resume(recoverable.id,interrupted.id);
+ await check('中断主持轮次仅恢复待回应成员，沿用原轮次且所有恢复会话只读',()=>{
+  const recoveredCalls=calls.slice(callsBeforeResume);assert.equal(recoveredCalls.filter(call=>call.agentId==='sales'&&call.prompt.startsWith('BIZ_GROUP_DEPARTMENT')).length,0);
+  assert.equal(recoveredCalls.filter(call=>call.agentId==='finance'&&call.prompt.startsWith('BIZ_GROUP_DEPARTMENT')).length,1);
+  assert.ok(recoveredCalls.every(call=>readonlySessionIds.has(call.sessionId)));
+  const resumedTurn=resumed.turns.find(turn=>turn.id===interrupted.id)!;assert.equal(resumedTurn.sequence,1);assert.equal(resumedTurn.discussion?.resumeCount,1);assert.equal(resumedTurn.discussion?.outcome,'consensus');assert.ok(resumedTurn.discussion!.elapsedMs!>=0);
+  assert.equal(resumed.messages.filter(message=>message.id==='resume-sales').length,1,'恢复不重复写入已提交的销售回复');
+ });
  mode='cancel';
  const cancelGroup=nextGroup();
  const started=new Promise<void>(resolve=>{resolveStarted=resolve;});
@@ -223,6 +309,27 @@ try {
   assert.throws(()=>currentService.update(group.id,{name:'x',agentIds:['sales','finance']}),AgentGroupError);
   const updated=currentService.update(group.id,{name:'顺序模式',agentIds:['sales','finance'],collaboration:null});
   assert.equal(updated.collaboration,undefined);
+ });
+ await check('HTTP 恢复与行动项状态接口验证边界且使用正确权限点',async()=>{
+  mode='host-summary-error';const failed=await currentService.send(nextGroup().id,'HTTP 汇总恢复');mode='consensus';
+  const auth={userOf:()=>undefined} as unknown as AuthRuntime;
+  const server=createServer(async(req,res)=>{await handleAgentGroups(req,res,new URL(req.url!,'http://local'),currentService,auth);});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const address=server.address();assert.ok(address&&typeof address==='object');const base=`http://127.0.0.1:${address.port}`;
+  const post=(path:string,body:unknown,method='POST')=>fetch(base+path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  try{
+   assert.equal(permissionFor('POST',`/api/agent-groups/${failed.id}/resume`),'session.run');
+   assert.equal(permissionFor('PATCH',`/api/agent-groups/${structured.id}/actions`),'session.write');
+   const resumed=await post(`/api/agent-groups/${failed.id}/resume`,{turnId:failed.turns.at(-1)!.id});assert.equal(resumed.status,200);
+   const body=await resumed.json() as {turns:{status:string;discussion:{resumeCount:number}}[]};assert.equal(body.turns.at(-1)?.discussion.resumeCount,1);assert.equal(body.turns.at(-1)?.status,'completed');
+   assert.equal((await post(`/api/agent-groups/${failed.id}/resume`,{turnId:failed.turns.at(-1)!.id})).status,409);
+   assert.equal((await post(`/api/agent-groups/${failed.id}/resume`,{turnId:structuredTurn.id})).status,404);
+   assert.equal((await post(`/api/agent-groups/${failed.id}/resume`,{turnId:null})).status,400);
+   const changed=await post(`/api/agent-groups/${structured.id}/actions`,{turnId:structuredTurn.id,actionId:'action-1',status:'in_progress'},'PATCH');assert.equal(changed.status,200);
+   assert.equal(storage.getAgentGroupTurn(structuredTurn.id)?.discussion?.result?.actionItems[0]?.status,'in_progress');
+   assert.equal((await post(`/api/agent-groups/${structured.id}/actions`,{turnId:structuredTurn.id,actionId:'action-1',status:'bogus'},'PATCH')).status,400);
+   assert.equal((await post(`/api/agent-groups/${structured.id}/actions`,{turnId:structuredTurn.id,actionId:'missing',status:'done'},'PATCH')).status,404);
+  }finally{await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
  });
  console.log(`主持协作自检：${passed} 组通过`);
 } finally {storage.close();rmSync(dir,{recursive:true,force:true});}

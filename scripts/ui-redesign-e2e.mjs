@@ -13,11 +13,71 @@ assert.equal(health.model?.mode,'simulated','UI 回归只允许连接模拟模�
 const browser=await chromium.launch();let page=await browser.newPage({viewport:{width:1440,height:1000}});const listPage=page;page.setDefaultTimeout(8000);const errors=[];page.on('pageerror',e=>errors.push(e.message));
 const modal=()=>page.locator('.n-modal').last();
 const field=(label)=>modal().locator('.n-form-item').filter({has:page.locator('label').filter({hasText:label})}).locator('input,textarea').first();
-async function go(route,title){await page.goto(BASE+'/#/'+route,{waitUntil:'domcontentloaded'});await expect(page.locator('.app-shell')).toBeVisible();if(title)await expect(page.getByRole('heading',{name:title,exact:true})).toBeVisible({timeout:15000});const sessionId=new URL(route,'http://test.invalid/').searchParams.get('session');if(sessionId&&(route.startsWith('chat?')||route.startsWith('agent-chat/'))){await expect(page.locator('.chat-session.active')).toHaveAttribute('data-session-id',sessionId);await expect(page.locator('.chat-input textarea')).toBeEnabled();}}
+async function go(route,title){await page.goto(BASE+'/#/'+route,{waitUntil:'domcontentloaded'});await expect(page.locator('.app-shell')).toBeVisible();if(title)await expect(page.getByRole('heading',{name:title,exact:true})).toBeVisible({timeout:15000});if(await page.locator('.page[aria-busy]').count())await expect(page.locator('.page[aria-busy]').first()).toHaveAttribute('aria-busy','false');const sessionId=new URL(route,'http://test.invalid/').searchParams.get('session');if(sessionId&&(route.startsWith('chat?')||route.startsWith('agent-chat/'))){await expect(page.locator('.chat-session.active')).toHaveAttribute('data-session-id',sessionId);await expect(page.locator('.chat-input textarea')).toBeEnabled();}}
 async function action(path,method,fn){const wait=page.waitForResponse(r=>new URL(r.url()).pathname===path&&r.request().method()===method);await fn();const r=await wait;assert.ok(r.ok(),`${method} ${path} HTTP ${r.status()}`);return r.json();}
 async function confirm(name='删除'){await page.locator('.n-dialog').getByRole('button',{name,exact:true}).click();}
 const uid=Date.now().toString(36);
 try{
+ await check('工作台加载与部分失败明确展示未知，重试后恢复真实数据',async()=>{
+  await go('workbench','工作台');
+  let releaseHealth,healthStarted;
+  const held=new Promise(resolve=>{releaseHealth=resolve;});
+  const started=new Promise(resolve=>{healthStarted=resolve;});
+  const healthHandler=async route=>{healthStarted();await held;await route.fulfill({status:503,json:{error:'运行状态暂不可用'}});};
+  const sessionsHandler=route=>route.fulfill({status:503,json:{error:'会话列表暂不可用'}});
+  await page.route('**/api/health',healthHandler);await page.route('**/api/sessions',sessionsHandler);
+  try{
+   await page.locator('.page-head').getByRole('button',{name:'刷新',exact:true}).click();await started;
+   await expect(page.locator('.page')).toHaveAttribute('aria-busy','true');
+   await expect(page.locator('.workspace-status')).toContainText('正在读取运行状态');
+   await expect(page.locator('.workspace-status')).not.toContainText('模拟模式');
+   await expect(page.locator('.page-head').getByRole('button',{name:/刷新/})).toBeDisabled();
+   releaseHealth();await expect(page.locator('.page')).toHaveAttribute('aria-busy','false');
+   await expect(page.locator('.workspace-status')).toContainText('状态未知');
+   await expect(page.locator('.workbench-stats .workbench-stat').nth(1)).toContainText('—');
+   await expect(page.getByText('暂时无法读取最近对话',{exact:true})).toBeVisible();
+   await expect(page.locator('.page-alert')).toContainText('运行状态暂不可用');
+   await page.screenshot({path:resolve(out,'workbench-unavailable.png'),fullPage:true,animations:'disabled'});
+  }finally{releaseHealth();await page.unroute('**/api/health',healthHandler);await page.unroute('**/api/sessions',sessionsHandler);}
+  await page.locator('.page-head').getByRole('button',{name:'刷新',exact:true}).click();
+  await expect(page.locator('.page')).toHaveAttribute('aria-busy','false');
+  await expect(page.locator('.workspace-status')).toContainText('模拟模式');await expect(page.locator('.page-alert')).toHaveCount(0);
+ });
+ await check('长期记忆可创建编辑删除，刷新后保留且展示来源',async()=>{
+  await go('settings','设置');
+  const panel=page.getByTestId('memory-panel');
+  await expect(panel).toContainText('只保存自己确认的偏好');
+  await panel.getByRole('button',{name:'添加记忆',exact:true}).click();
+  await field('记忆内容').fill('记忆验收-'+uid+'：预算统一使用人民币元');
+  await field('来源说明').fill('用户在项目验收中确认');
+  const created=await action('/api/memories','POST',()=>modal().getByRole('button',{name:'保存记忆',exact:true}).click());
+  const row=panel.locator(`[data-memory-id="${created.id}"]`);
+  await expect(row).toContainText('预算统一使用人民币元');await expect(row).toContainText('用户在项目验收中确认');
+  await page.reload();await expect(row).toContainText('预算统一使用人民币元');
+  await row.getByRole('button',{name:'编辑记忆',exact:true}).click();
+  await field('记忆内容').fill('记忆验收-'+uid+'：金额保留两位小数');
+  await action(`/api/memories/${created.id}`,'PATCH',()=>modal().getByRole('button',{name:'保存记忆',exact:true}).click());
+  await expect(row).toContainText('金额保留两位小数');
+  await expect(page.locator('.n-modal')).toHaveCount(0);
+  await panel.screenshot({path:resolve(out,'long-term-memory.png')});
+  await page.setViewportSize({width:390,height:844});await row.scrollIntoViewIfNeeded();
+  await expect.poll(()=>page.locator('.app-sider').evaluate(el=>el.getBoundingClientRect().right)).toBeLessThanOrEqual(1);
+  for(const input of await page.locator('.pi-settings-form .n-input-number').all())assert.ok((await input.boundingBox()).width>=200,'窄屏压缩参数输入框不被长标签挤压');
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'记忆面板窄屏不横向溢出');
+  await page.screenshot({path:resolve(out,'memory-mobile.png'),fullPage:true,animations:'disabled'});
+  await page.setViewportSize({width:1440,height:1000});
+  await row.getByRole('button',{name:'删除记忆',exact:true}).click();
+  await action(`/api/memories/${created.id}`,'DELETE',()=>confirm());
+  await expect(row).toHaveCount(0);
+ });
+ await check('模型页明确提示未配置稳定加密密钥',async()=>{
+  await page.route('**/api/models',async route=>{
+   const response=await route.fetch();const body=await response.json();
+   await route.fulfill({response,json:{...body,encryption:{configured:false,problem:'尚未配置稳定加密密钥'}}});
+  });
+  try{await go('models','模型管理');await expect(page.getByTestId('model-encryption-warning')).toContainText('SECRET_KEY');}
+  finally{await page.unroute('**/api/models');}
+ });
  await check('15 个模块真实渲染，无占位路由',async()=>{for(const [route,title]of [['workbench','工作台'],['agents','Agent'],['agent-groups','部门群聊'],['chat','对话'],['knowledge','知识库'],['skills','技能'],['models','模型管理'],['mcp','MCP 集成'],['im','IM 机器人'],['approvals','审批'],['audit','审计'],['monitor','监控'],['members','成员'],['settings','设置'],['plugins','插件']]){await go(route,title);assert.equal(await page.locator('.page-alert').count(),0,route+' 加载失败');}});
  await check('部门群聊创建、独立 Pi 会话、逐部门发言和恢复',async()=>{
   const departmentAgents=[];
@@ -234,8 +294,8 @@ try{
  });
  await check('Pi 工作空间压缩设置可编辑并持久保存',async()=>{await go('settings','设置');const panel=page.locator('.panel').filter({hasText:'Pi 自动压缩'});await expect(panel).toContainText('新建普通对话使用工作空间默认值');const reserve=panel.locator('.n-form-item').filter({hasText:'剩余上下文阈值'}).locator('input');const keep=panel.locator('.n-form-item').filter({hasText:'摘要后保留最近上下文'}).locator('input');await reserve.fill('8192');await keep.fill('12000');await action('/api/pi/settings','PUT',()=>panel.getByRole('button',{name:'保存 Pi 设置',exact:true}).click());assert.deepEqual(await api('/api/pi/settings'),{compaction:{enabled:true,reserveTokens:8192,keepRecentTokens:12000}});await page.reload();await expect(panel.locator('.n-form-item').filter({hasText:'剩余上下文阈值'}).locator('input')).toHaveValue('8192');});
  await check('API Key 一次性展示、停用和吊销',async()=>{await go('settings','设置');await page.getByRole('button',{name:'创建 API Key',exact:true}).click();await field('名称').fill('UI-Key-'+uid);await action('/api/api-keys','POST',()=>modal().getByRole('button',{name:'创建',exact:true}).click());await expect(modal()).toContainText('明文只显示这一次');await modal().getByRole('button',{name:'已保存，关闭',exact:true}).click();const row=page.locator('tr').filter({hasText:'UI-Key-'+uid});await row.getByRole('button',{name:'停用',exact:true}).click();await expect(row).toContainText('已停用');await row.getByRole('button',{name:'吊销',exact:true}).click();await confirm('吊销');await expect(row).toContainText('已吊销');});
- await check('对话和向量模型默认设置分别调用正确入口',async()=>{const provider=await api('/api/models/providers',{name:'UI供应商-'+uid,kind:'custom',baseUrl:'http://127.0.0.1:9/v1',apiKey:randomUUID()});await api('/api/models',{providerId:provider.id,modelId:'ui-chat-'+uid,name:'UI对话模型-'+uid,kind:'chat'});const chat=await api('/api/models',{providerId:provider.id,modelId:'ui-chat-alt-'+uid,name:'UI对话模型备用-'+uid,kind:'chat'});await api('/api/models',{providerId:provider.id,modelId:'ui-vector-'+uid,name:'UI向量模型-'+uid,kind:'embedding'});const vector=await api('/api/models',{providerId:provider.id,modelId:'ui-vector-alt-'+uid,name:'UI向量模型备用-'+uid,kind:'embedding'});await go('models','模型管理');const cr=page.locator('li.row').filter({hasText:chat.name});await action('/api/models/current','POST',()=>cr.getByRole('button',{name:'设为默认对话',exact:true}).click());const vr=page.locator('li.row').filter({hasText:vector.name});await action('/api/models/embedding','POST',()=>vr.getByRole('button',{name:'设为默认向量',exact:true}).click());await expect(vr.getByRole('button',{name:'使用中',exact:true})).toBeDisabled();await page.screenshot({path:resolve(out,'models.png'),fullPage:true});});
- await check('工作台统计与快捷入口，15 页窄屏不挤压内容',async()=>{await go('workbench','工作台');await expect(page.getByRole('button',{name:'选择 Agent',exact:true})).toBeVisible();await page.screenshot({path:resolve(out,'workbench.png'),fullPage:true});for(const width of [390,768]){await page.setViewportSize({width,height:844});for(const [route,title]of [['workbench','工作台'],['agents','Agent'],['agent-groups','部门群聊'],['knowledge','知识库'],['models','模型管理'],['mcp','MCP 集成'],['im','IM 机器人'],['approvals','审批'],['audit','审计'],['monitor','监控'],['skills','技能'],['members','成员'],['settings','设置'],['plugins','插件'],['chat','对话']]){await go(route,title);if(width===390&&route==='chat'){const chatBox=await page.locator('.chat-main').boundingBox();assert.ok(chatBox.width>=300,'移动端聊天主列过窄：'+chatBox.width);await expect(page.locator('.chat-list')).toBeHidden();}const box=await page.locator('.app-main').boundingBox();assert.ok(box.width>=width-220,route+' 内容被侧栏挤压');const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);assert.equal(overflow,false,route+' 页面横向溢出');}if(width===390){await page.getByRole('button',{name:'导航',exact:false}).first().click();await expect(page.locator('.app-sider')).toBeInViewport();await page.getByRole('button',{name:'关闭导航',exact:true}).click();await page.waitForTimeout(250);const mobileFrame=await page.locator('.page').boundingBox();assert.equal(mobileFrame?.x,0,'关闭移动导航后页面未回到左边界');await page.screenshot({path:resolve(out,'mobile-chat.png'),fullPage:true});}}});
+ await check('对话和向量模型默认设置分别调用正确入口',async()=>{const provider=await api('/api/models/providers',{name:'UI供应商-'+uid,kind:'custom',baseUrl:'http://127.0.0.1:9/v1',apiKey:randomUUID()});await api('/api/models',{providerId:provider.id,modelId:'ui-chat-'+uid,name:'UI对话模型-'+uid,kind:'chat'});const chat=await api('/api/models',{providerId:provider.id,modelId:'ui-chat-alt-'+uid,name:'UI对话模型备用-'+uid,kind:'chat'});await api('/api/models',{providerId:provider.id,modelId:'ui-vector-'+uid,name:'UI向量模型-'+uid,kind:'embedding'});const vector=await api('/api/models',{providerId:provider.id,modelId:'ui-vector-alt-'+uid,name:'UI向量模型备用-'+uid,kind:'embedding'});await go('models','模型管理');const cr=page.locator('li.row').filter({hasText:chat.name});await action('/api/models/current','POST',()=>cr.getByRole('button',{name:'设为默认对话',exact:true}).click());const vr=page.locator('li.row').filter({hasText:vector.name});await action('/api/models/embedding','POST',()=>vr.getByRole('button',{name:'设为默认向量',exact:true}).click());await expect(vr.getByRole('button',{name:'使用中',exact:true})).toBeDisabled();await expect(page.locator('.n-message')).toHaveCount(0);await page.screenshot({path:resolve(out,'models.png'),fullPage:true,animations:'disabled'});});
+ await check('工作台统计与快捷入口，15 页窄屏不挤压内容',async()=>{await go('workbench','工作台');await expect(page.getByRole('button',{name:'选择 Agent',exact:true})).toBeVisible();await expect(page.locator('.n-message')).toHaveCount(0);await page.screenshot({path:resolve(out,'workbench.png'),fullPage:true,animations:'disabled'});for(const width of [390,768]){await page.setViewportSize({width,height:844});for(const [route,title]of [['workbench','工作台'],['agents','Agent'],['agent-groups','部门群聊'],['knowledge','知识库'],['models','模型管理'],['mcp','MCP 集成'],['im','IM 机器人'],['approvals','审批'],['audit','审计'],['monitor','监控'],['skills','技能'],['members','成员'],['settings','设置'],['plugins','插件'],['chat','对话']]){await go(route,title);if(width===390&&route==='chat'){const chatBox=await page.locator('.chat-main').boundingBox();assert.ok(chatBox.width>=300,'移动端聊天主列过窄：'+chatBox.width);await expect(page.locator('.chat-list')).toBeHidden();}const box=await page.locator('.app-main').boundingBox();assert.ok(box.width>=width-220,route+' 内容被侧栏挤压');const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);assert.equal(overflow,false,route+' 页面横向溢出');if(width===390&&['workbench','models'].includes(route)){await expect(page.locator('.n-message')).toHaveCount(0);await page.screenshot({path:resolve(out,route+'-mobile.png'),fullPage:true,animations:'disabled'});}}if(width===390){await page.getByRole('button',{name:'导航',exact:false}).first().click();await expect(page.locator('.app-sider')).toBeInViewport();await page.getByRole('button',{name:'关闭导航',exact:true}).click();await page.waitForTimeout(250);const mobileFrame=await page.locator('.page').boundingBox();assert.equal(mobileFrame?.x,0,'关闭移动导航后页面未回到左边界');await page.screenshot({path:resolve(out,'mobile-chat.png'),fullPage:true});}}});
  await check('模型输出 HTML 被转义，全程没有页面脚本异常',async()=>{await page.setViewportSize({width:1440,height:1000});const session=await api('/api/sessions',{workflowId:'auto-flow'});await go('chat?session='+session.id,'对话');assert.equal(await page.locator('.markdown-body script').count(),0);assert.deepEqual(errors,[]);});
  assert.ok(passed>0,'没有匹配的浏览器测试');assert.deepEqual(errors,[]);
  console.log(`新界面与按钮回归${filter ? `（筛选：${filter}）` : ''}：${passed} 组通过`);

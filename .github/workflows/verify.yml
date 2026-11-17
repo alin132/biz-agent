@@ -1,0 +1,78 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+      LLM_DISABLE: '1'
+      AUTH_MODE: 'off'
+      DATABASE_URL: ''
+      DB_PATH: ${{ runner.temp }}/biz-agent-ci/default.db
+      DINGTALK_TRANSPORT: fake
+      WECOM_TRANSPORT: fake
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Generate isolated test environment
+        run: |
+          mkdir -p data/ci-logs
+          node scripts/ci-environment.mjs
+      - name: Install locked dependencies
+        run: npm ci 2>&1 | tee data/ci-logs/install.log
+      - name: Verify workflow contracts
+        run: node scripts/ci-workflow-selftest.mjs 2>&1 | tee data/ci-logs/workflow.log
+      - name: Typecheck and build
+        run: |
+          npm run typecheck 2>&1 | tee data/ci-logs/typecheck.log
+          npm run web:build 2>&1 | tee data/ci-logs/build.log
+      - name: Run offline self-tests
+        shell: bash
+        run: |
+          for script in verify ui:actions ui-check auth:selftest models:selftest agents:selftest agent-groups:selftest agent-groups:moderation:selftest memory:selftest eval:selftest contracts:selftest pi:selftest kb:selftest mcp:selftest obs:selftest plugins:selftest im:selftest wecom:selftest; do
+            npm run "$script" 2>&1 | tee "data/ci-logs/${script//:/_}.log"
+          done
+      - name: Install Chromium and system dependencies
+        run: npx --no-install playwright install --with-deps chromium 2>&1 | tee data/ci-logs/browser-install.log
+      - name: Run isolated browser contracts
+        run: npm run contracts:e2e 2>&1 | tee data/ci-logs/contracts-e2e.log
+      - name: Run group collaboration browser scenarios
+        run: npm run agent-groups:e2e 2>&1 | tee data/ci-logs/agent-groups-e2e.log
+      - name: Verify private session ownership
+        run: npm run memory:ownership:e2e 2>&1 | tee data/ci-logs/memory-ownership-e2e.log
+      - name: Verify restart recovery and budgets
+        run: npm run agent-groups:recovery:e2e 2>&1 | tee data/ci-logs/group-recovery-e2e.log
+      - name: Verify evaluation runner with local fixtures
+        run: npm run eval:integration 2>&1 | tee data/ci-logs/eval-integration.log
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-diagnostics-${{ github.run_attempt }}
+          path: |
+            data/ci-logs/
+            data/ui-redesign/*.png
+          if-no-files-found: ignore
+          retention-days: 7
